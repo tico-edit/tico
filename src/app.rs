@@ -17,7 +17,15 @@ pub enum PromptKind {
     ReplaceConfirm(ReplaceLoopState),
     GotoLine,
     WriteOut {
-        exiting: bool,
+        flow: WriteFlow,
+    },
+    /// One of the Yes/No questions nano's `write_it_out` may ask once a
+    /// filename is settled (see `WriteQuestion`). `answer` is the name as
+    /// typed, offered again if the Write Out prompt has to be reshown.
+    WriteConfirm {
+        question: WriteQuestion,
+        answer: String,
+        flow: WriteFlow,
     },
     Exit {
         discard_and_quit: bool,
@@ -61,6 +69,43 @@ pub enum PromptKind {
         messages: Vec<LintMessage>,
         index: usize,
     },
+}
+
+/// The context of one nano `write_it_out` call, carried through the Write
+/// Out prompt and its follow-up questions: nano keeps these in parameters
+/// and locals across its loop's `continue`s, but tico's prompts are modal,
+/// so each step hands them on to the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteFlow {
+    /// Saving from `^X` (nano's `exiting`): always the whole buffer, and a
+    /// successful write closes it.
+    pub exiting: bool,
+    /// False for `^S` (nano's `do_savefile`): a named buffer is written
+    /// under its own name without showing the prompt.
+    pub withprompt: bool,
+    /// nano's `maychange`: writing under a name other than the buffer's
+    /// own is fine -- the buffer has no name, or "Save file under
+    /// DIFFERENT NAME?" was already answered Yes.
+    pub maychange: bool,
+}
+
+/// The questions nano's `write_it_out` asks before writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteQuestion {
+    /// "Save file under DIFFERENT NAME? "
+    DifferentName,
+    /// "File \"NAME\" exists; OVERWRITE? "
+    Overwrite,
+    /// "File was modified since you opened it; continue saving? "
+    DiskChanged,
+}
+
+/// An answer to one of nano's `ask_user` Yes/No questions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YesNo {
+    Yes,
+    No,
+    Cancel,
 }
 
 /// One parsed line of linter output: `filename:line[:col]: msg` (or
@@ -237,6 +282,11 @@ pub struct Editor {
     /// the terminal bell once and clears this, matching nano's beep() in
     /// statusline() for ALERT-importance messages.
     pub bell_pending: bool,
+    /// A warning to flash before the next frame, nano's
+    /// `warn_and_briefly_pause`: the UI layer shows it as an Alert with the
+    /// shortcut bars blanked, holds it for 1.5s, then clears it and draws
+    /// whatever mode was set up behind it (e.g. the prompt that follows).
+    pub brief_warning: Option<String>,
     /// The currently highlighted search/replace match, if any (position +
     /// length in characters), rendered black-on-yellow like nano's
     /// `spotlightcolor` (confirmed against the installed nano's own
@@ -311,6 +361,7 @@ impl Editor {
             status_level: StatusLevel::Normal,
             status_countdown: 0,
             bell_pending: false,
+            brief_warning: None,
             spotlight: None,
             spotlight_deadline: None,
             history,
@@ -519,8 +570,8 @@ impl Editor {
                 self.mode = Mode::Editing;
             }
             Exit => self.begin_exit(),
-            WriteOut => self.begin_writeout(false),
-            SaveFile => self.quick_save(),
+            WriteOut => self.write_it_out(false, true),
+            SaveFile => self.write_it_out(false, false),
             Insert => self.begin_insert(),
             WhereIs => self.begin_search(),
             WhereWas => {
@@ -1452,14 +1503,15 @@ impl Editor {
         });
     }
 
-    fn begin_writeout(&mut self, exiting: bool) {
+    /// Start nano's `write_it_out(exiting, withprompt)`: `^O` is
+    /// (false, true), `^S` (false, false), and `^X`'s save (true, true).
+    fn write_it_out(&mut self, exiting: bool, withprompt: bool) {
         // A marked region offers to write just the selection instead of
         // the whole buffer, and (to reduce the chance of clobbering the
         // real file with just a fragment) starts with a blank filename
         // rather than defaulting to the current one — matches nano, and
         // only applies outside of the exit-time save prompt.
-        let selecting = !exiting && self.buf().mark.is_some();
-        let default = if selecting {
+        let given = if !exiting && self.buf().mark.is_some() {
             String::new()
         } else {
             self.buf()
@@ -1468,44 +1520,247 @@ impl Editor {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
         };
-        let label = self.writeout_prompt_label(exiting);
+        let flow = WriteFlow {
+            exiting,
+            withprompt,
+            maychange: self.buf().path.is_none(),
+        };
+        self.prompt_for_write(flow, given);
+    }
+
+    /// The top of `write_it_out`'s loop: without a prompt to show (`^S`,
+    /// or `saveonexit` when exiting) a named buffer goes straight on under
+    /// its own name; otherwise ask for the filename, offering `given`.
+    fn prompt_for_write(&mut self, flow: WriteFlow, given: String) {
+        if (!flow.withprompt || (self.options.saveonexit && flow.exiting))
+            && let Some(path) = self.buf().path.clone()
+        {
+            self.check_write_answer(path.display().to_string(), flow);
+            return;
+        }
+        let label = self.writeout_prompt_label(flow.exiting);
         self.mode = Mode::Prompt(Prompt {
-            kind: PromptKind::WriteOut { exiting },
+            kind: PromptKind::WriteOut { flow },
             menu: Menu::WriteOut,
             label,
-            cursor: default.chars().count(),
-            input: default,
+            cursor: given.chars().count(),
+            input: given,
             history_pos: None,
             saved_input: None,
         });
     }
 
-    fn quick_save(&mut self) {
-        if let Some(path) = self.buf().path.clone() {
-            match crate::fileio::save_file(self.buf_mut(), &path) {
-                Ok(()) => self.set_status(format!("Wrote {}", path.display())),
-                Err(e) => self.set_status(format!("Error writing {}: {e}", path.display())),
+    /// Enter at the Write Out prompt. An empty answer cancels, as nano's
+    /// `do_prompt` returns -2 for it.
+    pub(crate) fn submit_write_answer(&mut self, answer: String, flow: WriteFlow) {
+        self.mode = Mode::Editing;
+        if answer.is_empty() {
+            self.set_status("Cancelled");
+            return;
+        }
+        self.check_write_answer(answer, flow);
+    }
+
+    /// `write_it_out`'s checks on a settled filename: a name other than
+    /// the buffer's own needs "Save file under DIFFERENT NAME?" (unless
+    /// writing a selection) and, when taken, "File exists; OVERWRITE?"; the
+    /// buffer's own name needs "continue saving?" when the file changed on
+    /// disk since it was read or written.
+    fn check_write_answer(&mut self, answer: String, flow: WriteFlow) {
+        let expanded = crate::fileio::expand_leading_tilde(&answer);
+        let path = std::path::Path::new(&expanded);
+        let name_exists = std::fs::metadata(path).is_ok();
+        let do_warning = match &self.buf().path {
+            None => name_exists,
+            Some(own) => crate::fileio::full_path(path) != crate::fileio::full_path(own),
+        };
+        if do_warning {
+            if !flow.maychange && (flow.exiting || self.buf().mark.is_none()) {
+                self.ask_write_question(WriteQuestion::DifferentName, answer, flow);
+            } else if name_exists {
+                self.ask_write_question(WriteQuestion::Overwrite, answer, flow);
+            } else {
+                self.finish_write(&answer, flow);
             }
+        } else if name_exists
+            && self
+                .buf()
+                .disk_state
+                .as_ref()
+                .is_some_and(|known| crate::fileio::changed_on_disk_since(known, path))
+        {
+            self.brief_warning = Some("File on disk has changed".to_string());
+            self.ask_write_question(WriteQuestion::DiskChanged, answer, flow);
         } else {
-            self.begin_writeout(false);
+            self.finish_write(&answer, flow);
+        }
+    }
+
+    fn ask_write_question(&mut self, question: WriteQuestion, answer: String, flow: WriteFlow) {
+        let label = match question {
+            WriteQuestion::DifferentName => "Save file under DIFFERENT NAME? ".to_string(),
+            WriteQuestion::Overwrite => {
+                // nano's crop_to_fit(answer, COLS - breadth(question) + 1),
+                // where the question's "%s" counts as two columns.
+                let room = self
+                    .screen_cols
+                    .saturating_sub(overwrite_question("").chars().count() + 1);
+                overwrite_question(&crop_to_fit(&answer, room))
+            }
+            WriteQuestion::DiskChanged => {
+                "File was modified since you opened it; continue saving? ".to_string()
+            }
+        };
+        self.mode = Mode::Prompt(Prompt {
+            kind: PromptKind::WriteConfirm {
+                question,
+                answer,
+                flow,
+            },
+            menu: Menu::YesNo,
+            label,
+            input: String::new(),
+            cursor: 0,
+            history_pos: None,
+            saved_input: None,
+        });
+    }
+
+    /// Act on the answer to a `WriteConfirm` question, following
+    /// `write_it_out` -- a "No" to either name question reshows the Write
+    /// Out prompt with the name as typed (nano's `continue`).
+    pub(crate) fn answer_write_question(
+        &mut self,
+        question: WriteQuestion,
+        answer: String,
+        mut flow: WriteFlow,
+        choice: YesNo,
+    ) {
+        self.mode = Mode::Editing;
+        match question {
+            WriteQuestion::DifferentName => {
+                if choice != YesNo::Yes {
+                    return self.prompt_for_write(flow, answer);
+                }
+                flow.maychange = true;
+                if std::fs::metadata(crate::fileio::expand_leading_tilde(&answer)).is_ok() {
+                    self.ask_write_question(WriteQuestion::Overwrite, answer, flow);
+                } else {
+                    self.finish_write(&answer, flow);
+                }
+            }
+            WriteQuestion::Overwrite => {
+                if choice != YesNo::Yes {
+                    return self.prompt_for_write(flow, answer);
+                }
+                self.finish_write(&answer, flow);
+            }
+            // nano's `write_it_out` returns 0 (failure), 1 (success) or 2
+            // (discard the buffer); `do_exit` closes the buffer on 1 or 2,
+            // `do_writeout`/`do_savefile` only on 2.
+            WriteQuestion::DiskChanged => {
+                if self.options.saveonexit && flow.withprompt {
+                    // In "tool mode": Yes overwrites without updating the
+                    // buffer's bookkeeping (nano's NONOTES), No discards
+                    // the buffer, Cancel does nothing.
+                    match choice {
+                        YesNo::Yes => {
+                            if self.write_buffer_plainly(&answer) && flow.exiting {
+                                self.close_current_buffer();
+                            }
+                        }
+                        YesNo::No => self.close_current_buffer(),
+                        YesNo::Cancel => {}
+                    }
+                } else if choice == YesNo::Cancel && flow.exiting {
+                    self.prompt_for_write(flow, answer);
+                } else if choice != YesNo::Yes {
+                    // Not writing still counts as success, so ^X then
+                    // closes the buffer unsaved.
+                    if flow.exiting {
+                        self.close_current_buffer();
+                    }
+                } else {
+                    self.finish_write(&answer, flow);
+                }
+            }
+        }
+    }
+
+    /// The end of `write_it_out`: the marked region when one was prompted
+    /// for (and not exiting), else the whole buffer.
+    fn finish_write(&mut self, answer: &str, flow: WriteFlow) {
+        // nano's write_file expands a leading ~ or ~user.
+        let path = std::path::PathBuf::from(crate::fileio::expand_leading_tilde(answer));
+        // A marked region writes just the selection to `path` as a
+        // standalone file -- it doesn't touch the current buffer's own
+        // path/modified/disk-state, matching nano's write_region_to_file,
+        // and doesn't clear the mark (confirmed against the installed
+        // nano: the selection stays highlighted afterward).
+        if flow.withprompt
+            && !flow.exiting
+            && let Some((start, end)) = self.selection_range()
+        {
+            let mut selected = self.buf().text_range(start, end);
+            // nano's write_region_to_file: a region that ends partway into
+            // a line gets an empty line after it (so the file ends with a
+            // newline) unless `nonewlines` -- and, like any write, line
+            // breaks in the buffer's own format.
+            if end.col > 0 && !self.options.nonewlines {
+                selected.push('\n');
+            }
+            let bytes = crate::fileio::with_line_breaks(selected.clone(), self.buf().format);
+            match std::fs::write(&path, bytes) {
+                Ok(()) => {
+                    self.set_status(wrote_lines(crate::fileio::nano_style_line_count(&selected)))
+                }
+                Err(e) => self.set_status_alert(format!("Error writing {}: {e}", path.display())),
+            }
+            return;
+        }
+        self.write_buffer_to(&path, flow.exiting);
+    }
+
+    /// nano's `write_file(..., NONOTES)`: write the whole buffer to `path`
+    /// without marking it saved or renaming it. tico still refreshes the
+    /// buffer's disk snapshot, which only its own external-change watcher
+    /// reads, so that watcher doesn't then report tico's own write.
+    fn write_buffer_plainly(&mut self, path: &str) -> bool {
+        let path = std::path::Path::new(path);
+        match std::fs::write(path, crate::fileio::serialized(self.buf())) {
+            Ok(()) => {
+                self.buf_mut().disk_state = crate::fileio::stat_disk_state(path);
+                // Unlike a normal save, nano reports this one even under
+                // minibar: its line-count note is only for annotated writes.
+                self.set_status(wrote_lines(self.buf().nano_line_count()));
+                true
+            }
+            Err(e) => {
+                self.set_status_alert(format!("Error writing {}: {e}", path.display()));
+                false
+            }
         }
     }
 
     fn begin_exit(&mut self) {
+        // `--saveonexit`/`set saveonexit`: a modified buffer that has a
+        // name is written without asking (nano's `do_exit`); an unnamed
+        // one first flashes "No file name", then falls through to the
+        // usual "Save modified buffer?".
+        if self.buf().modified && self.options.saveonexit {
+            if self.buf().path.is_some() {
+                self.write_it_out(true, true);
+                return;
+            }
+            self.brief_warning = Some("No file name".to_string());
+        }
         if self.buf().modified {
             self.mode = Mode::Prompt(Prompt {
                 kind: PromptKind::Exit {
                     discard_and_quit: false,
                 },
                 menu: Menu::YesNo,
-                label: format!(
-                    "Save modified buffer{}? ",
-                    self.buf()
-                        .path
-                        .as_ref()
-                        .map(|p| format!(" ({})", p.display()))
-                        .unwrap_or_default()
-                ),
+                label: "Save modified buffer? ".to_string(),
                 input: String::new(),
                 cursor: 0,
                 history_pos: None,
@@ -1543,8 +1798,30 @@ impl Editor {
         }
     }
 
+    /// Write the whole current buffer to `path` (the Write Out prompt's
+    /// non-selection case) and report it; when `exiting`, a successful
+    /// write then closes the buffer, as nano's `do_exit` does.
+    pub(crate) fn write_buffer_to(&mut self, path: &std::path::Path, exiting: bool) {
+        match crate::fileio::save_file(self.buf_mut(), path) {
+            Ok(()) => {
+                self.note_buffer_linecount();
+                // nano suppresses the ordinary "Wrote N lines" blurb
+                // under minibar too -- only the persistent note shows
+                // (confirmed against the installed nano's own
+                // escape-code output).
+                if !self.options.minibar {
+                    self.set_status(wrote_lines(self.buf().nano_line_count()));
+                }
+                if exiting {
+                    self.close_current_buffer();
+                }
+            }
+            Err(e) => self.set_status_alert(format!("Error writing {}: {e}", path.display())),
+        }
+    }
+
     pub fn begin_writeout_for_exit(&mut self) {
-        self.begin_writeout(true);
+        self.write_it_out(true, true);
     }
 
     /// Kick off a three-way-merge preview for the current buffer against
@@ -2167,9 +2444,47 @@ fn find_in_lines(
     None
 }
 
+/// nano's report after writing a file: "Wrote 1 line" / "Wrote N lines".
+fn wrote_lines(count: usize) -> String {
+    if count == 1 {
+        "Wrote 1 line".to_string()
+    } else {
+        format!("Wrote {count} lines")
+    }
+}
+
+/// nano's "File \"%s\" exists; OVERWRITE? " question.
+fn overwrite_question(name: &str) -> String {
+    format!("File \"{name}\" exists; OVERWRITE? ")
+}
+
+/// nano's `crop_to_fit`: `name` if it fits in `room` columns, else its
+/// tail behind "...", or just "_" when there's no room for that.
+fn crop_to_fit(name: &str, room: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let width = |c: char| c.width().unwrap_or(0);
+    if name.chars().map(width).sum::<usize>() <= room {
+        return name.to_string();
+    }
+    if room < 4 {
+        return "_".to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for c in name.chars().rev() {
+        if used + width(c) > room - 3 {
+            break;
+        }
+        used += width(c);
+        tail.push(c);
+    }
+    format!("...{}", tail.into_iter().rev().collect::<String>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::LineFormat;
     use crate::keymap::KeyMap;
     use crate::options::Options;
 
@@ -2190,6 +2505,422 @@ mod tests {
         ed.execute(Action::Exit);
         assert!(matches!(ed.mode, Mode::Quit));
         assert!(ed.buffers.is_empty());
+    }
+
+    #[test]
+    fn saveonexit_writes_a_named_modified_buffer_without_asking() {
+        let path =
+            std::env::temp_dir().join(format!("tico_test_saveonexit.{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut ed = test_editor("hello");
+        ed.options.saveonexit = true;
+        ed.buf_mut().path = Some(path.clone());
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        assert!(matches!(ed.mode, Mode::Quit));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saveonexit_still_asks_for_an_unnamed_buffer() {
+        let mut ed = test_editor("hello");
+        ed.options.saveonexit = true;
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        assert!(matches!(
+            ed.mode,
+            Mode::Prompt(Prompt {
+                kind: PromptKind::Exit { .. },
+                ..
+            })
+        ));
+        assert_eq!(ed.brief_warning.as_deref(), Some("No file name"));
+    }
+
+    #[test]
+    fn exit_without_saveonexit_has_no_warning() {
+        let mut ed = test_editor("hello");
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        assert_eq!(ed.brief_warning, None);
+    }
+
+    /// A fresh scratch directory for one write-question test.
+    fn write_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tico_wq_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An editor holding `path` as if just read from disk, then edited.
+    fn editor_on_file(path: &std::path::Path, disk: &str, text: &str) -> Editor {
+        std::fs::write(path, disk).unwrap();
+        let mut ed = test_editor(text);
+        ed.screen_cols = 80;
+        ed.buf_mut().path = Some(path.to_path_buf());
+        ed.buf_mut().disk_state = crate::fileio::stat_disk_state(path);
+        ed.buf_mut().modified = true;
+        ed
+    }
+
+    /// Make `path` look changed on disk since it was read: new contents
+    /// and an mtime well ahead of the recorded one.
+    fn touch_on_disk(path: &std::path::Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    /// Type `answer` at the Write Out prompt that's up.
+    fn submit_write(ed: &mut Editor, answer: &str) {
+        let Mode::Prompt(Prompt {
+            kind: PromptKind::WriteOut { flow },
+            ..
+        }) = std::mem::replace(&mut ed.mode, Mode::Editing)
+        else {
+            panic!("expected the Write Out prompt");
+        };
+        ed.submit_write_answer(answer.to_string(), flow);
+    }
+
+    /// The pending write question and its label, if one is up.
+    fn write_question(ed: &Editor) -> Option<(WriteQuestion, String)> {
+        match &ed.mode {
+            Mode::Prompt(Prompt {
+                kind: PromptKind::WriteConfirm { question, .. },
+                label,
+                ..
+            }) => Some((*question, label.clone())),
+            _ => None,
+        }
+    }
+
+    fn answer(ed: &mut Editor, choice: YesNo) {
+        let Mode::Prompt(Prompt {
+            kind:
+                PromptKind::WriteConfirm {
+                    question,
+                    answer,
+                    flow,
+                },
+            ..
+        }) = std::mem::replace(&mut ed.mode, Mode::Editing)
+        else {
+            panic!("expected a write question");
+        };
+        ed.answer_write_question(question, answer, flow, choice);
+    }
+
+    #[test]
+    fn write_out_under_another_name_asks_different_name_then_overwrite() {
+        let dir = write_test_dir("different_name");
+        let own = dir.join("own.txt");
+        let other = dir.join("other.txt");
+        std::fs::write(&other, "theirs").unwrap();
+        let mut ed = editor_on_file(&own, "old", "new");
+        let other_s = other.display().to_string();
+
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &other_s);
+        assert_eq!(
+            write_question(&ed),
+            Some((
+                WriteQuestion::DifferentName,
+                "Save file under DIFFERENT NAME? ".to_string()
+            ))
+        );
+
+        // No: back to the Write Out prompt, offering the name as typed.
+        answer(&mut ed, YesNo::No);
+        match &ed.mode {
+            Mode::Prompt(p) => {
+                assert!(matches!(p.kind, PromptKind::WriteOut { .. }));
+                assert_eq!(p.input, other_s);
+            }
+            _ => panic!("expected the Write Out prompt again"),
+        }
+
+        submit_write(&mut ed, &other_s);
+        answer(&mut ed, YesNo::Yes);
+        let (question, label) = write_question(&ed).unwrap();
+        assert_eq!(question, WriteQuestion::Overwrite);
+        assert!(label.starts_with("File \""), "{label}");
+        assert!(label.ends_with("\" exists; OVERWRITE? "), "{label}");
+        assert!(label.chars().count() <= 80, "{label}");
+
+        answer(&mut ed, YesNo::Yes);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "old");
+        assert_eq!(ed.buf().path.as_deref(), Some(other.as_path()));
+        assert!(!ed.buf().modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn declining_overwrite_writes_nothing_and_reprompts() {
+        let dir = write_test_dir("decline_overwrite");
+        let other = dir.join("other.txt");
+        std::fs::write(&other, "theirs").unwrap();
+        let mut ed = test_editor("mine");
+        ed.screen_cols = 80;
+        ed.buf_mut().modified = true;
+
+        // An unnamed buffer may take any name, so only OVERWRITE is asked.
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &other.display().to_string());
+        assert_eq!(write_question(&ed).unwrap().0, WriteQuestion::Overwrite);
+        answer(&mut ed, YesNo::Cancel);
+        assert!(matches!(
+            ed.mode,
+            Mode::Prompt(Prompt {
+                kind: PromptKind::WriteOut { .. },
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "theirs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unnamed_buffer_to_a_new_name_is_written_without_questions() {
+        let dir = write_test_dir("new_name");
+        let path = dir.join("fresh.txt");
+        let mut ed = test_editor("mine");
+        ed.buf_mut().modified = true;
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &path.display().to_string());
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        assert_eq!(ed.status.as_deref(), Some("Wrote 1 line"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrote_lines_matches_nanos_wording() {
+        assert_eq!(wrote_lines(0), "Wrote 0 lines");
+        assert_eq!(wrote_lines(1), "Wrote 1 line");
+        assert_eq!(wrote_lines(3), "Wrote 3 lines");
+    }
+
+    #[test]
+    fn exit_question_matches_nano_even_for_a_named_buffer() {
+        let mut ed = test_editor("x");
+        ed.buf_mut().path = Some("named.txt".into());
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        let Mode::Prompt(p) = &ed.mode else {
+            panic!("expected the exit question");
+        };
+        assert_eq!(p.label, "Save modified buffer? ");
+    }
+
+    #[test]
+    fn a_selection_under_another_name_skips_the_different_name_question() {
+        let dir = write_test_dir("selection");
+        let own = dir.join("own.txt");
+        let other = dir.join("part.txt");
+        let mut ed = editor_on_file(&own, "old", "hello world");
+        ed.buf_mut().mark = Some(Pos::new(0, 0));
+        ed.buf_mut().cursor = Pos::new(0, 5);
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &other.display().to_string());
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "hello\n");
+        assert_eq!(ed.status.as_deref(), Some("Wrote 1 line"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write `text`'s region `from`..`to` to a fresh file via ^O, as
+    /// `format`, and return what landed on disk.
+    fn write_region(
+        text: &str,
+        from: Pos,
+        to: Pos,
+        format: LineFormat,
+        nonewlines: bool,
+    ) -> String {
+        let dir = write_test_dir(&format!("region_{}_{}_{nonewlines}", to.line, to.col));
+        let out = dir.join(format!("{format:?}.txt"));
+        let mut ed = test_editor(text);
+        ed.options.nonewlines = nonewlines;
+        ed.buf_mut().format = format;
+        ed.buf_mut().mark = Some(from);
+        ed.buf_mut().cursor = to;
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &out.display().to_string());
+        let written = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        written
+    }
+
+    #[test]
+    fn a_region_write_ends_with_a_newline_like_nano() {
+        let text = "one\ntwo\nthree\n";
+        // Ending mid-line: nano adds the newline.
+        assert_eq!(
+            write_region(
+                text,
+                Pos::new(0, 0),
+                Pos::new(1, 2),
+                LineFormat::Unix,
+                false
+            ),
+            "one\ntw\n"
+        );
+        // Ending at the start of a line: already ends with one.
+        assert_eq!(
+            write_region(
+                text,
+                Pos::new(0, 0),
+                Pos::new(2, 0),
+                LineFormat::Unix,
+                false
+            ),
+            "one\ntwo\n"
+        );
+        // `nonewlines`: nothing added.
+        assert_eq!(
+            write_region(text, Pos::new(0, 0), Pos::new(1, 2), LineFormat::Unix, true),
+            "one\ntw"
+        );
+        // Line breaks follow the buffer's format.
+        assert_eq!(
+            write_region(text, Pos::new(0, 0), Pos::new(1, 2), LineFormat::Dos, false),
+            "one\r\ntw\r\n"
+        );
+        assert_eq!(
+            write_region(text, Pos::new(0, 0), Pos::new(1, 2), LineFormat::Mac, false),
+            "one\rtw\r"
+        );
+    }
+
+    #[test]
+    fn empty_write_out_answer_cancels() {
+        let mut ed = test_editor("mine");
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, "");
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+    }
+
+    #[test]
+    fn saving_over_a_file_changed_on_disk_warns_and_asks() {
+        let dir = write_test_dir("disk_changed");
+        let own = dir.join("own.txt");
+        let mut ed = editor_on_file(&own, "old", "mine");
+        touch_on_disk(&own, "theirs");
+
+        ed.execute(Action::SaveFile);
+        assert_eq!(
+            ed.brief_warning.as_deref(),
+            Some("File on disk has changed")
+        );
+        assert_eq!(
+            write_question(&ed),
+            Some((
+                WriteQuestion::DiskChanged,
+                "File was modified since you opened it; continue saving? ".to_string()
+            ))
+        );
+        // ^S answered No: nothing written, the buffer stays as it was.
+        answer(&mut ed, YesNo::No);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "theirs");
+        assert!(ed.buf().modified);
+
+        ed.brief_warning = None;
+        ed.execute(Action::SaveFile);
+        answer(&mut ed, YesNo::Yes);
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "mine");
+        assert!(!ed.buf().modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchanged_file_on_disk_saves_without_asking() {
+        let dir = write_test_dir("disk_unchanged");
+        let own = dir.join("own.txt");
+        let mut ed = editor_on_file(&own, "old", "mine");
+        ed.execute(Action::SaveFile);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.brief_warning, None);
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "mine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exiting_over_a_changed_file_no_closes_unsaved_cancel_reprompts() {
+        let dir = write_test_dir("exit_disk_changed");
+        let own = dir.join("own.txt");
+        let own_s = own.display().to_string();
+
+        // Cancel goes back to the Write Out prompt.
+        let mut ed = editor_on_file(&own, "old", "mine");
+        touch_on_disk(&own, "theirs");
+        ed.begin_writeout_for_exit();
+        submit_write(&mut ed, &own_s);
+        assert_eq!(write_question(&ed).unwrap().0, WriteQuestion::DiskChanged);
+        answer(&mut ed, YesNo::Cancel);
+        assert!(matches!(
+            ed.mode,
+            Mode::Prompt(Prompt {
+                kind: PromptKind::WriteOut { .. },
+                ..
+            })
+        ));
+
+        // No counts as done: the buffer is closed without writing.
+        submit_write(&mut ed, &own_s);
+        answer(&mut ed, YesNo::No);
+        assert!(matches!(ed.mode, Mode::Quit));
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "theirs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saveonexit_over_a_changed_file() {
+        let dir = write_test_dir("saveonexit_disk_changed");
+        let own = dir.join("own.txt");
+
+        // Cancel: nothing happens, the buffer stays open.
+        let mut ed = editor_on_file(&own, "old", "mine");
+        ed.options.saveonexit = true;
+        touch_on_disk(&own, "theirs");
+        ed.execute(Action::Exit);
+        assert_eq!(write_question(&ed).unwrap().0, WriteQuestion::DiskChanged);
+        answer(&mut ed, YesNo::Cancel);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.buffers.len(), 1);
+
+        // No: the buffer is discarded.
+        ed.execute(Action::Exit);
+        answer(&mut ed, YesNo::No);
+        assert!(matches!(ed.mode, Mode::Quit));
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "theirs");
+
+        // Yes: written, then closed.
+        let mut ed = editor_on_file(&own, "old", "mine");
+        ed.options.saveonexit = true;
+        touch_on_disk(&own, "theirs");
+        ed.execute(Action::Exit);
+        answer(&mut ed, YesNo::Yes);
+        assert!(matches!(ed.mode, Mode::Quit));
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "mine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crop_to_fit_matches_nano() {
+        assert_eq!(crop_to_fit("short", 10), "short");
+        assert_eq!(crop_to_fit("/a/long/path/name.txt", 10), "...ame.txt");
+        assert_eq!(crop_to_fit("abcdef", 3), "_");
     }
 
     #[test]

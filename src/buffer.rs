@@ -75,6 +75,9 @@ pub struct DiskState {
     pub mtime: Option<SystemTime>,
     pub len: u64,
     pub content_hash: u64,
+    /// The file's (device, inode) where the platform has them: part of
+    /// nano's "File on disk has changed" test at save time.
+    pub file_id: Option<(u64, u64)>,
 }
 
 /// A memoized `syntax::highlight()` result, valid as long as `version`
