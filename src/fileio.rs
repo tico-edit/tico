@@ -140,7 +140,62 @@ pub fn stat_disk_state(path: &Path) -> Option<DiskState> {
         mtime: meta.modified().ok(),
         len: meta.len(),
         content_hash: hash_content(&content),
+        file_id: file_id(&meta),
     })
+}
+
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Whole seconds since the epoch, the resolution of nano's `st_mtime`.
+fn mtime_secs(mtime: Option<std::time::SystemTime>) -> Option<u64> {
+    mtime?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// nano's save-time "File on disk has changed" test (in `write_it_out`):
+/// the file at `path` is newer than when it was last read or written, or
+/// is a different file altogether (another device or inode).
+pub fn changed_on_disk_since(known: &DiskState, path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let newer = match (mtime_secs(known.mtime), mtime_secs(meta.modified().ok())) {
+        (Some(then), Some(now)) => then < now,
+        _ => false,
+    };
+    let replaced = match (known.file_id, file_id(&meta)) {
+        (Some(then), Some(now)) => then != now,
+        _ => false,
+    };
+    newer || replaced
+}
+
+/// nano's `get_full_path`: `path` made absolute with symlinks resolved --
+/// or, for a file that doesn't exist yet, its directory resolved with the
+/// last component re-added. `None` when even the directory can't be
+/// resolved. Used to tell whether a Write Out name is the buffer's own.
+pub fn full_path(path: &Path) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(expand_leading_tilde(&path.to_string_lossy()));
+    if let Ok(target) = std::fs::canonicalize(&path) {
+        return Some(target);
+    }
+    let name = path.file_name()?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    Some(std::fs::canonicalize(dir).ok()?.join(name))
 }
 
 /// A human-readable summary of a freshly loaded file's size, matching

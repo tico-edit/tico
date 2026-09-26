@@ -744,6 +744,7 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
     // handled directly, without going through the text-editing path.
     match &prompt.kind {
         PromptKind::Exit { .. } => return handle_exit_choice(editor, prompt, key),
+        PromptKind::WriteConfirm { .. } => return handle_write_confirm_choice(editor, prompt, key),
         PromptKind::ExternalChangeConflict => return handle_conflict_choice(editor, prompt, key),
         PromptKind::LockConflict { .. } => return handle_lock_conflict_choice(editor, prompt, key),
         PromptKind::ReplaceConfirm(_) => return handle_replace_confirm_choice(editor, prompt, key),
@@ -1024,7 +1025,7 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
         // to Unix if it already was that -- and re-show the prompt with
         // its " [DOS Format]"/" [Mac Format]" tag updated.
         Action::DosFormat | Action::MacFormat => {
-            let PromptKind::WriteOut { exiting } = prompt.kind else {
+            let PromptKind::WriteOut { flow } = prompt.kind else {
                 return false;
             };
             use crate::buffer::LineFormat;
@@ -1039,7 +1040,7 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             } else {
                 wanted
             };
-            prompt.label = editor.writeout_prompt_label(exiting);
+            prompt.label = editor.writeout_prompt_label(flow.exiting);
             false
         }
         // Recognized (bound, shown in the shortcut bar and ^G help) but not
@@ -1297,27 +1298,77 @@ fn refresh_search_label(editor: &Editor, prompt: &mut Prompt) {
     prompt.label = crate::app::search_prompt_label("Search", suffix, &editor.search);
 }
 
+/// nano's `ask_user` for a Yes/No question: Y/y and N/n, the menu's
+/// Cancel key (or Esc), plus nano's control-key shortcuts -- ^Y for Yes,
+/// and ^N or ^Q (^X under `--modernbindings`) for No, "to allow exiting in
+/// anger". Anything else leaves the question up.
+fn ask_user_choice(editor: &Editor, key: KeyEvent) -> Option<crate::app::YesNo> {
+    use crate::app::YesNo;
+    if matches!(key.code, KeyCode::Esc) {
+        return Some(YesNo::Cancel);
+    }
+    if !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => return Some(YesNo::Yes),
+            KeyCode::Char('n' | 'N') => return Some(YesNo::No),
+            _ => {}
+        }
+    }
+    let tkey = normalize_key(key)?;
+    if editor.keymap.lookup_menu_only(Menu::YesNo, tkey) == Some(&Binding::Action(Action::Cancel)) {
+        return Some(YesNo::Cancel);
+    }
+    let modern = editor.options.modernbindings;
+    match tkey {
+        TKey::Ctrl('Y') => Some(YesNo::Yes),
+        TKey::Ctrl('N') => Some(YesNo::No),
+        TKey::Ctrl('Q') if !modern => Some(YesNo::No),
+        TKey::Ctrl('X') if modern => Some(YesNo::No),
+        _ => None,
+    }
+}
+
 fn handle_exit_choice(editor: &mut Editor, prompt: Prompt, key: KeyEvent) {
+    use crate::app::YesNo;
     let PromptKind::Exit { .. } = &prompt.kind else {
         return;
     };
-    match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+    match ask_user_choice(editor, key) {
+        Some(YesNo::Yes) => {
             editor.mode = Mode::Editing;
             editor.begin_writeout_for_exit();
         }
-        KeyCode::Char('n') | KeyCode::Char('N') => {
+        Some(YesNo::No) => {
             editor.close_current_buffer();
             if !matches!(editor.mode, Mode::Quit) {
                 editor.mode = Mode::Editing;
             }
         }
-        KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
+        Some(YesNo::Cancel) => {
             editor.mode = Mode::Editing;
             editor.set_status("Cancelled");
         }
-        _ => editor.mode = Mode::Prompt(prompt),
+        None => editor.mode = Mode::Prompt(prompt),
     }
+}
+
+fn handle_write_confirm_choice(editor: &mut Editor, prompt: Prompt, key: KeyEvent) {
+    let Some(choice) = ask_user_choice(editor, key) else {
+        editor.mode = Mode::Prompt(prompt);
+        return;
+    };
+    let PromptKind::WriteConfirm {
+        question,
+        answer,
+        flow,
+    } = prompt.kind
+    else {
+        return;
+    };
+    editor.answer_write_question(question, answer, flow, choice);
 }
 
 fn handle_conflict_choice(editor: &mut Editor, prompt: Prompt, key: KeyEvent) {
@@ -1663,25 +1714,7 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
             }
             advance_spell_fix(editor, remaining);
         }
-        PromptKind::WriteOut { exiting } => {
-            editor.mode = Mode::Editing;
-            let path = std::path::PathBuf::from(text);
-            // A marked region (outside of the exit-time save prompt)
-            // writes just the selection to `path` as a standalone file --
-            // it doesn't touch the current buffer's own path/modified/
-            // disk-state, matching nano's write_region_to_file, and
-            // doesn't clear the mark (confirmed against the installed
-            // nano: the selection stays highlighted afterward).
-            if !exiting && let Some((start, end)) = editor.selection_range() {
-                let selected = editor.buf().text_range(start, end);
-                match std::fs::write(&path, &selected) {
-                    Ok(()) => editor.set_status(format!("Wrote {}", path.display())),
-                    Err(e) => editor.set_status(format!("Error writing file: {e}")),
-                }
-                return;
-            }
-            editor.write_buffer_to(&path, exiting);
-        }
+        PromptKind::WriteOut { flow } => editor.submit_write_answer(text, flow),
         _ => {
             editor.mode = Mode::Editing;
         }
@@ -2646,7 +2679,11 @@ fn finish_cursor(editor: &Editor, out: &mut impl Write, text_start_row: u16) -> 
         let row = editor
             .screen_rows
             .saturating_sub(if editor.options.nohelp { 1 } else { 3 });
-        let col = prompt.label.chars().count() + 2 + prompt.cursor;
+        let col = if prompt.menu == Menu::YesNo {
+            prompt.label.chars().count()
+        } else {
+            prompt.label.chars().count() + 2 + prompt.cursor
+        };
         queue!(
             out,
             MoveTo(
@@ -2788,11 +2825,17 @@ fn render_status_line(
         // nano's own escape-code output for both the Search and WriteOut
         // prompts.
         let style = bar_style(&editor.options.promptcolor, title_bar_style(editor));
-        let text = format!(
-            "{}: {}",
-            prompt.label,
-            prompt_input_for_display(editor, &prompt.input)
-        );
+        // nano's `ask_user` shows a Yes/No question bare; only `do_prompt`
+        // adds ": " and the answer being typed.
+        let text = if prompt.menu == Menu::YesNo {
+            prompt.label.clone()
+        } else {
+            format!(
+                "{}: {}",
+                prompt.label,
+                prompt_input_for_display(editor, &prompt.input)
+            )
+        };
         let mut s: String = text.chars().take(cols).collect();
         while s.chars().count() < cols {
             s.push(' ');
@@ -3050,12 +3093,13 @@ const EXTERNAL_CONFLICT_SHORTCUTS: &[(&str, &str)] = &[
     ("I", "Ignore All"),
 ];
 
-/// "Save modified buffer?" — confirmed against the installed nano's own
+/// nano's plain Yes/No questions ("Save modified buffer?", and Write
+/// Out's follow-up questions) — confirmed against the installed nano's own
 /// bar. The blank third entry keeps Cancel in the bottom-right slot,
 /// matching nano's layout (its Y/N/^C bar isn't a plain fill-in-order
 /// grid: Yes/No stack in the left column, Cancel sits alone at bottom
 /// right).
-const EXIT_SHORTCUTS: &[(&str, &str)] = &[("Y", "Yes"), ("N", "No"), ("", ""), ("^C", "Cancel")];
+const YES_NO_SHORTCUTS: &[(&str, &str)] = &[("Y", "Yes"), ("N", "No"), ("", ""), ("^C", "Cancel")];
 
 /// "Replace this instance?" — confirmed against the installed nano's own
 /// bar; unlike the exit prompt this one fills all four slots, so no blank
@@ -3095,7 +3139,7 @@ fn shortcut_bar_entries(keymap: &KeyMap, prompt: Option<&Prompt>) -> Vec<(String
     // handle_exit_choice/handle_lock_conflict_choice/
     // handle_replace_confirm_choice), so these stay literal too.
     let literal: Option<&[(&str, &str)]> = match &p.kind {
-        PromptKind::Exit { .. } => Some(EXIT_SHORTCUTS),
+        PromptKind::Exit { .. } | PromptKind::WriteConfirm { .. } => Some(YES_NO_SHORTCUTS),
         PromptKind::LockConflict { .. } => Some(LOCK_CONFLICT_SHORTCUTS),
         PromptKind::ReplaceConfirm(_) => Some(REPLACE_CONFIRM_SHORTCUTS),
         _ => None,
@@ -3972,6 +4016,38 @@ mod tests {
     }
 
     #[test]
+    fn yes_no_questions_take_nanos_keys() {
+        use crate::app::YesNo;
+        let ed = test_editor("");
+        let k = |c, m| ask_user_choice(&ed, KeyEvent::new(KeyCode::Char(c), m));
+        assert_eq!(k('y', KeyModifiers::NONE), Some(YesNo::Yes));
+        assert_eq!(k('N', KeyModifiers::SHIFT), Some(YesNo::No));
+        assert_eq!(k('c', KeyModifiers::CONTROL), Some(YesNo::Cancel));
+        assert_eq!(k('y', KeyModifiers::CONTROL), Some(YesNo::Yes));
+        assert_eq!(k('n', KeyModifiers::CONTROL), Some(YesNo::No));
+        assert_eq!(k('q', KeyModifiers::CONTROL), Some(YesNo::No));
+        // A plain "c" isn't Cancel in nano; it's ignored.
+        assert_eq!(k('c', KeyModifiers::NONE), None);
+        assert_eq!(
+            ask_user_choice(&ed, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(YesNo::Cancel)
+        );
+    }
+
+    #[test]
+    fn yes_no_questions_render_without_a_colon() {
+        let mut ed = test_editor("x");
+        ed.screen_cols = 40;
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        let mut out = Vec::new();
+        render_status_line(&ed, &mut out, 0, 40).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("Save modified buffer? "), "{text}");
+        assert!(!text.contains("? :"), "{text}");
+    }
+
+    #[test]
     fn shift_right_sets_a_soft_mark_and_extends_the_selection() {
         let mut ed = test_editor("hello world");
         handle_editing_key(&mut ed, KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
@@ -4049,7 +4125,13 @@ mod tests {
         ed.buf_mut().mark = Some(Pos::new(0, 0));
         ed.buf_mut().cursor = Pos::new(2, 0); // selects the first two lines whole
         let prompt = Prompt {
-            kind: PromptKind::WriteOut { exiting: false },
+            kind: PromptKind::WriteOut {
+                flow: crate::app::WriteFlow {
+                    exiting: false,
+                    withprompt: true,
+                    maychange: true,
+                },
+            },
             menu: Menu::WriteOut,
             label: "Write Selection to File".to_string(),
             input: path.to_str().unwrap().to_string(),
@@ -4343,7 +4425,13 @@ mod tests {
         let mut ed = test_editor("one\ntwo\n");
         ed.options.minibar = true;
         let prompt = Prompt {
-            kind: PromptKind::WriteOut { exiting: false },
+            kind: PromptKind::WriteOut {
+                flow: crate::app::WriteFlow {
+                    exiting: false,
+                    withprompt: true,
+                    maychange: true,
+                },
+            },
             menu: Menu::WriteOut,
             label: "Write Out".to_string(),
             input: path.to_str().unwrap().to_string(),
@@ -4451,7 +4539,13 @@ mod tests {
         ] {
             let mut ed = test_editor("x");
             let mut prompt = Prompt {
-                kind: PromptKind::WriteOut { exiting: false },
+                kind: PromptKind::WriteOut {
+                    flow: crate::app::WriteFlow {
+                        exiting: false,
+                        withprompt: true,
+                        maychange: true,
+                    },
+                },
                 menu: Menu::WriteOut,
                 label: "Write Out".to_string(),
                 input: String::new(),
@@ -4742,7 +4836,13 @@ mod tests {
         use crate::buffer::LineFormat;
         let mut ed = test_editor("x\n");
         let mut prompt = Prompt {
-            kind: PromptKind::WriteOut { exiting: false },
+            kind: PromptKind::WriteOut {
+                flow: crate::app::WriteFlow {
+                    exiting: false,
+                    withprompt: true,
+                    maychange: true,
+                },
+            },
             menu: Menu::WriteOut,
             label: ed.writeout_prompt_label(false),
             input: String::new(),
