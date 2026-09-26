@@ -58,7 +58,12 @@ here.
 - [ ] `positionlog` (no position-log machinery exists yet)
 - [ ] `restricted`
 - [ ] `operatingdir`
-- [ ] `nonewlines`
+- [ ] `nonewlines`, and the "magic line" it turns off: in nano, typing on
+      (or pasting onto, un-cutting to, ...) the buffer's last line adds a
+      new empty line below it, so a saved file ends with a newline. tico
+      has no magic line yet, so it behaves as if `nonewlines` were always
+      on (a file edited on its last line is saved without a final
+      newline). Only the Write Out selection write honors the setting.
 
 ### Editing
 

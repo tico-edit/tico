@@ -315,8 +315,12 @@ pub fn load_file(path: &Path, opts: &Options) -> std::io::Result<LoadedFile> {
 /// one (nano 8.7's `write_file`: a CR before each `'\n'` for both, and
 /// the `'\n'` itself only when not Mac).
 pub fn serialized(buffer: &Buffer) -> String {
-    let text = buffer.to_string();
-    match buffer.format {
+    with_line_breaks(buffer.to_string(), buffer.format)
+}
+
+/// `text` with each `'\n'` written as `format` breaks lines on disk.
+pub fn with_line_breaks(text: String, format: LineFormat) -> String {
+    match format {
         LineFormat::Dos => text.replace('\n', "\r\n"),
         LineFormat::Mac => text.replace('\n', "\r"),
         LineFormat::Unix | LineFormat::Unspecified => text,

@@ -1701,8 +1701,16 @@ impl Editor {
             && !flow.exiting
             && let Some((start, end)) = self.selection_range()
         {
-            let selected = self.buf().text_range(start, end);
-            match std::fs::write(&path, &selected) {
+            let mut selected = self.buf().text_range(start, end);
+            // nano's write_region_to_file: a region that ends partway into
+            // a line gets an empty line after it (so the file ends with a
+            // newline) unless `nonewlines` -- and, like any write, line
+            // breaks in the buffer's own format.
+            if end.col > 0 && !self.options.nonewlines {
+                selected.push('\n');
+            }
+            let bytes = crate::fileio::with_line_breaks(selected.clone(), self.buf().format);
+            match std::fs::write(&path, bytes) {
                 Ok(()) => {
                     self.set_status(wrote_lines(crate::fileio::nano_style_line_count(&selected)))
                 }
@@ -2476,6 +2484,7 @@ fn crop_to_fit(name: &str, room: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::LineFormat;
     use crate::keymap::KeyMap;
     use crate::options::Options;
 
@@ -2723,8 +2732,73 @@ mod tests {
         ed.execute(Action::WriteOut);
         submit_write(&mut ed, &other.display().to_string());
         assert!(matches!(ed.mode, Mode::Editing));
-        assert_eq!(std::fs::read_to_string(&other).unwrap(), "hello");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "hello\n");
+        assert_eq!(ed.status.as_deref(), Some("Wrote 1 line"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write `text`'s region `from`..`to` to a fresh file via ^O, as
+    /// `format`, and return what landed on disk.
+    fn write_region(
+        text: &str,
+        from: Pos,
+        to: Pos,
+        format: LineFormat,
+        nonewlines: bool,
+    ) -> String {
+        let dir = write_test_dir(&format!("region_{}_{}_{nonewlines}", to.line, to.col));
+        let out = dir.join(format!("{format:?}.txt"));
+        let mut ed = test_editor(text);
+        ed.options.nonewlines = nonewlines;
+        ed.buf_mut().format = format;
+        ed.buf_mut().mark = Some(from);
+        ed.buf_mut().cursor = to;
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &out.display().to_string());
+        let written = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        written
+    }
+
+    #[test]
+    fn a_region_write_ends_with_a_newline_like_nano() {
+        let text = "one\ntwo\nthree\n";
+        // Ending mid-line: nano adds the newline.
+        assert_eq!(
+            write_region(
+                text,
+                Pos::new(0, 0),
+                Pos::new(1, 2),
+                LineFormat::Unix,
+                false
+            ),
+            "one\ntw\n"
+        );
+        // Ending at the start of a line: already ends with one.
+        assert_eq!(
+            write_region(
+                text,
+                Pos::new(0, 0),
+                Pos::new(2, 0),
+                LineFormat::Unix,
+                false
+            ),
+            "one\ntwo\n"
+        );
+        // `nonewlines`: nothing added.
+        assert_eq!(
+            write_region(text, Pos::new(0, 0), Pos::new(1, 2), LineFormat::Unix, true),
+            "one\ntw"
+        );
+        // Line breaks follow the buffer's format.
+        assert_eq!(
+            write_region(text, Pos::new(0, 0), Pos::new(1, 2), LineFormat::Dos, false),
+            "one\r\ntw\r\n"
+        );
+        assert_eq!(
+            write_region(text, Pos::new(0, 0), Pos::new(1, 2), LineFormat::Mac, false),
+            "one\rtw\r"
+        );
     }
 
     #[test]
