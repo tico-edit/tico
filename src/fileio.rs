@@ -286,7 +286,7 @@ pub struct LoadedFile {
     pub detected: LineFormat,
 }
 
-fn nano_style_line_count(text: &str) -> usize {
+pub(crate) fn nano_style_line_count(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }

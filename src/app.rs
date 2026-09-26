@@ -1703,7 +1703,9 @@ impl Editor {
         {
             let selected = self.buf().text_range(start, end);
             match std::fs::write(&path, &selected) {
-                Ok(()) => self.set_status(format!("Wrote {}", path.display())),
+                Ok(()) => {
+                    self.set_status(wrote_lines(crate::fileio::nano_style_line_count(&selected)))
+                }
                 Err(e) => self.set_status_alert(format!("Error writing {}: {e}", path.display())),
             }
             return;
@@ -1720,9 +1722,9 @@ impl Editor {
         match std::fs::write(path, crate::fileio::serialized(self.buf())) {
             Ok(()) => {
                 self.buf_mut().disk_state = crate::fileio::stat_disk_state(path);
-                if !self.options.minibar {
-                    self.set_status(format!("Wrote {}", path.display()));
-                }
+                // Unlike a normal save, nano reports this one even under
+                // minibar: its line-count note is only for annotated writes.
+                self.set_status(wrote_lines(self.buf().nano_line_count()));
                 true
             }
             Err(e) => {
@@ -1750,14 +1752,7 @@ impl Editor {
                     discard_and_quit: false,
                 },
                 menu: Menu::YesNo,
-                label: format!(
-                    "Save modified buffer{}? ",
-                    self.buf()
-                        .path
-                        .as_ref()
-                        .map(|p| format!(" ({})", p.display()))
-                        .unwrap_or_default()
-                ),
+                label: "Save modified buffer? ".to_string(),
                 input: String::new(),
                 cursor: 0,
                 history_pos: None,
@@ -1807,7 +1802,7 @@ impl Editor {
                 // (confirmed against the installed nano's own
                 // escape-code output).
                 if !self.options.minibar {
-                    self.set_status(format!("Wrote {}", path.display()));
+                    self.set_status(wrote_lines(self.buf().nano_line_count()));
                 }
                 if exiting {
                     self.close_current_buffer();
@@ -2441,6 +2436,15 @@ fn find_in_lines(
     None
 }
 
+/// nano's report after writing a file: "Wrote 1 line" / "Wrote N lines".
+fn wrote_lines(count: usize) -> String {
+    if count == 1 {
+        "Wrote 1 line".to_string()
+    } else {
+        format!("Wrote {count} lines")
+    }
+}
+
 /// nano's "File \"%s\" exists; OVERWRITE? " question.
 fn overwrite_question(name: &str) -> String {
     format!("File \"{name}\" exists; OVERWRITE? ")
@@ -2685,7 +2689,27 @@ mod tests {
         submit_write(&mut ed, &path.display().to_string());
         assert!(matches!(ed.mode, Mode::Editing));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        assert_eq!(ed.status.as_deref(), Some("Wrote 1 line"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrote_lines_matches_nanos_wording() {
+        assert_eq!(wrote_lines(0), "Wrote 0 lines");
+        assert_eq!(wrote_lines(1), "Wrote 1 line");
+        assert_eq!(wrote_lines(3), "Wrote 3 lines");
+    }
+
+    #[test]
+    fn exit_question_matches_nano_even_for_a_named_buffer() {
+        let mut ed = test_editor("x");
+        ed.buf_mut().path = Some("named.txt".into());
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        let Mode::Prompt(p) = &ed.mode else {
+            panic!("expected the exit question");
+        };
+        assert_eq!(p.label, "Save modified buffer? ");
     }
 
     #[test]
