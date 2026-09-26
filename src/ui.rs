@@ -171,6 +171,8 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
 
         sync_mouse_capture(editor, &mut mouse_capture_enabled)?;
 
+        show_brief_warning(editor)?;
+
         if dirty {
             render_and_ring(editor)?;
         }
@@ -200,11 +202,35 @@ fn sync_mouse_capture(editor: &Editor, enabled: &mut bool) -> io::Result<()> {
 fn render_and_ring(editor: &mut Editor) -> io::Result<()> {
     maybe_warn_highlighting_disabled_for_size(editor);
     render(editor)?;
+    ring_pending_bell(editor)
+}
+
+fn ring_pending_bell(editor: &mut Editor) -> io::Result<()> {
     if editor.bell_pending {
         editor.bell_pending = false;
         print!("\x07");
         io::stdout().flush()?;
     }
+    Ok(())
+}
+
+/// nano's `warn_and_briefly_pause`: blank the shortcut bars, show the
+/// queued `brief_warning` as an Alert (errorcolor plus the bell), and hold
+/// it on screen for 1.5s so it can be read before the mode set up behind
+/// it (e.g. the "Save modified buffer?" prompt) is drawn. Keys typed
+/// meanwhile stay queued for that mode, as they do across nano's `napms`.
+/// The message is dropped afterward, like nano's `lastmessage = VACUUM`.
+fn show_brief_warning(editor: &mut Editor) -> io::Result<()> {
+    let Some(msg) = editor.brief_warning.take() else {
+        return Ok(());
+    };
+    let mode = std::mem::replace(&mut editor.mode, Mode::Editing);
+    editor.set_status_alert(msg);
+    render_frame(editor, true)?;
+    ring_pending_bell(editor)?;
+    std::thread::sleep(Duration::from_millis(1500));
+    editor.mode = mode;
+    editor.status = None;
     Ok(())
 }
 
@@ -1654,22 +1680,7 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                 }
                 return;
             }
-            match crate::fileio::save_file(editor.buf_mut(), &path) {
-                Ok(()) => {
-                    editor.note_buffer_linecount();
-                    // nano suppresses the ordinary "Wrote N lines" blurb
-                    // under minibar too -- only the persistent note shows
-                    // (confirmed against the installed nano's own
-                    // escape-code output).
-                    if !editor.options.minibar {
-                        editor.set_status(format!("Wrote {}", path.display()));
-                    }
-                    if exiting {
-                        editor.close_current_buffer();
-                    }
-                }
-                Err(e) => editor.set_status(format!("Error writing file: {e}")),
-            }
+            editor.write_buffer_to(&path, exiting);
         }
         _ => {
             editor.mode = Mode::Editing;
@@ -2362,6 +2373,12 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
 // ---------------------------------------------------------------------
 
 fn render(editor: &Editor) -> io::Result<()> {
+    render_frame(editor, false)
+}
+
+/// `render`, optionally with the shortcut bars left blank (nano's
+/// `blank_bottombars`, for `show_brief_warning`).
+fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
     // No full-screen Clear here: every row below is redrawn at its full
     // width, so nothing needs re-blanking first (a per-frame Clear was the
     // cause of visible flicker). The screen is cleared once at startup and
@@ -2419,7 +2436,11 @@ fn render(editor: &Editor) -> io::Result<()> {
         } else {
             None
         };
-        let entries = shortcut_bar_entries(&editor.keymap, prompt);
+        let entries = if blank_bars {
+            Vec::new()
+        } else {
+            shortcut_bar_entries(&editor.keymap, prompt)
+        };
         render_shortcut_bar(editor, &mut out, status_row + 1, cols, &entries)?;
     }
 

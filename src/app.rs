@@ -237,6 +237,11 @@ pub struct Editor {
     /// the terminal bell once and clears this, matching nano's beep() in
     /// statusline() for ALERT-importance messages.
     pub bell_pending: bool,
+    /// A warning to flash before the next frame, nano's
+    /// `warn_and_briefly_pause`: the UI layer shows it as an Alert with the
+    /// shortcut bars blanked, holds it for 1.5s, then clears it and draws
+    /// whatever mode was set up behind it (e.g. the prompt that follows).
+    pub brief_warning: Option<String>,
     /// The currently highlighted search/replace match, if any (position +
     /// length in characters), rendered black-on-yellow like nano's
     /// `spotlightcolor` (confirmed against the installed nano's own
@@ -311,6 +316,7 @@ impl Editor {
             status_level: StatusLevel::Normal,
             status_countdown: 0,
             bell_pending: false,
+            brief_warning: None,
             spotlight: None,
             spotlight_deadline: None,
             history,
@@ -1492,6 +1498,17 @@ impl Editor {
     }
 
     fn begin_exit(&mut self) {
+        // `--saveonexit`/`set saveonexit`: a modified buffer that has a
+        // name is written without asking (nano's `do_exit`); an unnamed
+        // one first flashes "No file name", then falls through to the
+        // usual "Save modified buffer?".
+        if self.buf().modified && self.options.saveonexit {
+            if let Some(path) = self.buf().path.clone() {
+                self.write_buffer_to(&path, true);
+                return;
+            }
+            self.brief_warning = Some("No file name".to_string());
+        }
         if self.buf().modified {
             self.mode = Mode::Prompt(Prompt {
                 kind: PromptKind::Exit {
@@ -1540,6 +1557,28 @@ impl Editor {
             LineFormat::Dos => format!("{base} [DOS Format]"),
             LineFormat::Mac => format!("{base} [Mac Format]"),
             LineFormat::Unix | LineFormat::Unspecified => base.to_string(),
+        }
+    }
+
+    /// Write the whole current buffer to `path` (the Write Out prompt's
+    /// non-selection case) and report it; when `exiting`, a successful
+    /// write then closes the buffer, as nano's `do_exit` does.
+    pub(crate) fn write_buffer_to(&mut self, path: &std::path::Path, exiting: bool) {
+        match crate::fileio::save_file(self.buf_mut(), path) {
+            Ok(()) => {
+                self.note_buffer_linecount();
+                // nano suppresses the ordinary "Wrote N lines" blurb
+                // under minibar too -- only the persistent note shows
+                // (confirmed against the installed nano's own
+                // escape-code output).
+                if !self.options.minibar {
+                    self.set_status(format!("Wrote {}", path.display()));
+                }
+                if exiting {
+                    self.close_current_buffer();
+                }
+            }
+            Err(e) => self.set_status(format!("Error writing file: {e}")),
         }
     }
 
@@ -2190,6 +2229,45 @@ mod tests {
         ed.execute(Action::Exit);
         assert!(matches!(ed.mode, Mode::Quit));
         assert!(ed.buffers.is_empty());
+    }
+
+    #[test]
+    fn saveonexit_writes_a_named_modified_buffer_without_asking() {
+        let path =
+            std::env::temp_dir().join(format!("tico_test_saveonexit.{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut ed = test_editor("hello");
+        ed.options.saveonexit = true;
+        ed.buf_mut().path = Some(path.clone());
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        assert!(matches!(ed.mode, Mode::Quit));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saveonexit_still_asks_for_an_unnamed_buffer() {
+        let mut ed = test_editor("hello");
+        ed.options.saveonexit = true;
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        assert!(matches!(
+            ed.mode,
+            Mode::Prompt(Prompt {
+                kind: PromptKind::Exit { .. },
+                ..
+            })
+        ));
+        assert_eq!(ed.brief_warning.as_deref(), Some("No file name"));
+    }
+
+    #[test]
+    fn exit_without_saveonexit_has_no_warning() {
+        let mut ed = test_editor("hello");
+        ed.buf_mut().modified = true;
+        ed.execute(Action::Exit);
+        assert_eq!(ed.brief_warning, None);
     }
 
     #[test]

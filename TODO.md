@@ -56,10 +56,14 @@ here.
 - [ ] `backup` / `backupdir` (no backup-file machinery exists yet)
 - [ ] `allow_insecure_backup` — not even recognized by the nanorc parser
 - [ ] `positionlog` (no position-log machinery exists yet)
-- [ ] `saveonexit`
 - [ ] `restricted`
 - [ ] `operatingdir`
 - [ ] `nonewlines`
+- [ ] Write Out's safety questions (nano's `write_it_out`): "Save file
+      under DIFFERENT NAME?", "File "…" exists; OVERWRITE?", and "File on
+      disk has changed" / "File was modified since you opened it; continue
+      saving?" (including its `saveonexit` variant, where No discards the
+      buffer) — tico writes without asking
 
 ### Editing
 
