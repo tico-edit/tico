@@ -3755,8 +3755,6 @@ fn key_label_for(keymap: &KeyMap, menu: Menu, action: Action) -> String {
 /// cell; `n_pairs` is how many such cells fit across `cols`, each holding
 /// up to two entries (one per row of the two-line bar).
 struct ShortcutBarLayout {
-    max_label: usize,
-    max_desc: usize,
     col_width: usize,
     n_pairs: usize,
 }
@@ -3775,12 +3773,7 @@ fn shortcut_bar_layout(cols: usize, entries: &[(String, &str)]) -> ShortcutBarLa
     let col_width = max_label + 1 + max_desc + 2;
     let n_cols = (cols / col_width).max(1);
     let n_pairs = n_cols.min(entries.len().div_ceil(2));
-    ShortcutBarLayout {
-        max_label,
-        max_desc,
-        col_width,
-        n_pairs,
-    }
+    ShortcutBarLayout { col_width, n_pairs }
 }
 
 /// The entry (if any) a mouse click at `(row_in_bar, col)` -- 0-based
@@ -3820,12 +3813,7 @@ fn render_shortcut_bar(
 ) -> io::Result<()> {
     let key_style = bar_style(&editor.options.keycolor, BarStyle::Reverse);
     let desc_style = bar_style(&editor.options.functioncolor, BarStyle::Plain);
-    let ShortcutBarLayout {
-        max_label,
-        max_desc,
-        col_width,
-        n_pairs,
-    } = shortcut_bar_layout(cols, entries);
+    let ShortcutBarLayout { col_width, n_pairs } = shortcut_bar_layout(cols, entries);
 
     for r in 0..2u16 {
         queue!(out, MoveTo(0, row + r))?;
@@ -3833,14 +3821,18 @@ fn render_shortcut_bar(
         for c in 0..n_pairs {
             let idx = c * 2 + r as usize;
             if let Some((key, desc)) = entries.get(idx).filter(|(k, _)| !k.is_empty()) {
-                // As in nano: the key combo is shown in `keycolor` (reverse
-                // video by default), the description in `functioncolor`
-                // (the terminal's normal colors by default).
-                let key_padded = format!("{key:<lw$}", lw = max_label);
-                queue_bar_segment(out, key_style, &key_padded)?;
-                let rest = format!(" {desc:<dw$}  ", dw = max_desc);
-                queue_bar_segment(out, desc_style, &rest)?;
-                written += key_padded.chars().count() + rest.chars().count();
+                // As in nano's `post_one_key`: just the key combo itself in
+                // `keycolor` (reverse video by default) -- not padded out to
+                // the widest key in the bar -- then one blank and the
+                // description in `functioncolor` (the terminal's normal
+                // colors by default); the rest of the column is plain.
+                queue_bar_segment(out, key_style, key)?;
+                queue!(out, Print(" "))?;
+                queue_bar_segment(out, desc_style, desc)?;
+                let used = key.chars().count() + 1 + desc.chars().count();
+                let pad = col_width.saturating_sub(used);
+                queue!(out, Print(" ".repeat(pad)))?;
+                written += used + pad;
             } else {
                 let pad = " ".repeat(col_width);
                 queue!(out, Print(&pad))?;
@@ -6092,6 +6084,21 @@ mod tests {
         assert_eq!(ed.buf().cursor, before, "the cursor doesn't move");
         handle_mouse(&mut ed, mev(MouseEventKind::ScrollUp, 0, 0));
         assert_eq!(ed.buf().top_line, 0);
+    }
+
+    #[test]
+    fn shortcut_bar_reverses_only_the_key_itself() {
+        // nano's `post_one_key`: a short key next to a long one isn't
+        // padded out inside the reverse-video block, and the description
+        // follows it after a single blank.
+        let ed = test_editor("");
+        let entries: Vec<(String, &str)> =
+            vec![("^G".into(), "Help"), ("Right".into(), "Forward")];
+        let mut out = Vec::new();
+        render_shortcut_bar(&ed, &mut out, 0, 40, &entries).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b[7m^G\x1b[0m Help"), "{text:?}");
+        assert!(text.contains("\x1b[7mRight\x1b[0m Forward"), "{text:?}");
     }
 
     #[test]
