@@ -10,6 +10,21 @@ records the known, intentional differences from nano. Keep both current:
 remove a TODO entry when its feature lands, and add a DIFFERENCES entry
 whenever a deliberate deviation is introduced.
 
+## Keep the website's configuration doc in sync
+
+The project website (`tico-edit.github.io`) has `docs/configuration.md`
+(built to `docs/configuration.html` by that repo's `./build.pl`)
+documenting every nanorc/ticorc configuration item -- every `set`/`unset`
+name, `~/.ticorc`'s sections, and the built-in themes -- in tico's own
+words rather than by pointing at nano's docs. When a change here adds,
+removes, renames, or changes the behavior of one of those (including
+moving something from "parsed but not yet consulted" to actually working,
+or adding/renaming a built-in theme), update that page to match, and
+rebuild it. On this system that website repo is checked out as a sibling
+directory (`../tico-edit.github.io` relative to this one); if it isn't
+present, say the config doc needs a follow-up update instead of silently
+skipping it.
+
 ## Never commit or push without explicit instructions
 
 Do not run `git commit` or `git push` (or anything else that lands work in
