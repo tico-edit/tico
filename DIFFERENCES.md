@@ -81,6 +81,17 @@ main menu, Suspend appears with an empty key column). tico builds the
 listing from the live keymap, so only bound actions appear, sorted by
 description rather than by nano's order.
 
+## File browser: Esc, unbound keys, and the shortcut bar
+
+In the file browser (`^T` at the Read File / Write Out prompts), Esc
+leaves the browser, the same as it cancels any tico prompt; in nano a
+lone Esc just starts a Meta/Escape sequence. An unbound key reports
+"Unbound key: KEY" using tico's own key names (`Left`, `^Up`, ...)
+rather than nano's arrow glyphs. The bottom bar lists the same entries
+in the same order as nano's (capped at the count nano would show for
+the screen width), but laid out with tico's usual column sizing, so at
+80 columns it shows eight of nano's twelve.
+
 ## Comment toggle: cursor after removing a postfix
 
 For a bracketing comment sequence such as HTML's `<!--|-->`, uncommenting

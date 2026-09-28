@@ -16,8 +16,6 @@ here.
 - [ ] Find matching bracket (`M-]`)
 - [ ] Anchors: set, previous, next (`M-Ins` / `M-"`, `M-PgUp`, `M-PgDn` / `M-'`)
 - [ ] Macros: record and replay (`M-:` / `M-;`)
-- [ ] File browser (`^T` from the Read File / Write Out prompts), including
-      its Go To Directory, First File and Last File actions
 - [ ] Pipe Text (`M-\`) at the Execute prompt
 - [ ] Cut Till End (`^V`) from the Execute menu
 - [ ] Full Justify (`^J`) from the Execute menu — main-menu `M-J` already
@@ -42,7 +40,6 @@ here.
 - [ ] `constantshow`
 - [ ] `matchbrackets`
 - [ ] `stateflags`
-- [ ] `showcursor`
 - [ ] `boldtext`
 - [ ] `bookstyle`
 - [ ] `jumpyscrolling`
@@ -56,8 +53,9 @@ here.
 - [ ] `backup` / `backupdir` (no backup-file machinery exists yet)
 - [ ] `allow_insecure_backup` — not even recognized by the nanorc parser
 - [ ] `positionlog` (no position-log machinery exists yet)
-- [ ] `restricted`
-- [ ] `operatingdir`
+- [ ] `restricted` (which, among other things, should hide the file
+      browser's `^T`)
+- [ ] `operatingdir` (which should also confine the file browser)
 - [ ] `nonewlines`, and the "magic line" it turns off: in nano, typing on
       (or pasting onto, un-cutting to, ...) the buffer's last line adds a
       new empty line below it, so a saved file ends with a newline. tico

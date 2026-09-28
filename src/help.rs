@@ -262,8 +262,13 @@ fn shortcut_lines(menu: Menu, keymap: &KeyMap) -> Vec<String> {
             if *action == Action::SuggestSuspend {
                 continue;
             }
+            // Nor is Enter, anywhere but the main menu: it's how a prompt
+            // (or the browser's selection) is accepted, not a function.
+            if *action == Action::Enter && menu != Menu::Main {
+                continue;
+            }
             by_description
-                .entry(action.description())
+                .entry(action.description_in(menu))
                 .or_default()
                 .push(*key);
         }

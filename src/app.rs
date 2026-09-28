@@ -69,6 +69,22 @@ pub enum PromptKind {
         messages: Vec<LintMessage>,
         index: usize,
     },
+    /// The file browser's Search prompt (nano's `MWHEREISFILE`), shown
+    /// over the listing in `Editor::browser`.
+    BrowserSearch {
+        forwards: bool,
+    },
+    /// The file browser's Go To Directory prompt (nano's `MGOTODIR`).
+    GotoDir,
+}
+
+/// An open file browser (`^T` at the Read File / Write Out prompts): the
+/// listing, plus the prompt it was opened from, which gets the chosen
+/// filename -- or is simply shown again when the browser is left.
+#[derive(Debug, Clone)]
+pub struct BrowserSession {
+    pub list: crate::browser::Browser,
+    pub return_to: Prompt,
 }
 
 /// The context of one nano `write_it_out` call, carried through the Write
@@ -176,6 +192,7 @@ pub enum Mode {
     Help {
         lines: Vec<String>,
         top: usize,
+        cursor: HelpCursor,
         return_to: Option<Box<Prompt>>,
     },
     /// A full-screen, scrollable diff viewer — currently used only for
@@ -189,7 +206,23 @@ pub enum Mode {
         top: usize,
         outcome: DiffOutcome,
     },
+    /// The file browser, whose state is `Editor::browser` -- kept there
+    /// rather than here so that it survives while one of its own prompts
+    /// (`PromptKind::BrowserSearch`/`GotoDir`) or its help is up.
+    Browser,
     Quit,
+}
+
+/// Where the cursor is in the help viewer's body (an index into its
+/// `lines[1..]`), which only matters with `set showcursor`: nano's help
+/// viewer is a buffer, and with the cursor shown the arrow keys move it
+/// through the text instead of scrolling. `want` is the column Up/Down
+/// aim for (nano's `placewewant`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HelpCursor {
+    pub line: usize,
+    pub col: usize,
+    pub want: usize,
 }
 
 /// What happens when the diff viewer (`Mode::Diff`) is dismissed.
@@ -319,6 +352,8 @@ pub struct Editor {
     /// spotlight — confirmed against the installed nano's own escape-code
     /// output.
     pub minibar_note: Option<String>,
+    /// The open file browser, if any (see `Mode::Browser`).
+    pub browser: Option<BrowserSession>,
 }
 
 impl Editor {
@@ -370,6 +405,7 @@ impl Editor {
             screen_cols: 80,
             file_completions: None,
             minibar_note: None,
+            browser: None,
         }
     }
 
@@ -563,6 +599,7 @@ impl Editor {
                 self.mode = Mode::Help {
                     lines,
                     top: 0,
+                    cursor: HelpCursor::default(),
                     return_to: None,
                 };
             }
