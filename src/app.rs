@@ -192,6 +192,7 @@ pub enum Mode {
     Help {
         lines: Vec<String>,
         top: usize,
+        cursor: HelpCursor,
         return_to: Option<Box<Prompt>>,
     },
     /// A full-screen, scrollable diff viewer — currently used only for
@@ -210,6 +211,18 @@ pub enum Mode {
     /// (`PromptKind::BrowserSearch`/`GotoDir`) or its help is up.
     Browser,
     Quit,
+}
+
+/// Where the cursor is in the help viewer's body (an index into its
+/// `lines[1..]`), which only matters with `set showcursor`: nano's help
+/// viewer is a buffer, and with the cursor shown the arrow keys move it
+/// through the text instead of scrolling. `want` is the column Up/Down
+/// aim for (nano's `placewewant`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HelpCursor {
+    pub line: usize,
+    pub col: usize,
+    pub want: usize,
 }
 
 /// What happens when the diff viewer (`Mode::Diff`) is dismissed.
@@ -586,6 +599,7 @@ impl Editor {
                 self.mode = Mode::Help {
                     lines,
                     top: 0,
+                    cursor: HelpCursor::default(),
                     return_to: None,
                 };
             }

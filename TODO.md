@@ -40,8 +40,6 @@ here.
 - [ ] `constantshow`
 - [ ] `matchbrackets`
 - [ ] `stateflags`
-- [ ] `showcursor` — honored in the file browser, not yet in the help
-      viewer
 - [ ] `boldtext`
 - [ ] `bookstyle`
 - [ ] `jumpyscrolling`

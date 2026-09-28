@@ -3,7 +3,7 @@
 //! bar) mirrors GNU nano's, with "tico" shown wherever nano would show its
 //! own name.
 
-use crate::app::{DiffOutcome, Editor, Mode, Prompt, PromptKind};
+use crate::app::{DiffOutcome, Editor, HelpCursor, Mode, Prompt, PromptKind};
 use crate::buffer::Pos;
 use crate::keymap::{Action, Binding, Key as TKey, KeyMap, Menu};
 use crate::theme::{Style, print_styled};
@@ -348,9 +348,10 @@ fn handle_key(editor: &mut Editor, key: KeyEvent) {
         Mode::Help {
             lines,
             top,
+            cursor,
             return_to,
         } => {
-            handle_help_key(editor, lines, top, return_to, key);
+            handle_help_key(editor, lines, top, cursor, return_to, key);
         }
         Mode::Diff {
             lines,
@@ -605,20 +606,23 @@ fn key_to_event(key: TKey) -> KeyEvent {
     KeyEvent::new(code, modifiers)
 }
 
-/// Handle a keystroke while the `^G` help viewer is open: scroll its body,
-/// or close it (via `^X`/`^C`/Esc) and return to whatever was active
-/// before — the main editing window, or the prompt help was opened from.
+/// Handle a keystroke while the `^G` help viewer is open: scroll its body
+/// (or, with `set showcursor`, move the cursor through it), or close it
+/// (via `^X`/`^C`/Esc) and return to whatever was active before — the
+/// main editing window, or the prompt help was opened from.
 fn handle_help_key(
     editor: &mut Editor,
     lines: Vec<String>,
     top: usize,
+    cursor: HelpCursor,
     return_to: Option<Box<Prompt>>,
     key: KeyEvent,
 ) {
-    let body_len = lines.len().saturating_sub(1);
+    let body = &lines[1.min(lines.len())..];
     let body_rows = help_body_rows(editor);
-    let max_top = body_len.saturating_sub(body_rows);
+    let max_top = body.len().saturating_sub(body_rows);
     let mut top = top.min(max_top);
+    let mut cursor = cursor;
     let mut close = false;
 
     if matches!(key.code, KeyCode::Esc) {
@@ -627,15 +631,20 @@ fn handle_help_key(
         && let Some(Binding::Action(action)) =
             editor.keymap.lookup_menu_only(Menu::Help, tkey).cloned()
     {
-        match action {
-            Action::Cancel => close = true,
-            Action::Up => top = top.saturating_sub(1),
-            Action::Down => top = (top + 1).min(max_top),
-            Action::PageUp => top = top.saturating_sub(body_rows),
-            Action::PageDown => top = (top + body_rows).min(max_top),
-            Action::FirstLine => top = 0,
-            Action::LastLine => top = max_top,
-            _ => {}
+        if action == Action::Cancel {
+            close = true;
+        } else if editor.options.showcursor {
+            move_help_cursor(body, &mut top, &mut cursor, action, body_rows);
+        } else {
+            match action {
+                Action::Up => top = top.saturating_sub(1),
+                Action::Down => top = (top + 1).min(max_top),
+                Action::PageUp => top = top.saturating_sub(body_rows),
+                Action::PageDown => top = (top + body_rows).min(max_top),
+                Action::FirstLine => top = 0,
+                Action::LastLine => top = max_top,
+                _ => {}
+            }
         }
     }
 
@@ -649,9 +658,104 @@ fn handle_help_key(
         Mode::Help {
             lines,
             top,
+            cursor,
             return_to,
         }
     };
+}
+
+/// A help-viewer movement with `set showcursor`: the cursor moves through
+/// the text the way it would in a buffer -- nano's help viewer runs
+/// `do_left`/`do_right`/`do_up`/`do_down` on its help buffer when the
+/// cursor is shown -- and the view follows it. Page Up/Down move the
+/// cursor "almost one screenful" (all but two rows) keeping it on the
+/// same screen row, or, when that would run off an end, to the first/last
+/// line (nano's `do_page_up`/`do_page_down`).
+fn move_help_cursor(
+    body: &[String],
+    top: &mut usize,
+    cursor: &mut HelpCursor,
+    action: Action,
+    rows: usize,
+) {
+    if body.is_empty() {
+        return;
+    }
+    let last = body.len() - 1;
+    let max_top = body.len().saturating_sub(rows);
+    let len = |line: usize| body[line].chars().count();
+    let mustmove = if rows < 3 { 1 } else { rows - 2 };
+    cursor.line = cursor.line.min(last);
+    cursor.col = cursor.col.min(len(cursor.line));
+
+    let to_first = |cursor: &mut HelpCursor| *cursor = HelpCursor::default();
+    // In help, the last line is entered at its start (nano's
+    // `to_last_line`, `inhelp`), and shown at the bottom of the screen.
+    let to_last = |cursor: &mut HelpCursor, top: &mut usize| {
+        *cursor = HelpCursor {
+            line: last,
+            col: 0,
+            want: 0,
+        };
+        *top = max_top;
+    };
+
+    match action {
+        Action::Left => {
+            if cursor.col > 0 {
+                cursor.col -= 1;
+            } else if cursor.line > 0 {
+                cursor.line -= 1;
+                cursor.col = len(cursor.line);
+            }
+            cursor.want = cursor.col;
+        }
+        Action::Right => {
+            if cursor.col < len(cursor.line) {
+                cursor.col += 1;
+            } else if cursor.line < last {
+                cursor.line += 1;
+                cursor.col = 0;
+            }
+            cursor.want = cursor.col;
+        }
+        Action::Up | Action::Down => {
+            if action == Action::Up && cursor.line > 0 {
+                cursor.line -= 1;
+            } else if action == Action::Down && cursor.line < last {
+                cursor.line += 1;
+            }
+            cursor.col = cursor.want.min(len(cursor.line));
+        }
+        Action::PageUp => {
+            if cursor.line < mustmove {
+                to_first(cursor);
+            } else {
+                cursor.line -= mustmove;
+                cursor.col = cursor.want.min(len(cursor.line));
+                *top = top.saturating_sub(mustmove);
+            }
+        }
+        Action::PageDown => {
+            if cursor.line + mustmove > last {
+                to_last(cursor, top);
+            } else {
+                cursor.line += mustmove;
+                cursor.col = cursor.want.min(len(cursor.line));
+                *top = (*top + mustmove).min(max_top);
+            }
+        }
+        Action::FirstLine => to_first(cursor),
+        Action::LastLine => to_last(cursor, top),
+        _ => {}
+    }
+
+    // Keep the cursor on screen, scrolling as little as needed.
+    if cursor.line < *top {
+        *top = cursor.line;
+    } else if cursor.line >= *top + rows {
+        *top = cursor.line + 1 - rows;
+    }
 }
 
 /// The movement actions Shift-selection applies to -- matches nano's
@@ -912,6 +1016,7 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             editor.mode = Mode::Help {
                 lines,
                 top: 0,
+                cursor: Default::default(),
                 return_to: Some(Box::new(prompt.clone())),
             };
             true
@@ -1450,6 +1555,7 @@ fn handle_conflict_choice(editor: &mut Editor, prompt: Prompt, key: KeyEvent) {
         editor.mode = Mode::Help {
             lines,
             top: 0,
+            cursor: Default::default(),
             return_to: Some(Box::new(prompt)),
         };
         return;
@@ -2667,6 +2773,7 @@ fn apply_browser_action(editor: &mut Editor, action: Action) {
             editor.mode = Mode::Help {
                 lines,
                 top: 0,
+                cursor: Default::default(),
                 return_to: None,
             };
         }
@@ -2935,8 +3042,11 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
     // instead of moving straight to its final spot.
     queue!(out, Hide)?;
 
-    if let Mode::Help { lines, top, .. } = &editor.mode {
-        render_help_screen(editor, &mut out, lines, *top)?;
+    if let Mode::Help {
+        lines, top, cursor, ..
+    } = &editor.mode
+    {
+        render_help_screen(editor, &mut out, lines, *top, *cursor)?;
         return out.flush();
     }
     if let Mode::Diff {
@@ -3049,6 +3159,7 @@ fn render_help_screen(
     out: &mut impl Write,
     lines: &[String],
     top: usize,
+    cursor: HelpCursor,
 ) -> io::Result<()> {
     let cols = editor.screen_cols;
     let rows = editor.screen_rows;
@@ -3059,16 +3170,31 @@ fn render_help_screen(
         cols,
         lines.first().map(|s| s.as_str()).unwrap_or("Help"),
     )?;
-    render_scrollable_body(
-        out,
-        cols,
-        &lines[1.min(lines.len())..],
-        top,
-        help_body_rows(editor),
-        None,
-    )?;
+    let body = &lines[1.min(lines.len())..];
+    let body_rows = help_body_rows(editor);
+    render_scrollable_body(out, cols, body, top, body_rows, None)?;
     let entries = resolve_shortcuts(&editor.keymap, Menu::Help, HELP_SHORTCUTS);
-    render_shortcut_bar(editor, out, rows.saturating_sub(2) as u16, cols, &entries)
+    render_shortcut_bar(editor, out, rows.saturating_sub(2) as u16, cols, &entries)?;
+
+    // `set showcursor`: the cursor stays visible in the help text.
+    if editor.options.showcursor
+        && let Some(line) = body.get(cursor.line)
+        && cursor.line >= top
+        && cursor.line < top + body_rows
+    {
+        let col: usize = line
+            .chars()
+            .take(cursor.col)
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+            .sum();
+        let row = 1 + cursor.line - top;
+        queue!(
+            out,
+            MoveTo(col.min(cols.saturating_sub(1)) as u16, row as u16),
+            Show
+        )?;
+    }
+    Ok(())
 }
 
 /// The merge-diff viewer (`Mode::Diff`): same full-screen layout as the
@@ -6086,14 +6212,105 @@ mod tests {
         assert_eq!(ed.buf().top_line, 0);
     }
 
+    fn help_body(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("line {i}")).collect()
+    }
+
+    #[test]
+    fn help_cursor_moves_through_the_text_like_a_buffer() {
+        let mut body = help_body(20);
+        body[3] = "ab".into();
+        let (mut top, mut c) = (0, HelpCursor::default());
+        let rows = 5;
+        let mv = |top: &mut usize, c: &mut HelpCursor, a| move_help_cursor(&body, top, c, a, rows);
+        mv(&mut top, &mut c, Action::Left);
+        assert_eq!((c.line, c.col), (0, 0), "nowhere to go");
+        mv(&mut top, &mut c, Action::Right);
+        mv(&mut top, &mut c, Action::Right);
+        mv(&mut top, &mut c, Action::Right);
+        mv(&mut top, &mut c, Action::Right);
+        assert_eq!((c.line, c.col), (0, 4));
+        mv(&mut top, &mut c, Action::Down);
+        mv(&mut top, &mut c, Action::Down);
+        mv(&mut top, &mut c, Action::Down);
+        assert_eq!((c.line, c.col), (3, 2), "clamped to the short line");
+        mv(&mut top, &mut c, Action::Down);
+        assert_eq!((c.line, c.col), (4, 4), "the wanted column comes back");
+        assert_eq!(top, 0);
+        mv(&mut top, &mut c, Action::Down);
+        assert_eq!((c.line, top), (5, 1), "scrolls one line to follow");
+        // Right at the end of a line wraps to the next one, Left back.
+        mv(&mut top, &mut c, Action::Right);
+        mv(&mut top, &mut c, Action::Right);
+        mv(&mut top, &mut c, Action::Right);
+        assert_eq!((c.line, c.col), (6, 0));
+        mv(&mut top, &mut c, Action::Left);
+        assert_eq!((c.line, c.col), (5, 6));
+    }
+
+    #[test]
+    fn help_cursor_pages_keep_its_screen_row_until_an_end() {
+        let body = help_body(20);
+        let rows = 5; // pages move 3 lines
+        let (mut top, mut c) = (0, HelpCursor::default());
+        let mv = |top: &mut usize, c: &mut HelpCursor, a| move_help_cursor(&body, top, c, a, rows);
+        mv(&mut top, &mut c, Action::Down);
+        mv(&mut top, &mut c, Action::PageDown);
+        assert_eq!((c.line, top), (4, 3));
+        mv(&mut top, &mut c, Action::PageDown);
+        assert_eq!((c.line, top), (7, 6));
+        mv(&mut top, &mut c, Action::LastLine);
+        assert_eq!((c.line, c.col, top), (19, 0, 15));
+        mv(&mut top, &mut c, Action::PageUp);
+        assert_eq!((c.line, top), (16, 12));
+        mv(&mut top, &mut c, Action::PageDown);
+        assert_eq!((c.line, top), (19, 15), "runs off the end: last line");
+        mv(&mut top, &mut c, Action::FirstLine);
+        assert_eq!((c.line, c.col, top), (0, 0, 0));
+        mv(&mut top, &mut c, Action::Down);
+        mv(&mut top, &mut c, Action::PageUp);
+        assert_eq!((c.line, top), (0, 0), "runs off the start: first line");
+    }
+
+    #[test]
+    fn help_arrows_move_the_cursor_only_with_showcursor() {
+        for showcursor in [false, true] {
+            let mut ed = test_editor("");
+            ed.options.showcursor = showcursor;
+            ed.screen_cols = 40;
+            ed.screen_rows = 8;
+            ed.execute(Action::Help);
+            handle_key(&mut ed, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            let Mode::Help { top, cursor, .. } = &ed.mode else {
+                panic!("help should still be open");
+            };
+            if showcursor {
+                assert_eq!((*top, cursor.line), (0, 1));
+            } else {
+                assert_eq!((*top, cursor.line), (1, 0));
+            }
+            let mut out = Vec::new();
+            let Mode::Help {
+                lines, top, cursor, ..
+            } = &ed.mode
+            else {
+                unreachable!()
+            };
+            render_help_screen(&ed, &mut out, lines, *top, *cursor).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            // Row 3 (1-based) = title row + body line 1.
+            let shown = text.ends_with("\x1b[3;1H\x1b[?25h");
+            assert_eq!(shown, showcursor, "{text:?}");
+        }
+    }
+
     #[test]
     fn shortcut_bar_reverses_only_the_key_itself() {
         // nano's `post_one_key`: a short key next to a long one isn't
         // padded out inside the reverse-video block, and the description
         // follows it after a single blank.
         let ed = test_editor("");
-        let entries: Vec<(String, &str)> =
-            vec![("^G".into(), "Help"), ("Right".into(), "Forward")];
+        let entries: Vec<(String, &str)> = vec![("^G".into(), "Help"), ("Right".into(), "Forward")];
         let mut out = Vec::new();
         render_shortcut_bar(&ed, &mut out, 0, 40, &entries).unwrap();
         let text = String::from_utf8_lossy(&out);
