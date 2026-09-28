@@ -359,6 +359,32 @@ impl Action {
     }
 }
 
+impl Action {
+    /// [`description`](Self::description), except where `menu` gives the
+    /// action a meaning of its own: the file browser reuses the main
+    /// menu's movement and search functions, and nano's help there uses
+    /// the browser's own phrasing (its `browser*_gist` strings).
+    pub fn description_in(&self, menu: Menu) -> &'static str {
+        use Action::*;
+        if menu == Menu::Browser {
+            match self {
+                Exit => return "Exit from the file browser",
+                WhereIs => return "Search forward for a string",
+                WhereWas => return "Search backward for a string",
+                Left => return "Go to the previous file in the list",
+                Right => return "Go to the next file in the list",
+                PrevWord => return "Go to lefthand column",
+                NextWord => return "Go to righthand column",
+                PrevBlock => return "Go to first row in this column",
+                NextBlock => return "Go to last row in this column",
+                Refresh => return "Refresh the file list",
+                _ => {}
+            }
+        }
+        self.description()
+    }
+}
+
 /// The menu (keystroke context) a binding applies to, matching nano's menu
 /// names from `nanorc(5)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -947,12 +973,6 @@ impl KeyMap {
             K::Meta('F'),
             Binding::Action(A::FlipNewBuffer),
         );
-        // No-conversion, flip-to-execute, and the file browser aren't
-        // implemented yet, but are still bound (matching nano's full menu)
-        // so the shortcut bar and ^G help text show them; pressing any of
-        // them just reports "not yet implemented" instead of doing nothing
-        // silently — see apply_prompt_action's FlipConvert/FlipExecute/
-        // Browser arms.
         self.bind(Menu::Insert, K::Meta('N'), Binding::Action(A::FlipConvert));
         self.bind(Menu::Insert, K::Ctrl('X'), Binding::Action(A::FlipExecute));
         self.bind(Menu::Insert, K::Ctrl('T'), Binding::Action(A::Browser));
@@ -995,11 +1015,93 @@ impl KeyMap {
         self.bind(Menu::Help, K::Meta('/'), Binding::Action(A::LastLine));
         self.bind(Menu::Help, K::Ctrl('X'), Binding::Action(A::Cancel));
 
+        self.install_browser_defaults();
+
         self.bind(Menu::Linter, K::Ctrl('X'), Binding::Action(A::Cancel));
         self.bind(Menu::Linter, K::Ctrl('C'), Binding::Action(A::Cancel));
         self.bind(Menu::Linter, K::Ctrl('M'), Binding::Action(A::Cancel));
         self.bind(Menu::Linter, K::PageUp, Binding::Action(A::PageUp));
         self.bind(Menu::Linter, K::PageDown, Binding::Action(A::PageDown));
+    }
+
+    /// The file browser (`MBROWSER`) and its two prompts, Search
+    /// (`MWHEREISFILE`) and Go To Directory (`MGOTODIR`), from nano's
+    /// `add_to_sclist` calls in src/global.c. The browser mostly reuses the
+    /// main menu's function names with a browser meaning: `left`/`right`
+    /// step through the names, `prevword`/`nextword` go to the first/last
+    /// column, `prevblock`/`nextblock` to the top/bottom row. Plain letters
+    /// (`s`, `q`, `n`, Space, ...) work too, but aren't bindings: nano
+    /// checks them before the keymap (`interpret()`), and so does
+    /// `ui::browser_plain_key`.
+    fn install_browser_defaults(&mut self) {
+        use Action as A;
+        use Key as K;
+        // The shared prompt-line editing keys (Home/End, Backspace, ^D, ...)
+        // mean something else here, or nothing.
+        self.table.retain(|(menu, _), _| *menu != Menu::Browser);
+        let m = Menu::Browser;
+        let mut b = |k: Key, a: Action| self.bind(m, k, Binding::Action(a));
+        b(K::Ctrl('M'), A::Enter);
+        b(K::Ctrl('G'), A::Help);
+        b(K::Ctrl('X'), A::Exit);
+        b(K::Ctrl('C'), A::Exit);
+        // Leaving with the same key as used for entry.
+        b(K::Ctrl('T'), A::Exit);
+        b(K::F(2), A::Exit);
+        b(K::Ctrl('F'), A::WhereIs);
+        b(K::Ctrl('W'), A::WhereIs);
+        b(K::F(6), A::WhereIs);
+        b(K::Ctrl('B'), A::WhereWas);
+        b(K::Ctrl('Q'), A::WhereWas);
+        b(K::Meta('B'), A::FindPrevious);
+        b(K::Meta('Q'), A::FindPrevious);
+        b(K::Meta('F'), A::FindNext);
+        b(K::Meta('W'), A::FindNext);
+        b(K::Left, A::Left);
+        b(K::Right, A::Right);
+        b(K::CtrlLeft, A::PrevWord);
+        b(K::CtrlRight, A::NextWord);
+        b(K::Up, A::Up);
+        b(K::Down, A::Down);
+        b(K::Ctrl('P'), A::Up);
+        b(K::Ctrl('N'), A::Down);
+        b(K::CtrlUp, A::PrevBlock);
+        b(K::CtrlDown, A::NextBlock);
+        b(K::PageUp, A::PageUp);
+        b(K::Ctrl('Y'), A::PageUp);
+        b(K::F(7), A::PageUp);
+        b(K::Backspace, A::PageUp);
+        b(K::PageDown, A::PageDown);
+        b(K::Ctrl('V'), A::PageDown);
+        b(K::F(8), A::PageDown);
+        b(K::Meta('\\'), A::FirstFile);
+        b(K::Home, A::FirstFile);
+        b(K::CtrlHome, A::FirstFile);
+        b(K::Meta('/'), A::LastFile);
+        b(K::End, A::LastFile);
+        b(K::CtrlEnd, A::LastFile);
+        // nano shows this one as "^/": the same byte as ^_.
+        b(K::Ctrl('_'), A::GotoDir);
+        b(K::Meta('G'), A::GotoDir);
+        b(K::Ctrl('L'), A::Refresh);
+        b(K::Meta('X'), A::NoHelp);
+
+        for menu in [Menu::WhereIsFile, Menu::GotoDir] {
+            self.bind(menu, K::Ctrl('M'), Binding::Action(A::Enter));
+        }
+        let w = Menu::WhereIsFile;
+        for (k, a) in [
+            (K::Ctrl('P'), A::Older),
+            (K::Ctrl('N'), A::Newer),
+            (K::Up, A::Older),
+            (K::Down, A::Newer),
+            (K::Ctrl('Y'), A::FirstFile),
+            (K::Ctrl('V'), A::LastFile),
+            (K::Meta('\\'), A::FirstFile),
+            (K::Meta('/'), A::LastFile),
+        ] {
+            self.bind(w, k, Binding::Action(a));
+        }
     }
 
     /// `-/`/`--modernbindings`: rebinds a batch of Main-menu Ctrl-key
@@ -1061,6 +1163,16 @@ impl KeyMap {
             self.unbind(menu, K::Ctrl('G'));
             self.bind(menu, K::Ctrl('H'), Binding::Action(A::Help));
         }
+
+        // The browser gets the modern set's ^Q/^D/^G in place of the
+        // traditional ^X/^Q/^W/^P/^N/^Y/^V (and ^H for help, above).
+        let br = Menu::Browser;
+        for k in ['X', 'Q', 'W', 'P', 'N', 'Y', 'V'] {
+            self.unbind(br, K::Ctrl(k));
+        }
+        self.bind(br, K::Ctrl('Q'), Binding::Action(A::Exit));
+        self.bind(br, K::Ctrl('D'), Binding::Action(A::FindPrevious));
+        self.bind(br, K::Ctrl('G'), Binding::Action(A::FindNext));
 
         // The help key toggles: pressing it again while help is open closes
         // it, same as nano's `add_to_sclist(MHELP, help_key, 0, do_exit)`.

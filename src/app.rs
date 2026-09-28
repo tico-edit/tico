@@ -69,6 +69,22 @@ pub enum PromptKind {
         messages: Vec<LintMessage>,
         index: usize,
     },
+    /// The file browser's Search prompt (nano's `MWHEREISFILE`), shown
+    /// over the listing in `Editor::browser`.
+    BrowserSearch {
+        forwards: bool,
+    },
+    /// The file browser's Go To Directory prompt (nano's `MGOTODIR`).
+    GotoDir,
+}
+
+/// An open file browser (`^T` at the Read File / Write Out prompts): the
+/// listing, plus the prompt it was opened from, which gets the chosen
+/// filename -- or is simply shown again when the browser is left.
+#[derive(Debug, Clone)]
+pub struct BrowserSession {
+    pub list: crate::browser::Browser,
+    pub return_to: Prompt,
 }
 
 /// The context of one nano `write_it_out` call, carried through the Write
@@ -189,6 +205,10 @@ pub enum Mode {
         top: usize,
         outcome: DiffOutcome,
     },
+    /// The file browser, whose state is `Editor::browser` -- kept there
+    /// rather than here so that it survives while one of its own prompts
+    /// (`PromptKind::BrowserSearch`/`GotoDir`) or its help is up.
+    Browser,
     Quit,
 }
 
@@ -319,6 +339,8 @@ pub struct Editor {
     /// spotlight — confirmed against the installed nano's own escape-code
     /// output.
     pub minibar_note: Option<String>,
+    /// The open file browser, if any (see `Mode::Browser`).
+    pub browser: Option<BrowserSession>,
 }
 
 impl Editor {
@@ -370,6 +392,7 @@ impl Editor {
             screen_cols: 80,
             file_completions: None,
             minibar_note: None,
+            browser: None,
         }
     }
 

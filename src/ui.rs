@@ -21,6 +21,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 struct RawModeGuard;
@@ -359,6 +360,10 @@ fn handle_key(editor: &mut Editor, key: KeyEvent) {
             handle_diff_key(editor, lines, top, outcome, key);
         }
         Mode::Prompt(prompt) => handle_prompt_key(editor, prompt, key),
+        Mode::Browser => {
+            editor.mode = Mode::Browser;
+            handle_browser_key(editor, key);
+        }
         Mode::Quit => editor.mode = Mode::Quit,
     }
 }
@@ -381,6 +386,19 @@ fn handle_key(editor: &mut Editor, key: KeyEvent) {
 fn handle_mouse(editor: &mut Editor, mev: MouseEvent) {
     if !editor.options.mouse {
         return;
+    }
+    // In the browser the wheel moves the selection a row per notch-line.
+    if matches!(editor.mode, Mode::Browser) {
+        let action = match mev.kind {
+            MouseEventKind::ScrollUp => Some(Action::Up),
+            MouseEventKind::ScrollDown => Some(Action::Down),
+            _ => None,
+        };
+        if let Some(action) = action {
+            apply_browser_action(editor, action);
+            apply_browser_action(editor, action);
+            return;
+        }
     }
     match mev.kind {
         // "One bump of the mouse wheel should scroll two lines" (nano's
@@ -405,6 +423,10 @@ fn handle_mouse(editor: &mut Editor, mev: MouseEvent) {
 /// layout (`main_screen_layout`); the full-screen Help and Diff viewers
 /// only expose their own bottom shortcut bar.
 fn handle_click(editor: &mut Editor, row: usize, col: usize) {
+    if editor.browser.is_some() && matches!(&editor.mode, Mode::Browser | Mode::Prompt(_)) {
+        handle_browser_click(editor, row, col);
+        return;
+    }
     if matches!(&editor.mode, Mode::Editing | Mode::Prompt(_)) {
         handle_main_screen_click(editor, row, col);
         return;
@@ -620,6 +642,7 @@ fn handle_help_key(
     editor.mode = if close {
         match return_to {
             Some(prompt) => Mode::Prompt(*prompt),
+            None if editor.browser.is_some() => Mode::Browser,
             None => Mode::Editing,
         }
     } else {
@@ -762,6 +785,13 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
     if let Some(tkey) = normalize_key(key) {
         if tkey == TKey::Ctrl('C') || matches!(key.code, KeyCode::Esc) {
             editor.mode = Mode::Editing;
+            // The file browser's own prompts go back to the browser.
+            if matches!(
+                prompt.kind,
+                PromptKind::BrowserSearch { .. } | PromptKind::GotoDir
+            ) {
+                editor.mode = Mode::Browser;
+            }
             // Canceling out of a spell-fix prompt stops the word-by-word
             // loop, but (matching nano's `fix_spello`/`spell_check`) still
             // reports success rather than "Cancelled".
@@ -804,13 +834,21 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
             return;
         }
         // `Tab` at the `^R` Read File prompt (only in file-insert mode,
-        // not Execute Command — matches nano's `MINSERTFILE` gate).
-        if tkey == TKey::Ctrl('I')
-            && let PromptKind::InsertFile { execute: false, .. } = prompt.kind
-        {
-            apply_filename_completion(editor, &mut prompt);
-            editor.mode = Mode::Prompt(prompt);
-            return;
+        // not Execute Command — matches nano's `MINSERTFILE` gate), and at
+        // the browser's Go To Directory prompt, where it completes only
+        // directories, relative to the one being browsed (`MGOTODIR`).
+        if tkey == TKey::Ctrl('I') {
+            let gotodir_base = match prompt.kind {
+                PromptKind::GotoDir => editor.browser.as_ref().map(|b| b.list.dir.clone()),
+                _ => None,
+            };
+            let completes = matches!(prompt.kind, PromptKind::InsertFile { execute: false, .. })
+                || gotodir_base.is_some();
+            if completes {
+                apply_filename_completion(editor, &mut prompt, gotodir_base.as_deref());
+                editor.mode = Mode::Prompt(prompt);
+                return;
+            }
         }
         if tkey == TKey::Left {
             prompt.cursor = prompt.cursor.saturating_sub(1);
@@ -1043,19 +1081,38 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             prompt.label = editor.writeout_prompt_label(flow.exiting);
             false
         }
+        // `^T` Browse, at the Read File and Write Out prompts: nano's
+        // `to_files`. The prompt waits behind the browser, to get the
+        // chosen filename or to be shown again when the browser is left.
+        Action::Browser => {
+            let from_file_prompt = matches!(
+                prompt.kind,
+                PromptKind::InsertFile { execute: false, .. } | PromptKind::WriteOut { .. }
+            );
+            from_file_prompt && open_browser(editor, prompt)
+        }
+        // `^Y`/`^V` (`M-\`/`M-/`) at the browser's Search prompt select the
+        // first/last name without searching -- though what was typed is
+        // still remembered as the search string, as nano's
+        // `search_filename` does for any function key.
+        Action::FirstFile | Action::LastFile => {
+            if !matches!(prompt.kind, PromptKind::BrowserSearch { .. }) {
+                return false;
+            }
+            remember_browser_search(editor, &prompt.input);
+            if let Some(session) = editor.browser.as_mut() {
+                session.list.navigate(action, 1, 1);
+            }
+            editor.status = None;
+            editor.mode = Mode::Browser;
+            true
+        }
         // Recognized (bound, shown in the shortcut bar and ^G help) but not
         // actually implemented yet: report that plainly rather than either
         // hiding the option or silently doing nothing when pressed. Status
         // messages don't show while a prompt is up (the status line is the
         // prompt itself), so this closes the prompt to make the message
         // visible, same as a real result would.
-        Action::Browser => {
-            editor.mode = Mode::Editing;
-            editor.set_status("File Browser: not yet implemented");
-            true
-        }
-        // Same treatment as `Browser` just above: recognized (bound, shown
-        // in the Write Out shortcut bar) but not actually implemented yet.
         Action::Append => {
             editor.mode = Mode::Editing;
             editor.set_status("Append: not yet implemented");
@@ -1135,7 +1192,15 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
 /// `username_completion`) — and list them all in `editor.file_completions`
 /// when there's more than one, rendered as a grid in place of the buffer
 /// (`render_completions_grid`).
-fn apply_filename_completion(editor: &mut Editor, prompt: &mut Prompt) {
+///
+/// With `browsed` (the browser's Go To Directory prompt), a relative
+/// fragment is looked up in that directory rather than the working one,
+/// and only directories are candidates.
+fn apply_filename_completion(
+    editor: &mut Editor,
+    prompt: &mut Prompt,
+    browsed: Option<&std::path::Path>,
+) {
     // Matches nano: completion only applies at the end of the input.
     if prompt.cursor != prompt.input.chars().count() {
         return;
@@ -1155,10 +1220,11 @@ fn apply_filename_completion(editor: &mut Editor, prompt: &mut Prompt) {
     // keeps whatever the user actually typed (so `~/Doc<Tab>` completes to
     // `~/Documents/`, not the expanded home path).
     let expanded_dir = crate::fileio::expand_leading_tilde(&dir_part);
-    let dir_path = if expanded_dir.is_empty() {
-        std::path::PathBuf::from(".")
-    } else {
+    let base = browsed.unwrap_or(std::path::Path::new("."));
+    let dir_path = if std::path::Path::new(&expanded_dir).is_absolute() {
         std::path::PathBuf::from(&expanded_dir)
+    } else {
+        base.join(&expanded_dir)
     };
     let Ok(entries) = std::fs::read_dir(&dir_path) else {
         return;
@@ -1167,6 +1233,7 @@ fn apply_filename_completion(editor: &mut Editor, prompt: &mut Prompt) {
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| name.starts_with(&fragment))
+        .filter(|name| browsed.is_none() || dir_path.join(name).is_dir())
         .collect();
     if matches.is_empty() {
         return;
@@ -1248,7 +1315,7 @@ fn common_prefix(a: &str, b: &str) -> String {
 /// whatever was live-typed before browsing started.
 fn cycle_history(editor: &mut Editor, prompt: &mut Prompt, older: bool) {
     let list: &[String] = match prompt.menu {
-        Menu::Search | Menu::Replace => &editor.history.search,
+        Menu::Search | Menu::Replace | Menu::WhereIsFile => &editor.history.search,
         Menu::ReplaceWith => &editor.history.replace,
         Menu::Execute => &editor.history.execute,
         _ => return,
@@ -1715,6 +1782,32 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
             advance_spell_fix(editor, remaining);
         }
         PromptKind::WriteOut { flow } => editor.submit_write_answer(text, flow),
+        PromptKind::BrowserSearch { forwards } => {
+            editor.mode = Mode::Browser;
+            // Enter on a blank answer, with nothing searched for yet this
+            // session, is the same as cancelling.
+            if text.is_empty() && editor.search.last_pattern.is_none() {
+                editor.set_status("Cancelled");
+                return;
+            }
+            remember_browser_search(editor, &text);
+            let needle = editor.search.last_pattern.clone().unwrap_or_default();
+            browser_find(editor, &needle, forwards);
+        }
+        PromptKind::GotoDir => {
+            editor.mode = Mode::Browser;
+            if text.is_empty() {
+                editor.set_status("Cancelled");
+                return;
+            }
+            let Some(session) = editor.browser.as_mut() else {
+                return;
+            };
+            let target = crate::browser::goto_dir_target(&session.list.dir, &text);
+            // Highlighted if listed, in case it then can't be entered.
+            session.list.select_if_listed(&target);
+            browser_enter_dir(editor, &target, None);
+        }
         _ => {
             editor.mode = Mode::Editing;
         }
@@ -2402,6 +2495,425 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
 }
 
 // ---------------------------------------------------------------------
+// File browser
+// ---------------------------------------------------------------------
+
+/// Open the file browser from `prompt` (Read File or Write Out), starting
+/// where its answer points -- nano's `browse_in`. Returns false, with the
+/// reason flashed as a brief warning, when there is nothing to browse; the
+/// prompt then simply stays up, as it does in nano.
+fn open_browser(editor: &mut Editor, prompt: &Prompt) -> bool {
+    use crate::browser::{Browser, full_dir_path, start_dir, strerror};
+    let start = match start_dir(&prompt.input) {
+        Ok(dir) => dir,
+        Err(msg) => {
+            editor.brief_warning = Some(msg);
+            return false;
+        }
+    };
+    match full_dir_path(&start).and_then(|dir| Browser::read(&dir)) {
+        Ok(list) => {
+            editor.browser = Some(crate::app::BrowserSession {
+                list,
+                return_to: prompt.clone(),
+            });
+            editor.file_completions = None;
+            editor.status = None;
+            editor.mode = Mode::Browser;
+            true
+        }
+        Err(e) => {
+            editor.brief_warning = Some(format!("Cannot open directory: {}", strerror(&e)));
+            false
+        }
+    }
+}
+
+/// Leave the browser without choosing anything: back to the prompt it
+/// was opened from, as it was.
+fn close_browser(editor: &mut Editor) {
+    editor.status = None;
+    editor.mode = match editor.browser.take() {
+        Some(session) => Mode::Prompt(session.return_to),
+        None => Mode::Editing,
+    };
+}
+
+/// Show `path` in the browser: nano's `read_directory_contents` step.
+/// With `reselect`, that entry (the directory just left, for "..") is
+/// selected again; otherwise the first. A directory that can't be read
+/// leaves the current listing up (re-read, keeping its selection) under
+/// an alert.
+fn browser_enter_dir(editor: &mut Editor, path: &std::path::Path, reselect: Option<PathBuf>) {
+    use crate::browser::{Browser, full_dir_path, strerror};
+    let loaded = full_dir_path(path).and_then(|dir| Browser::read(&dir));
+    let Some(session) = editor.browser.as_mut() else {
+        return;
+    };
+    match loaded {
+        Ok(mut list) => {
+            if let Some(name) = reselect {
+                list.selected = session.list.selected;
+                list.reselect(&name);
+            }
+            session.list = list;
+        }
+        Err(e) => {
+            let msg = format!("Cannot open directory: {}", strerror(&e));
+            browser_reread(session);
+            editor.set_status_alert(msg);
+        }
+    }
+}
+
+/// Re-read the directory being shown, keeping the selection on the same
+/// name when it's still there (`^L`, and after failing to enter another).
+fn browser_reread(session: &mut crate::app::BrowserSession) {
+    let current = session.list.selected_entry().map(|e| e.path.clone());
+    if let Ok(mut list) = crate::browser::Browser::read(&session.list.dir) {
+        list.selected = session.list.selected;
+        if let Some(path) = current {
+            list.reselect(&path);
+        }
+        session.list = list;
+    }
+}
+
+/// The number of listing rows, and the screen row the listing starts on.
+fn browser_list_area(editor: &Editor) -> (usize, usize) {
+    if editor.options.zero {
+        (editor.screen_rows.saturating_sub(1).max(1), 0)
+    } else {
+        let layout = main_screen_layout(editor);
+        (layout.text_rows.max(1), layout.text_start_row)
+    }
+}
+
+/// The browser's (piles, rows) for the current screen size.
+fn browser_geometry(editor: &Editor) -> (usize, usize) {
+    let rows = browser_list_area(editor).0;
+    let piles = editor
+        .browser
+        .as_ref()
+        .map_or(1, |b| b.list.piles(editor.screen_cols));
+    (piles, rows)
+}
+
+/// The plain keys that nano's `interpret()` gives a meaning in the browser
+/// (and help viewer) ahead of any binding -- Pico's and `less`'s.
+fn browser_plain_key(key: KeyEvent) -> Option<Action> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    match c {
+        'N' => return Some(Action::FindPrevious),
+        'n' => return Some(Action::FindNext),
+        _ => {}
+    }
+    Some(match c.to_ascii_lowercase() {
+        'b' | '-' => Action::PageUp,
+        ' ' => Action::PageDown,
+        'w' | '/' => Action::WhereIs,
+        'g' => Action::GotoDir,
+        '?' => Action::Help,
+        's' => Action::Enter,
+        'e' | 'q' | 'x' => Action::Exit,
+        _ => return None,
+    })
+}
+
+fn handle_browser_key(editor: &mut Editor, key: KeyEvent) {
+    if matches!(key.code, KeyCode::Esc) {
+        close_browser(editor);
+        return;
+    }
+    let tkey = normalize_key(key);
+    let action = browser_plain_key(key).or_else(|| {
+        match tkey.and_then(|k| editor.keymap.lookup_menu_only(Menu::Browser, k)) {
+            Some(Binding::Action(a)) => Some(*a),
+            _ => None,
+        }
+    });
+    let Some(action) = action else {
+        let name = match (key.code, tkey) {
+            (_, Some(k)) => k.describe(),
+            (KeyCode::Char(c), None) => c.to_string(),
+            _ => return,
+        };
+        editor.set_status_mild(format!("Unbound key: {name}"));
+        return;
+    };
+    apply_browser_action(editor, action);
+}
+
+fn apply_browser_action(editor: &mut Editor, action: Action) {
+    let (piles, rows) = browser_geometry(editor);
+    let Some(session) = editor.browser.as_mut() else {
+        editor.mode = Mode::Editing;
+        return;
+    };
+    if session.list.navigate(action, piles, rows) {
+        return;
+    }
+    match action {
+        Action::Help => {
+            let lines = crate::help::build(Menu::Browser, &editor.keymap, editor.screen_cols);
+            editor.mode = Mode::Help {
+                lines,
+                top: 0,
+                return_to: None,
+            };
+        }
+        Action::Exit => close_browser(editor),
+        Action::Enter => browser_choose(editor),
+        Action::WhereIs | Action::WhereWas => {
+            let forwards = action == Action::WhereIs;
+            let label = browser_search_label(editor, forwards);
+            editor.mode = Mode::Prompt(Prompt {
+                kind: PromptKind::BrowserSearch { forwards },
+                menu: Menu::WhereIsFile,
+                label,
+                input: String::new(),
+                cursor: 0,
+                history_pos: None,
+                saved_input: None,
+            });
+        }
+        Action::FindNext | Action::FindPrevious => {
+            // With nothing searched for yet, the newest search history
+            // entry stands in.
+            if editor.search.last_pattern.is_none() {
+                editor.search.last_pattern = editor.history.search.last().cloned();
+            }
+            match editor.search.last_pattern.clone() {
+                Some(needle) => {
+                    editor.status = None;
+                    browser_find(editor, &needle, action == Action::FindNext);
+                }
+                None => editor.set_status("No current search pattern"),
+            }
+        }
+        Action::GotoDir => {
+            editor.mode = Mode::Prompt(Prompt {
+                kind: PromptKind::GotoDir,
+                menu: Menu::GotoDir,
+                label: "Go To Directory".to_string(),
+                input: String::new(),
+                cursor: 0,
+                history_pos: None,
+                saved_input: None,
+            });
+        }
+        Action::Refresh => browser_reread(session),
+        Action::NoHelp => editor.options.nohelp = !editor.options.nohelp,
+        _ => {}
+    }
+}
+
+/// Enter on the selected name: descend into a directory, or pick a file
+/// -- handing it to the prompt the browser was opened from, as if typed
+/// there and accepted.
+fn browser_choose(editor: &mut Editor) {
+    let Some(session) = editor.browser.as_ref() else {
+        return;
+    };
+    let Some(entry) = session.list.selected_entry().cloned() else {
+        return;
+    };
+    let dir = session.list.dir.clone();
+    let going_up = entry.name == "..";
+    if going_up && dir.parent().is_none() {
+        editor.set_status_alert("Can't move up a directory");
+        return;
+    }
+    let meta = match std::fs::metadata(&entry.path) {
+        Ok(meta) => meta,
+        Err(e) => {
+            editor.set_status_alert(format!(
+                "Error reading {}: {}",
+                entry.path.display(),
+                crate::browser::strerror(&e)
+            ));
+            return;
+        }
+    };
+    if meta.is_dir() {
+        // Going up, the directory just left is selected again, so that
+        // it's easily re-entered.
+        let reselect = going_up.then_some(dir);
+        browser_enter_dir(editor, &entry.path, reselect);
+        return;
+    }
+
+    let Some(session) = editor.browser.take() else {
+        return;
+    };
+    let mut prompt = session.return_to;
+    prompt.input = entry.path.to_string_lossy().into_owned();
+    prompt.cursor = prompt.input.chars().count();
+    editor.status = None;
+    submit_prompt(editor, prompt);
+}
+
+/// The browser's Search prompt label: "Search", " [Backwards]" when so,
+/// and the previous search string in brackets (clipped to a third of the
+/// screen). nano's `search_filename`.
+fn browser_search_label(editor: &Editor, forwards: bool) -> String {
+    let mut label = "Search".to_string();
+    if !forwards {
+        label.push_str(" [Backwards]");
+    }
+    if let Some(last) = editor.search.last_pattern.as_deref()
+        && !last.is_empty()
+    {
+        let room = editor.screen_cols / 3;
+        let shown: String = last.chars().take(room).collect();
+        let dots = if last.chars().count() > room {
+            "..."
+        } else {
+            ""
+        };
+        label.push_str(&format!(" [{shown}{dots}]"));
+    }
+    label
+}
+
+/// An answer typed at the browser's Search prompt becomes the search
+/// string -- shared with the editor's own searches, as in nano -- and goes
+/// into the search history.
+fn remember_browser_search(editor: &mut Editor, text: &str) {
+    if !text.is_empty() {
+        editor.search.last_pattern = Some(text.to_string());
+        editor.history.add_search(text);
+    }
+}
+
+fn browser_find(editor: &mut Editor, needle: &str, forwards: bool) {
+    use crate::browser::FindOutcome;
+    let Some(session) = editor.browser.as_mut() else {
+        return;
+    };
+    match session.list.find(needle, forwards) {
+        FindOutcome::Found => editor.status = None,
+        FindOutcome::Wrapped => editor.set_status("Search Wrapped"),
+        FindOutcome::OnlyOccurrence => editor.set_status("This is the only occurrence"),
+        FindOutcome::NotFound => editor.set_status(format!("\"{needle}\" not found")),
+    }
+}
+
+/// A left-click while the browser (or one of its prompts) is up: on a
+/// name, select it -- or, when it already was, choose it, as nano does;
+/// on the shortcut bar, that shortcut.
+fn handle_browser_click(editor: &mut Editor, row: usize, col: usize) {
+    let (rows, start) = browser_list_area(editor);
+    if matches!(editor.mode, Mode::Browser) && row >= start && row < start + rows {
+        let cols = editor.screen_cols;
+        let Some(session) = editor.browser.as_mut() else {
+            return;
+        };
+        if let Some(index) = session.list.index_at(cols, rows, row - start, col) {
+            if index == session.list.selected {
+                browser_choose(editor);
+            } else {
+                session.list.selected = index;
+            }
+        }
+        return;
+    }
+    if editor.options.zero {
+        return;
+    }
+    let layout = main_screen_layout(editor);
+    if layout.help_rows > 0 && row > layout.status_row {
+        let entries = browser_bar_entries(editor);
+        activate_shortcut_click(editor, &entries, row - layout.status_row - 1, col);
+    }
+}
+
+/// The shortcut bar under the browser: its own, or its current prompt's.
+fn browser_bar_entries(editor: &Editor) -> Vec<(String, &'static str)> {
+    match &editor.mode {
+        Mode::Prompt(p) => shortcut_bar_entries(&editor.keymap, Some(p)),
+        _ => {
+            // Only as many as nano's `shown_entries_for` would show, so the
+            // longer entries further down don't widen every column.
+            let maximum = ((editor.screen_cols + 40) / 20) * 2;
+            let shown = &BROWSER_SHORTCUTS[..maximum.min(BROWSER_SHORTCUTS.len())];
+            resolve_shortcuts(&editor.keymap, Menu::Browser, shown)
+        }
+    }
+}
+
+/// The browser's screen: "DIR:" title bar, the listing (or a Go To
+/// Directory tab-completion grid), the status/prompt line and the
+/// shortcut bar. nano's `browser_refresh` plus its `titlebar(path)`.
+fn render_browser_screen(
+    editor: &Editor,
+    session: &crate::app::BrowserSession,
+    out: &mut impl Write,
+    blank_bars: bool,
+) -> io::Result<()> {
+    let cols = editor.screen_cols;
+    let (rows, start) = browser_list_area(editor);
+    if start > 0 {
+        queue!(out, MoveTo(0, 0))?;
+        let title =
+            crate::browser::title_line(&crate::browser::display_dir(&session.list.dir), cols);
+        queue_bar_segment(out, title_bar_style(editor), &title)?;
+    }
+
+    if let Some(matches) = &editor.file_completions {
+        render_completions_grid(out, start as u16, rows, cols, matches)?;
+    } else {
+        let highlight = bar_style(&editor.options.selectedcolor, BarStyle::Reverse);
+        for (r, segments) in session.list.render_rows(cols, rows).into_iter().enumerate() {
+            queue!(out, MoveTo(0, (start + r) as u16))?;
+            for (text, selected) in segments {
+                if selected {
+                    queue_bar_segment(out, highlight, &text)?;
+                } else {
+                    queue!(out, Print(text))?;
+                }
+            }
+        }
+    }
+
+    let status_row = start + rows;
+    if status_row < editor.screen_rows {
+        // No minibar here: with no message, the status line is blank.
+        if matches!(editor.mode, Mode::Browser) && editor.status.is_none() {
+            queue!(out, MoveTo(0, status_row as u16), Print(" ".repeat(cols)))?;
+        } else {
+            render_status_line(editor, out, status_row as u16, cols)?;
+        }
+    }
+    if !editor.options.zero && !editor.options.nohelp {
+        let entries = if blank_bars {
+            Vec::new()
+        } else {
+            browser_bar_entries(editor)
+        };
+        render_shortcut_bar(editor, out, (status_row + 1) as u16, cols, &entries)?;
+    }
+
+    match &editor.mode {
+        Mode::Prompt(_) => finish_cursor(editor, out, start as u16),
+        // `set showcursor`: the cursor sits on the selected name.
+        _ if editor.options.showcursor => {
+            let (r, c) = session.list.selected_cell(cols, rows);
+            queue!(out, MoveTo(c as u16, (start + r) as u16), Show)
+        }
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------
 
@@ -2434,6 +2946,13 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
     } = &editor.mode
     {
         render_diff_screen(editor, &mut out, lines, *top, outcome)?;
+        return out.flush();
+    }
+
+    if let Some(session) = &editor.browser
+        && matches!(editor.mode, Mode::Browser | Mode::Prompt(_))
+    {
+        render_browser_screen(editor, session, &mut out, blank_bars)?;
         return out.flush();
     }
 
@@ -3014,9 +3533,6 @@ const GOTOLINE_SHORTCUTS: &[(Action, &str)] = &[
 ];
 
 /// The `^R` Read File prompt's shortcut list, matching nano's full menu.
-/// The file browser (`^T`) isn't actually implemented yet — see
-/// apply_prompt_action's Browser arm — but is still listed rather than
-/// silently omitted, since pressing it does give real feedback.
 const INSERT_SHORTCUTS: &[(Action, &str)] = &[
     (Action::Help, "Help"),
     (Action::Cancel, "Cancel"),
@@ -3028,8 +3544,8 @@ const INSERT_SHORTCUTS: &[(Action, &str)] = &[
 
 /// The `^O` Write Out prompt's shortcut list, matching nano 8.7's
 /// MWRITEFILE bar (confirmed against the installed nano). Append,
-/// Prepend, Backup File and Browse aren't implemented yet but are listed
-/// rather than silently omitted.
+/// Prepend and Backup File aren't implemented yet but are listed rather
+/// than silently omitted.
 const WRITEOUT_SHORTCUTS: &[(Action, &str)] = &[
     (Action::Help, "Help"),
     (Action::Cancel, "Cancel"),
@@ -3069,6 +3585,46 @@ const LINTER_SHORTCUTS: &[(Action, &str)] = &[
     (Action::PageUp, "Previous Linter message"),
     (Action::PageDown, "Next Linter message"),
 ];
+
+/// The file browser's bar, in the order of nano's MBROWSER functions
+/// (src/global.c; the installed nano shows the first twelve at 80
+/// columns).
+const BROWSER_SHORTCUTS: &[(Action, &str)] = &[
+    (Action::Help, "Help"),
+    (Action::Exit, "Close"),
+    (Action::GotoDir, "Go To Dir"),
+    (Action::Refresh, "Refresh"),
+    (Action::WhereIs, "Where Is"),
+    (Action::WhereWas, "Where Was"),
+    (Action::FindPrevious, "Previous"),
+    (Action::FindNext, "Next"),
+    (Action::Left, "Back"),
+    (Action::Right, "Forward"),
+    (Action::Up, "Prev Line"),
+    (Action::Down, "Next Line"),
+    (Action::PageUp, "Prev Page"),
+    (Action::PageDown, "Next Page"),
+    (Action::FirstFile, "First File"),
+    (Action::LastFile, "Last File"),
+    (Action::PrevWord, "Left Column"),
+    (Action::NextWord, "Right Column"),
+    (Action::PrevBlock, "Top Row"),
+    (Action::NextBlock, "Bottom Row"),
+];
+
+/// The browser's Search prompt (`MWHEREISFILE`), confirmed against the
+/// installed nano.
+const WHEREISFILE_SHORTCUTS: &[(Action, &str)] = &[
+    (Action::Help, "Help"),
+    (Action::Cancel, "Cancel"),
+    (Action::Older, "Older"),
+    (Action::Newer, "Newer"),
+    (Action::FirstFile, "First File"),
+    (Action::LastFile, "Last File"),
+];
+
+/// The browser's Go To Directory prompt (`MGOTODIR`), likewise.
+const GOTODIR_SHORTCUTS: &[(Action, &str)] = &[(Action::Help, "Help"), (Action::Cancel, "Cancel")];
 
 /// The `^G` help viewer's own bottom bar (confirmed against the installed
 /// nano's help screen).
@@ -3157,6 +3713,8 @@ fn shortcut_bar_entries(keymap: &KeyMap, prompt: Option<&Prompt>) -> Vec<(String
         Menu::WriteOut => WRITEOUT_SHORTCUTS,
         Menu::Execute => EXECUTE_SHORTCUTS,
         Menu::Linter => LINTER_SHORTCUTS,
+        Menu::WhereIsFile => WHEREISFILE_SHORTCUTS,
+        Menu::GotoDir => GOTODIR_SHORTCUTS,
         _ => return resolve_shortcuts(keymap, Menu::Main, SHORTCUT_PRIORITY),
     };
     resolve_shortcuts(keymap, p.menu, table)
@@ -4200,7 +4758,7 @@ mod tests {
         std::fs::write(dir.join("readme.txt"), "").unwrap();
         let mut ed = test_editor("x");
         let mut prompt = insert_prompt(false, &format!("{}/rea", dir.display()));
-        apply_filename_completion(&mut ed, &mut prompt);
+        apply_filename_completion(&mut ed, &mut prompt, None);
         assert_eq!(prompt.input, format!("{}/readme.txt", dir.display()));
         assert_eq!(prompt.cursor, prompt.input.chars().count());
         assert!(ed.file_completions.is_none());
@@ -4213,7 +4771,7 @@ mod tests {
         std::fs::create_dir(dir.join("subdir")).unwrap();
         let mut ed = test_editor("x");
         let mut prompt = insert_prompt(false, &format!("{}/sub", dir.display()));
-        apply_filename_completion(&mut ed, &mut prompt);
+        apply_filename_completion(&mut ed, &mut prompt, None);
         assert_eq!(prompt.input, format!("{}/subdir/", dir.display()));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4225,7 +4783,7 @@ mod tests {
         std::fs::write(dir.join("foo_beta.txt"), "").unwrap();
         let mut ed = test_editor("x");
         let mut prompt = insert_prompt(false, &format!("{}/foo_", dir.display()));
-        apply_filename_completion(&mut ed, &mut prompt);
+        apply_filename_completion(&mut ed, &mut prompt, None);
         assert_eq!(prompt.input, format!("{}/foo_", dir.display()));
         let matches = ed
             .file_completions
@@ -4241,7 +4799,7 @@ mod tests {
         let dir = tab_complete_test_dir("tico_test_tabcomplete_none");
         let mut ed = test_editor("x");
         let mut prompt = insert_prompt(false, &format!("{}/nope", dir.display()));
-        apply_filename_completion(&mut ed, &mut prompt);
+        apply_filename_completion(&mut ed, &mut prompt, None);
         assert_eq!(prompt.input, format!("{}/nope", dir.display()));
         assert!(ed.file_completions.is_none());
         std::fs::remove_dir_all(&dir).ok();
@@ -4361,7 +4919,7 @@ mod tests {
         // username completion, even though it starts with `~`.
         let mut ed = test_editor("x");
         let mut prompt = insert_prompt(false, "~/tico_test_no_such_dir_xyz123/rea");
-        apply_filename_completion(&mut ed, &mut prompt);
+        apply_filename_completion(&mut ed, &mut prompt, None);
         assert_eq!(prompt.input, "~/tico_test_no_such_dir_xyz123/rea");
     }
 
@@ -4512,22 +5070,242 @@ mod tests {
         assert!(prompt.label.contains("new buffer"));
     }
 
-    #[test]
-    fn unimplemented_insert_actions_report_plainly_and_close_the_prompt() {
-        let (action, expected) = (Action::Browser, "File Browser: not yet implemented");
-        {
-            let mut ed = test_editor("x");
-            let mut prompt = insert_prompt(false, "");
-            assert!(
-                apply_prompt_action(&mut ed, &mut prompt, action),
-                "{action:?}"
-            );
-            assert!(
-                matches!(ed.mode, Mode::Editing),
-                "{action:?} should close the prompt"
-            );
-            assert_eq!(ed.status.as_deref(), Some(expected), "{action:?}");
+    /// A scratch directory for the browser tests: `sub/` (holding
+    /// `inner.txt`), `alpha.txt` and `beta.txt`.
+    fn browser_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tico-browser-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/inner.txt"), "inner\n").unwrap();
+        std::fs::write(dir.join("alpha.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.join("beta.txt"), "beta\n").unwrap();
+        crate::browser::full_dir_path(&dir).unwrap()
+    }
+
+    fn press(ed: &mut Editor, code: KeyCode, modifiers: KeyModifiers) {
+        handle_key(ed, KeyEvent::new(code, modifiers));
+    }
+
+    fn type_text(ed: &mut Editor, text: &str) {
+        for c in text.chars() {
+            press(ed, KeyCode::Char(c), KeyModifiers::NONE);
         }
+    }
+
+    fn browser_names(ed: &Editor) -> Vec<String> {
+        let session = ed.browser.as_ref().expect("browser open");
+        session
+            .list
+            .entries
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    fn selected_name(ed: &Editor) -> String {
+        let session = ed.browser.as_ref().expect("browser open");
+        session.list.selected_entry().unwrap().name.clone()
+    }
+
+    fn open_test_browser(dir: &std::path::Path) -> Editor {
+        let mut ed = test_editor("x");
+        ed.screen_cols = 80;
+        ed.screen_rows = 24;
+        let input = format!("{}/", dir.display());
+        ed.mode = Mode::Prompt(insert_prompt(false, &input));
+        press(&mut ed, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(matches!(ed.mode, Mode::Browser));
+        ed
+    }
+
+    #[test]
+    fn browser_lists_the_prompts_directory_and_inserts_the_chosen_file() {
+        let dir = browser_fixture("insert");
+        let mut ed = open_test_browser(&dir);
+        assert_eq!(browser_names(&ed), ["..", "sub", "alpha.txt", "beta.txt"]);
+        assert_eq!(selected_name(&ed), "..");
+        // Right three times, then Enter: beta.txt is read into the buffer.
+        press(&mut ed, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut ed, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut ed, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(selected_name(&ed), "beta.txt");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert!(ed.browser.is_none());
+        assert_eq!(ed.buf().to_string(), "beta\nx");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn browser_enters_directories_and_reselects_on_the_way_back_up() {
+        let dir = browser_fixture("updown");
+        let mut ed = open_test_browser(&dir);
+        press(&mut ed, KeyCode::Right, KeyModifiers::NONE);
+        // `s` is Enter in the browser, as in nano.
+        type_text(&mut ed, "s");
+        assert_eq!(ed.browser.as_ref().unwrap().list.dir, dir.join("sub"));
+        assert_eq!(browser_names(&ed), ["..", "inner.txt"]);
+        assert_eq!(selected_name(&ed), "..");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(ed.browser.as_ref().unwrap().list.dir, dir);
+        assert_eq!(selected_name(&ed), "sub");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn leaving_the_browser_restores_the_prompt_untouched() {
+        let dir = browser_fixture("leave");
+        for (code, modifiers) in [
+            (KeyCode::Char('x'), KeyModifiers::CONTROL),
+            (KeyCode::Char('t'), KeyModifiers::CONTROL),
+            (KeyCode::Char('q'), KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            let mut ed = open_test_browser(&dir);
+            press(&mut ed, code, modifiers);
+            assert!(ed.browser.is_none(), "{code:?}");
+            let Mode::Prompt(prompt) = &ed.mode else {
+                panic!("{code:?} should return to the prompt");
+            };
+            assert_eq!(prompt.menu, Menu::Insert);
+            assert_eq!(prompt.input, format!("{}/", dir.display()));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn browser_search_selects_matches_and_shares_the_search_string() {
+        let dir = browser_fixture("search");
+        let mut ed = open_test_browser(&dir);
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        let Mode::Prompt(prompt) = &ed.mode else {
+            panic!("search prompt expected");
+        };
+        assert_eq!(prompt.menu, Menu::WhereIsFile);
+        assert_eq!(prompt.label, "Search");
+        type_text(&mut ed, "TXT");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Browser));
+        assert_eq!(selected_name(&ed), "alpha.txt");
+        assert_eq!(ed.search.last_pattern.as_deref(), Some("TXT"));
+        // `n` repeats it; past the end it wraps.
+        type_text(&mut ed, "n");
+        assert_eq!(selected_name(&ed), "beta.txt");
+        assert_eq!(ed.status, None);
+        type_text(&mut ed, "n");
+        assert_eq!(selected_name(&ed), "alpha.txt");
+        assert_eq!(ed.status.as_deref(), Some("Search Wrapped"));
+        // The previous string is offered in the label, and Enter reuses it.
+        type_text(&mut ed, "w");
+        let Mode::Prompt(prompt) = &ed.mode else {
+            panic!("search prompt expected");
+        };
+        assert_eq!(prompt.label, "Search [TXT]");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(selected_name(&ed), "beta.txt");
+        // Cancelling goes back to the browser.
+        press(&mut ed, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(ed.mode, Mode::Browser));
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+        type_text(&mut ed, "wzzz");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(ed.status.as_deref(), Some("\"zzz\" not found"));
+        assert_eq!(selected_name(&ed), "beta.txt");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn go_to_directory_enters_or_complains() {
+        let dir = browser_fixture("gotodir");
+        let mut ed = open_test_browser(&dir);
+        press(&mut ed, KeyCode::Char('7'), KeyModifiers::CONTROL); // ^_
+        let Mode::Prompt(prompt) = &ed.mode else {
+            panic!("go-to-dir prompt expected");
+        };
+        assert_eq!(prompt.menu, Menu::GotoDir);
+        // Tab completes relative to the browsed directory, directories only.
+        type_text(&mut ed, "s");
+        press(&mut ed, KeyCode::Tab, KeyModifiers::NONE);
+        let Mode::Prompt(prompt) = &ed.mode else {
+            panic!("go-to-dir prompt expected");
+        };
+        assert_eq!(prompt.input, "sub/");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Browser));
+        assert_eq!(ed.browser.as_ref().unwrap().list.dir, dir.join("sub"));
+
+        type_text(&mut ed, "g");
+        type_text(&mut ed, "../nowhere");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Browser));
+        assert_eq!(ed.browser.as_ref().unwrap().list.dir, dir.join("sub"));
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("Cannot open directory: No such file or directory")
+        );
+        assert_eq!(ed.status_level, crate::app::StatusLevel::Alert);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn browsing_from_write_out_asks_before_overwriting_the_chosen_file() {
+        let dir = browser_fixture("writeout");
+        let mut ed = test_editor("new text");
+        ed.screen_cols = 80;
+        ed.screen_rows = 24;
+        let flow = crate::app::WriteFlow {
+            exiting: false,
+            withprompt: true,
+            maychange: true,
+        };
+        ed.mode = Mode::Prompt(Prompt {
+            kind: PromptKind::WriteOut { flow },
+            menu: Menu::WriteOut,
+            label: "File Name to Write".to_string(),
+            input: dir.join("whatever").to_string_lossy().into_owned(),
+            cursor: 0,
+            history_pos: None,
+            saved_input: None,
+        });
+        press(&mut ed, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(ed.mode, Mode::Browser),
+            "a missing name browses its directory"
+        );
+        press(&mut ed, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(selected_name(&ed), "beta.txt");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        let Mode::Prompt(prompt) = &ed.mode else {
+            panic!("overwrite question expected");
+        };
+        assert!(
+            matches!(
+                prompt.kind,
+                PromptKind::WriteConfirm {
+                    question: crate::app::WriteQuestion::Overwrite,
+                    ..
+                }
+            ),
+            "{:?}",
+            prompt.kind
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn browser_screen_shows_the_directory_listing_and_its_bar() {
+        let dir = browser_fixture("render");
+        let ed = open_test_browser(&dir);
+        let mut out = Vec::new();
+        render_browser_screen(&ed, ed.browser.as_ref().unwrap(), &mut out, false).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("DIR: "), "{text}");
+        assert!(text.contains("(parent dir)"), "{text}");
+        assert!(text.contains("alpha.txt"), "{text}");
+        assert!(text.contains("Go To Dir"), "{text}");
+        assert!(text.contains("Where Was"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

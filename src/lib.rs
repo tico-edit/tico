@@ -4,6 +4,7 @@
 //! output without pulling in the editor itself.
 
 pub mod app;
+pub mod browser;
 pub mod buffer;
 pub mod cli;
 pub mod config;
