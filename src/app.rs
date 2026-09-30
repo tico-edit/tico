@@ -579,6 +579,47 @@ impl Editor {
         self.scroll_horizontal_to_cursor();
     }
 
+    /// Keep nano's magic line (see `Buffer::lacks_magic_line`) under the
+    /// current buffer's text unless `nonewlines`; run after every event
+    /// that might have edited it.
+    pub fn ensure_magic_line(&mut self) {
+        if !self.options.nonewlines && !self.buffers.is_empty() {
+            self.buf_mut().add_magic_line();
+        }
+    }
+
+    /// Whether the cursor sits at the end of a line with text on it that
+    /// is directly above the magic line: nano's do_delete does nothing
+    /// there (joining the two would only have the magic line re-added).
+    fn at_end_above_magic_line(&self) -> bool {
+        let buf = self.buf();
+        let len = buf.line(buf.cursor.line).chars().count();
+        !self.options.nonewlines
+            && len > 0
+            && buf.cursor.col == len
+            && buf.cursor.line + 2 == buf.line_count()
+    }
+
+    fn do_delete(&mut self) {
+        if !self.at_end_above_magic_line() {
+            self.buf_mut().delete_forward();
+        }
+    }
+
+    /// nano's do_backspace is a do_left followed by a do_delete, so on
+    /// the magic line under a line with text it only moves the cursor.
+    fn do_backspace(&mut self) {
+        let cursor = self.buf().cursor;
+        if cursor.col == 0 && cursor.line > 0 {
+            self.buf_mut().move_left();
+            if self.at_end_above_magic_line() {
+                return;
+            }
+            self.buf_mut().cursor = cursor;
+        }
+        self.buf_mut().backspace();
+    }
+
     /// Dispatch one editing action. Returns true if the caller should
     /// re-render (essentially always, but kept for future use).
     pub fn execute(&mut self, action: Action) {
@@ -659,8 +700,8 @@ impl Editor {
             GotoLine => self.begin_goto_line(),
             Tab => self.buf_mut().insert_char('\t'),
             Enter => self.do_enter(),
-            Delete => self.buf_mut().delete_forward(),
-            Backspace => self.buf_mut().backspace(),
+            Delete => self.do_delete(),
+            Backspace => self.do_backspace(),
             Zap => self.do_zap(),
             ChopWordLeft => self.chop_word_left(),
             ChopWordRight => self.chop_word_right(),
