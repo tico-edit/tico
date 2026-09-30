@@ -298,12 +298,23 @@ pub(crate) fn nano_style_line_count(text: &str) -> usize {
     }
 }
 
+/// Give freshly read `text` nano's magic line (see
+/// `Buffer::lacks_magic_line`) unless `nonewlines`: nano's `read_file`
+/// puts an empty line after a last line with no newline on it, without
+/// that counting as a modification.
+pub fn with_magic_line(text: &mut String, nonewlines: bool) {
+    if !nonewlines && !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+}
+
 /// Read `path` into a fresh buffer, converting line endings per
 /// `convert_line_endings` and settling the buffer's format per
 /// `Buffer::adopt_format`.
 pub fn load_file(path: &Path, opts: &Options) -> std::io::Result<LoadedFile> {
     let raw = std::fs::read_to_string(path)?;
-    let (text, detected) = convert_line_endings(&raw, opts.noconvert);
+    let (mut text, detected) = convert_line_endings(&raw, opts.noconvert);
+    with_magic_line(&mut text, opts.nonewlines);
     let mut buffer = Buffer::from_text(&text, Some(path.to_path_buf()));
     buffer.adopt_format(detected, opts.unix);
     buffer.disk_state = stat_disk_state(path);
@@ -379,12 +390,18 @@ pub fn check_external_change(buffer: &Buffer) -> ExternalChange {
 /// Reload a buffer from disk in place, discarding any (already-established
 /// to be nonexistent-or-ignorable) local state. Preserves cursor position
 /// where possible by clamping.
-pub fn reload(buffer: &mut Buffer, noconvert: bool, unix: bool) -> std::io::Result<()> {
+pub fn reload(
+    buffer: &mut Buffer,
+    noconvert: bool,
+    unix: bool,
+    nonewlines: bool,
+) -> std::io::Result<()> {
     let Some(path) = buffer.path.clone() else {
         return Ok(());
     };
     let raw = std::fs::read_to_string(&path)?;
-    let (text, detected) = convert_line_endings(&raw, noconvert);
+    let (mut text, detected) = convert_line_endings(&raw, noconvert);
+    with_magic_line(&mut text, nonewlines);
     buffer.adopt_format(detected, unix);
     let cursor = buffer.cursor;
     buffer.rope = ropey::Rope::from_str(&text);
@@ -651,6 +668,22 @@ mod tests {
         let mut buf = Buffer::empty();
         buf.adopt_format(Unix, false);
         assert_eq!(buf.format, Unix);
+    }
+
+    #[test]
+    fn loading_a_file_without_a_final_newline_adds_the_magic_line() {
+        let path = std::env::temp_dir().join("tico_test_magic_line.txt");
+        std::fs::write(&path, "one\ntwo").unwrap();
+        let loaded = load_file(&path, &Options::default()).unwrap();
+        assert_eq!(loaded.buffer.to_string(), "one\ntwo\n");
+        assert!(!loaded.buffer.modified);
+        let nonewlines = Options {
+            nonewlines: true,
+            ..Default::default()
+        };
+        let loaded = load_file(&path, &nonewlines).unwrap();
+        assert_eq!(loaded.buffer.to_string(), "one\ntwo");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

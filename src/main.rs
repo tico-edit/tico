@@ -269,6 +269,8 @@ fn open_stdin(
             // feeds read_file too).
             let (content, detected) = fileio::convert_line_endings(&content, opts.noconvert);
             let msg = fileio::describe_read(&content, detected);
+            let mut content = content;
+            fileio::with_magic_line(&mut content, opts.nonewlines);
             let mut buf = buffer::Buffer::from_text(&content, None);
             buf.adopt_format(detected, opts.unix);
             if !content.is_empty() {

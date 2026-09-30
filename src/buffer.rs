@@ -283,6 +283,35 @@ impl Buffer {
         self.content_version = self.content_version.wrapping_add(1);
     }
 
+    /// Whether the text ends partway into a line -- missing the empty
+    /// last line nano calls the "magic line", which (unless `nonewlines`)
+    /// it keeps below the text at all times, so that the cursor can
+    /// always move down past a last line that has text on it and a saved
+    /// file ends with a newline.
+    pub fn lacks_magic_line(&self) -> bool {
+        let len = self.rope.len_chars();
+        len > 0 && self.rope.char(len - 1) != '\n'
+    }
+
+    /// Restore the magic line (see `lacks_magic_line`) after an edit left
+    /// the text ending mid-line: nano adds a fresh one as soon as the old
+    /// one gets text typed, pasted, ... onto it, and undoing that edit
+    /// takes the added line away with it -- so the newline joins the undo
+    /// entry of the edit that reached the end of the text.
+    pub fn add_magic_line(&mut self) {
+        if !self.lacks_magic_line() {
+            return;
+        }
+        let len = self.rope.len_chars();
+        self.rope.insert_char(len, '\n');
+        if let Some(edit) = self.undo_stack.last_mut()
+            && edit.start_char + edit.inserted.chars().count() == len
+        {
+            edit.inserted.push('\n');
+        }
+        self.content_version = self.content_version.wrapping_add(1);
+    }
+
     /// Invalidate the highlight cache after replacing `rope` wholesale
     /// (reload from disk, applying a merge, ...) — those bypass
     /// `replace_range`/`undo`/`redo`, the usual places that bump

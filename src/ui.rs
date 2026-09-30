@@ -305,8 +305,9 @@ fn maybe_check_external_change(editor: &mut Editor) -> bool {
     match crate::fileio::check_external_change(editor.buf()) {
         ExternalChange::Unchanged => return false,
         ExternalChange::ChangedNoLocalEdits => {
-            let (noconvert, unix) = (editor.options.noconvert, editor.options.unix);
-            let _ = crate::fileio::reload(editor.buf_mut(), noconvert, unix);
+            let o = &editor.options;
+            let (noconvert, unix, nonewlines) = (o.noconvert, o.unix, o.nonewlines);
+            let _ = crate::fileio::reload(editor.buf_mut(), noconvert, unix, nonewlines);
             editor.set_status("File reloaded (changed on disk)");
         }
         ExternalChange::ChangedWithLocalEdits => {
@@ -321,6 +322,11 @@ fn maybe_check_external_change(editor: &mut Editor) -> bool {
 // ---------------------------------------------------------------------
 
 fn handle_key(editor: &mut Editor, key: KeyEvent) {
+    dispatch_key(editor, key);
+    editor.ensure_magic_line();
+}
+
+fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
     match std::mem::replace(&mut editor.mode, Mode::Editing) {
         Mode::Editing => {
             editor.mode = Mode::Editing;
@@ -385,6 +391,11 @@ fn handle_key(editor: &mut Editor, key: KeyEvent) {
 /// expects dragging to work (see `set mouse` in `nanorc(5)`): nano's own
 /// mouse handling has no drag/motion case at all.
 fn handle_mouse(editor: &mut Editor, mev: MouseEvent) {
+    dispatch_mouse(editor, mev);
+    editor.ensure_magic_line();
+}
+
+fn dispatch_mouse(editor: &mut Editor, mev: MouseEvent) {
     if !editor.options.mouse {
         return;
     }
@@ -1562,8 +1573,9 @@ fn handle_conflict_choice(editor: &mut Editor, prompt: Prompt, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Char('r') | KeyCode::Char('R') => {
-            let (noconvert, unix) = (editor.options.noconvert, editor.options.unix);
-            let _ = crate::fileio::reload(editor.buf_mut(), noconvert, unix);
+            let o = &editor.options;
+            let (noconvert, unix, nonewlines) = (o.noconvert, o.unix, o.nonewlines);
+            let _ = crate::fileio::reload(editor.buf_mut(), noconvert, unix, nonewlines);
             editor.mode = Mode::Editing;
             editor.set_status("Reloaded from disk; local edits discarded");
         }
@@ -1629,7 +1641,8 @@ fn handle_diff_key(
         }
         DiffOutcome::ApplyMerge { merged_text } => match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                let text = merged_text.clone();
+                let mut text = merged_text.clone();
+                crate::fileio::with_magic_line(&mut text, editor.options.nonewlines);
                 editor.buf_mut().rope = ropey::Rope::from_str(&text);
                 editor.buf_mut().invalidate_highlight_cache();
                 editor.buf_mut().modified = true;
@@ -5220,6 +5233,54 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn typing_on_the_last_line_adds_a_magic_line_below_it() {
+        let mut ed = test_editor("");
+        type_text(&mut ed, "abc");
+        assert_eq!(ed.buf().to_string(), "abc\n");
+        press(&mut ed, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            ed.buf().cursor,
+            Pos::new(1, 0),
+            "Down reaches the magic line"
+        );
+        type_text(&mut ed, "d");
+        assert_eq!(ed.buf().to_string(), "abc\nd\n");
+        // Undoing the typing takes its magic line away with it.
+        press(&mut ed, KeyCode::Char('u'), KeyModifiers::ALT);
+        assert_eq!(ed.buf().to_string(), "abc\n");
+    }
+
+    #[test]
+    fn nonewlines_keeps_no_magic_line() {
+        let mut ed = test_editor("");
+        ed.options.nonewlines = true;
+        type_text(&mut ed, "abc");
+        press(&mut ed, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(ed.buf().to_string(), "abc");
+        assert_eq!(ed.buf().cursor, Pos::new(0, 3));
+    }
+
+    #[test]
+    fn delete_and_backspace_leave_the_magic_line_alone() {
+        // Checked against nano 8.7.1: neither edits, nor marks modified.
+        let mut ed = test_editor("one\ntwo\n");
+        ed.buf_mut().cursor = Pos::new(1, 3);
+        press(&mut ed, KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(ed.buf().to_string(), "one\ntwo\n");
+        assert!(!ed.buf().modified);
+        ed.buf_mut().cursor = Pos::new(2, 0);
+        press(&mut ed, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(ed.buf().to_string(), "one\ntwo\n");
+        assert_eq!(ed.buf().cursor, Pos::new(1, 3));
+        assert!(!ed.buf().modified);
+        // Above an empty line, the join is real.
+        let mut ed = test_editor("one\n\n");
+        ed.buf_mut().cursor = Pos::new(2, 0);
+        press(&mut ed, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(ed.buf().to_string(), "one\n");
+    }
+
     fn selected_name(ed: &Editor) -> String {
         let session = ed.browser.as_ref().expect("browser open");
         session.list.selected_entry().unwrap().name.clone()
@@ -5250,7 +5311,7 @@ mod tests {
         press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(ed.mode, Mode::Editing));
         assert!(ed.browser.is_none());
-        assert_eq!(ed.buf().to_string(), "beta\nx");
+        assert_eq!(ed.buf().to_string(), "beta\nx\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
