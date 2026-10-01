@@ -736,28 +736,105 @@ impl Editor {
             // apply_binding/apply_prompt_action intercept them before they
             // would ever reach here.
             Speller | Formatter | Linter | Suspend => {}
-            NoHelp => self.options.nohelp = !self.options.nohelp,
+            NoHelp => {
+                self.options.nohelp = !self.options.nohelp;
+                // Named (and reported) after the positive feature, "Help
+                // mode", not the negated nohelp flag it flips: confirmed
+                // against the installed nano 8.6 that "enabled" is shown
+                // when nohelp goes false (shortcut lines visible).
+                self.set_status(if self.options.nohelp {
+                    "Help mode disabled"
+                } else {
+                    "Help mode enabled"
+                });
+            }
             Zero => self.options.zero = !self.options.zero,
             ConstantShow => self.options.constantshow = !self.options.constantshow,
-            SoftWrap => self.options.softwrap = !self.options.softwrap,
-            LineNumbers => self.options.linenumbers = !self.options.linenumbers,
+            // Zero and ConstantShow stay silent here like nano itself:
+            // zero hides every bar there'd be room to report on, and
+            // constantshow's toggle is immediately superseded by the
+            // live cursor-position display, so nano's do_toggle skips the
+            // generic message for both (verified against installed nano 8.6).
+            SoftWrap => {
+                self.options.softwrap = !self.options.softwrap;
+                self.set_status(if self.options.softwrap {
+                    "Soft wrapping of overlong lines enabled"
+                } else {
+                    "Soft wrapping of overlong lines disabled"
+                });
+            }
+            LineNumbers => {
+                self.options.linenumbers = !self.options.linenumbers;
+                self.set_status(if self.options.linenumbers {
+                    "Line numbering enabled"
+                } else {
+                    "Line numbering disabled"
+                });
+            }
             WhitespaceDisplay => {
                 self.options.whitespacedisplay = !self.options.whitespacedisplay;
-                // nano's do_toggle reports every flag flip this way; tico
-                // does so for this one (the others are still silent).
                 self.set_status(if self.options.whitespacedisplay {
                     "Whitespace display enabled"
                 } else {
                     "Whitespace display disabled"
                 });
             }
-            NoSyntax => self.options.syntax_highlighting = !self.options.syntax_highlighting,
-            SmartHome => self.options.smarthome = !self.options.smarthome,
-            AutoIndent => self.options.autoindent = !self.options.autoindent,
-            CutFromCursor => self.options.cutfromcursor = !self.options.cutfromcursor,
-            BreakLongLines => self.options.breaklonglines = !self.options.breaklonglines,
-            TabsToSpaces => self.options.tabstospaces = !self.options.tabstospaces,
-            Mouse => self.options.mouse = !self.options.mouse,
+            NoSyntax => {
+                self.options.syntax_highlighting = !self.options.syntax_highlighting;
+                self.set_status(if self.options.syntax_highlighting {
+                    "Color syntax highlighting enabled"
+                } else {
+                    "Color syntax highlighting disabled"
+                });
+            }
+            SmartHome => {
+                self.options.smarthome = !self.options.smarthome;
+                self.set_status(if self.options.smarthome {
+                    "Smart home key enabled"
+                } else {
+                    "Smart home key disabled"
+                });
+            }
+            AutoIndent => {
+                self.options.autoindent = !self.options.autoindent;
+                self.set_status(if self.options.autoindent {
+                    "Auto indent enabled"
+                } else {
+                    "Auto indent disabled"
+                });
+            }
+            CutFromCursor => {
+                self.options.cutfromcursor = !self.options.cutfromcursor;
+                self.set_status(if self.options.cutfromcursor {
+                    "Cut to end enabled"
+                } else {
+                    "Cut to end disabled"
+                });
+            }
+            BreakLongLines => {
+                self.options.breaklonglines = !self.options.breaklonglines;
+                self.set_status(if self.options.breaklonglines {
+                    "Hard wrapping of overlong lines enabled"
+                } else {
+                    "Hard wrapping of overlong lines disabled"
+                });
+            }
+            TabsToSpaces => {
+                self.options.tabstospaces = !self.options.tabstospaces;
+                self.set_status(if self.options.tabstospaces {
+                    "Conversion of typed tabs to spaces enabled"
+                } else {
+                    "Conversion of typed tabs to spaces disabled"
+                });
+            }
+            Mouse => {
+                self.options.mouse = !self.options.mouse;
+                self.set_status(if self.options.mouse {
+                    "Mouse support enabled"
+                } else {
+                    "Mouse support disabled"
+                });
+            }
             CaseSens => self.search.case_sensitive = !self.search.case_sensitive,
             Regexp => self.search.use_regex = !self.search.use_regex,
             Backwards => self.search.backwards = !self.search.backwards,
@@ -3910,6 +3987,110 @@ mod tests {
         ed.execute(Action::WhitespaceDisplay);
         assert!(!ed.options.whitespacedisplay);
         assert_eq!(ed.status.as_deref(), Some("Whitespace display disabled"));
+    }
+
+    #[test]
+    fn other_m_toggles_report_like_nanos_do_toggle_too() {
+        // Wording and enabled/disabled polarity verified against the
+        // installed nano 8.6 binary, one toggle at a time, with a pty.
+        for (action, enabled_msg, disabled_msg) in [
+            (
+                Action::SoftWrap,
+                "Soft wrapping of overlong lines enabled",
+                "Soft wrapping of overlong lines disabled",
+            ),
+            (
+                Action::LineNumbers,
+                "Line numbering enabled",
+                "Line numbering disabled",
+            ),
+            (
+                Action::SmartHome,
+                "Smart home key enabled",
+                "Smart home key disabled",
+            ),
+            (
+                Action::AutoIndent,
+                "Auto indent enabled",
+                "Auto indent disabled",
+            ),
+            (
+                Action::CutFromCursor,
+                "Cut to end enabled",
+                "Cut to end disabled",
+            ),
+            (
+                Action::BreakLongLines,
+                "Hard wrapping of overlong lines enabled",
+                "Hard wrapping of overlong lines disabled",
+            ),
+            (
+                Action::TabsToSpaces,
+                "Conversion of typed tabs to spaces enabled",
+                "Conversion of typed tabs to spaces disabled",
+            ),
+            (
+                Action::Mouse,
+                "Mouse support enabled",
+                "Mouse support disabled",
+            ),
+        ] {
+            let mut ed = test_editor("x");
+            ed.execute(action);
+            assert_eq!(
+                ed.status.as_deref(),
+                Some(enabled_msg),
+                "{action:?} first toggle"
+            );
+            ed.execute(action);
+            assert_eq!(
+                ed.status.as_deref(),
+                Some(disabled_msg),
+                "{action:?} second toggle"
+            );
+        }
+
+        // NoHelp and NoSyntax flip fields whose *name* is the negative of
+        // the feature nano reports on, so the message polarity is the
+        // opposite of the raw flag for one of them.
+        let mut ed = test_editor("x");
+        assert!(!ed.options.nohelp);
+        ed.execute(Action::NoHelp);
+        assert!(ed.options.nohelp);
+        assert_eq!(ed.status.as_deref(), Some("Help mode disabled"));
+        ed.execute(Action::NoHelp);
+        assert!(!ed.options.nohelp);
+        assert_eq!(ed.status.as_deref(), Some("Help mode enabled"));
+
+        let mut ed = test_editor("x");
+        assert!(ed.options.syntax_highlighting);
+        ed.execute(Action::NoSyntax);
+        assert!(!ed.options.syntax_highlighting);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("Color syntax highlighting disabled")
+        );
+        ed.execute(Action::NoSyntax);
+        assert!(ed.options.syntax_highlighting);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("Color syntax highlighting enabled")
+        );
+    }
+
+    #[test]
+    fn zero_and_constantshow_toggles_stay_silent_like_nano() {
+        // nano's do_toggle skips the generic message for these two: zero
+        // hides every bar there'd be room to report on, and constantshow
+        // is immediately superseded by the live cursor-position display.
+        // Verified against the installed nano 8.6 binary.
+        let mut ed = test_editor("x");
+        ed.execute(Action::Zero);
+        assert_eq!(ed.status, None);
+
+        let mut ed = test_editor("x");
+        ed.execute(Action::ConstantShow);
+        assert_eq!(ed.status, None);
     }
 
     #[test]
