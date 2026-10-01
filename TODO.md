@@ -25,13 +25,6 @@ here.
 - [ ] Write Out prompt toggles: Append (`M-A`), Prepend (`M-P`), Backup
       (`M-B`)
 
-## Bound keys that work but give no feedback
-
-- [ ] The other `M-` toggles (`M-S` soft wrap, `M-N` line numbers, `M-X`
-      help lines, ...) flip their option but don't show nano's
-      "<Feature> enabled/disabled" message; only `M-P` whitespace display
-      reports
-
 ## Options parsed but never consulted
 
 ### Display
