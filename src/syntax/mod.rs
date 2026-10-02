@@ -1380,6 +1380,81 @@ mod tests {
         assert_eq!(at("hello").as_deref(), Some("string"));
     }
 
+    /// The vendored V query is reordered for tico's last-wins painting, so
+    /// a method call's name stays a method rather than a plain field.
+    #[test]
+    fn v_highlights() {
+        let src = "module main\n\nimport os\n\n// A point\n@[heap]\npub struct Point {\nmut:\n\tx int\n}\n\nfn (p Point) dist(scale f64) f64 {\n\treturn p.x * scale + 1.5\n}\n\nfn main() {\n\tp := Point{x: 3}\n\tname := os.args[0]\n\tprintln('${name}: ${p.dist(2.0)}\\n')\n\tif true { exit(0) }\n}\n";
+        let lang = languages::detect(Some(std::path::Path::new("a.v")), src).unwrap();
+        assert_eq!(lang.name, "v");
+        let spans = highlight(src, lang);
+        let at = |needle: &str| {
+            let start = src.find(needle).unwrap();
+            spans
+                .iter()
+                .filter(|s| s.start == start && s.end == start + needle.len())
+                .map(|s| s.scope.name().to_string())
+                .next_back()
+        };
+        assert_eq!(at("module").as_deref(), Some("keyword.storage.type"));
+        assert_eq!(at("main").as_deref(), Some("namespace"));
+        assert_eq!(at("import").as_deref(), Some("keyword.control.import"));
+        assert_eq!(at("os").as_deref(), Some("namespace"));
+        assert_eq!(at("// A point").as_deref(), Some("comment"));
+        assert_eq!(at("@[heap]").as_deref(), Some("attribute"));
+        {
+            let start = src.find("heap]").unwrap() + 4;
+            let scope = spans
+                .iter()
+                .filter(|s| s.start == start && s.end == start + 1)
+                .map(|s| s.scope.name().to_string())
+                .next_back();
+            assert_eq!(scope.as_deref(), Some("attribute"));
+        }
+        assert_eq!(at("pub").as_deref(), Some("keyword"));
+        assert_eq!(at("Point").as_deref(), Some("type"));
+        assert_eq!(at("mut").as_deref(), Some("keyword.storage.modifier.mut"));
+        assert_eq!(at("x").as_deref(), Some("variable.other.member"));
+        assert_eq!(at("f64").as_deref(), Some("type"));
+        assert_eq!(at("dist").as_deref(), Some("function.method"));
+        assert_eq!(at("scale").as_deref(), Some("variable.parameter"));
+        assert_eq!(at("return").as_deref(), Some("keyword.control.return"));
+        assert_eq!(at("1.5").as_deref(), Some("constant.numeric.float"));
+        assert_eq!(at("3").as_deref(), Some("constant.numeric.integer"));
+        assert_eq!(at("println").as_deref(), Some("function"));
+        assert_eq!(at("${").as_deref(), Some("punctuation.bracket"));
+        {
+            // `p.dist(2.0)` inside the interpolation: a method call.
+            let start = src.find("p.dist(").unwrap() + 2;
+            let scope = spans
+                .iter()
+                .filter(|s| s.start == start && s.end == start + 4)
+                .map(|s| s.scope.name().to_string())
+                .next_back();
+            assert_eq!(scope.as_deref(), Some("function.method"));
+        }
+        assert_eq!(at("\\n").as_deref(), Some("constant.character.escape"));
+        assert_eq!(at("if").as_deref(), Some("keyword.control.conditional"));
+        assert_eq!(at("true").as_deref(), Some("constant.builtin.boolean"));
+    }
+
+    #[test]
+    fn v_detection() {
+        let detect = |path: &str, text: &str| {
+            languages::detect(Some(std::path::Path::new(path)), text).map(|l| l.name)
+        };
+        assert_eq!(detect("build.vsh", ""), Some("v"));
+        assert_eq!(detect("v.mod", "Module {\n}\n"), Some("v"));
+        assert_eq!(
+            detect("script", "#!/usr/bin/env v\nprintln(1)\n"),
+            Some("v")
+        );
+        assert_eq!(
+            detect("script", "#!/usr/bin/env -S v run\nprintln(1)\n"),
+            Some("v")
+        );
+    }
+
     #[test]
     fn make_plain_rule_is_colored() {
         let src = "foo: bar baz.o\n\tcc -o foo bar\n\nall: foo\n";
@@ -2476,6 +2551,11 @@ mod tests {
                 "# hi\nfunction Foo { param($x) Write-Output $x }\n",
             ),
             ("batch", "a.cmd", "@echo off\nREM hi\nset X=1\necho %X%\n"),
+            (
+                "v",
+                "a.v",
+                "module main\n// hi\nfn main() {\n\tx := 1\n\tprintln('${x}')\n}\n",
+            ),
             (
                 "cue",
                 "a.cue",

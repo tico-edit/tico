@@ -69,6 +69,7 @@ lang_fn!(lang_rust, tree_sitter_rust);
 lang_fn!(lang_bash, tree_sitter_bash);
 lang_fn!(lang_json, tree_sitter_json);
 lang_fn!(lang_yaml, tree_sitter_yaml);
+lang_fn!(lang_v, tree_sitter_vlang);
 lang_fn!(lang_toml, tree_sitter_toml_ng);
 lang_fn!(lang_make, tree_sitter_make);
 lang_fn!(lang_fortran, tree_sitter_fortran);
@@ -629,6 +630,18 @@ const LANGUAGES: &[LanguageDef] = &[
         comment: r#"""#,
     },
     LanguageDef {
+        name: "v",
+        extensions: &["v", "vsh"],
+        filenames: &["v.mod"],
+        shebangs: &["v"],
+        modeline_aliases: &["vlang"],
+        language: lang_v,
+        highlights_query: include_str!("queries/v.scm"),
+        linter: None,
+        formatter: None,
+        comment: "//",
+    },
+    LanguageDef {
         name: "lua",
         extensions: &["lua"],
         filenames: &[],
@@ -1014,6 +1027,12 @@ fn detect_by_shebang(first_line: &str) -> Option<&'static LanguageDef> {
     let interpreter_base = interpreter.rsplit('/').next().unwrap_or(interpreter);
     if interpreter_base == "env" {
         interpreter = parts.next()?;
+        // `env -S` splits the rest of the line into arguments, which is how
+        // a shebang passes the interpreter its own options
+        // (`#!/usr/bin/env -S v run`).
+        if interpreter == "-S" {
+            interpreter = parts.next()?;
+        }
     } else {
         interpreter = interpreter_base;
     }
