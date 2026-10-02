@@ -28,6 +28,7 @@ doesn't land in a Helix top-level scope fails
 | `cue.scm` | [eonpatapon/tree-sitter-cue](https://github.com/eonpatapon/tree-sitter-cue) commit `dd7b90e`, `queries/highlights.scm`, with two patterns moved earlier as noted in its header (the grammar itself is vendored under `grammars/tree-sitter-cue/`) | MIT |
 | `pascal.scm` | [Helix](https://github.com/helix-editor/helix) `runtime/queries/pascal/highlights.scm`, commit `33c18b3`, reordered and extended as noted in its header (the grammar is tico's fork under `grammars/tree-sitter-pascal/`) | **MPL-2.0** — see `LICENSE-MPL-2.0` in the repository root |
 | `hcl.scm` | [Helix](https://github.com/helix-editor/helix) `runtime/queries/hcl/highlights.scm`, commit `90b126d` (the `tree-sitter-hcl` crate ships no query) | **MPL-2.0** — see `LICENSE-MPL-2.0` in the repository root |
+| `v.scm` | [vlang/v-analyzer](https://github.com/vlang/v-analyzer) commit `925d457` (the revision the `tree-sitter-vlang` crate pins), `tree_sitter_v/queries/helix.highlights.scm`, reordered and adjusted as noted in its header (the crate ships no query) | MIT |
 | everything else | The corresponding `tree-sitter-<lang>` crate's `queries/highlights.scm`, unmodified except where noted in a file's header | That grammar's license (MIT for all current ones) |
 
 `diff.scm` and `hcl.scm` are the only files here not under tico's MIT
