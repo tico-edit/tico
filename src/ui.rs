@@ -1796,6 +1796,7 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                 };
                 let col = col_s.trim().parse::<i64>().unwrap_or(1).max(1) as usize - 1;
                 editor.buf_mut().cursor = Pos::new(target_line as usize, col);
+                editor.center_cursor_line();
             }
         }
         PromptKind::InsertFile {
