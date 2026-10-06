@@ -91,7 +91,15 @@ pub fn apply(
             Ok(())
         }
         "matchbrackets" => {
+            // nano: no blanks, and an even number of characters (the
+            // openers, then their closers in the same order).
             if let Some(v) = arg {
+                if v.chars().any(char::is_whitespace) {
+                    return Err("Non-blank characters required".to_string());
+                }
+                if v.chars().count() % 2 != 0 {
+                    return Err("Even number of characters required".to_string());
+                }
                 options.matchbrackets = v.to_string();
             }
             Ok(())
@@ -173,6 +181,22 @@ fn set_color(field: &mut options::ColorPair, arg: Option<&str>) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matchbrackets_needs_an_even_number_of_non_blank_characters() {
+        let mut o = Options::default();
+        assert_eq!(
+            apply(&mut o, "matchbrackets", Some("(<[{)>]"), true),
+            Err("Even number of characters required".to_string())
+        );
+        assert_eq!(
+            apply(&mut o, "matchbrackets", Some("( )x"), true),
+            Err("Non-blank characters required".to_string())
+        );
+        assert_eq!(o.matchbrackets, "(<[{)>]}", "left unchanged");
+        assert_eq!(apply(&mut o, "matchbrackets", Some("«»"), true), Ok(()));
+        assert_eq!(o.matchbrackets, "«»");
+    }
 
     #[test]
     fn whitespace_needs_exactly_two_single_column_characters() {

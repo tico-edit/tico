@@ -465,6 +465,14 @@ impl Buffer {
         }
     }
 
+    /// Jump the cursor to `pos`, forgetting any remembered goal column so
+    /// that a following Up/Down starts from the new column (nano resets
+    /// `placewewant` after such a jump).
+    pub fn set_cursor(&mut self, pos: Pos) {
+        self.cursor = pos;
+        self.goal_col = None;
+    }
+
     pub fn move_up(&mut self) {
         if self.cursor.line > 0 {
             let goal = self.goal_col.get_or_insert(self.cursor.col);
