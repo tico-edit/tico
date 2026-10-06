@@ -1885,6 +1885,7 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                     );
                     editor.buffers.push(buf);
                     editor.current = editor.buffers.len() - 1;
+                    editor.restore_position();
                     editor.set_status("New File");
                 } else {
                     match crate::fileio::load_file(&path, &editor.options) {
@@ -1900,6 +1901,8 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                             );
                             editor.buffers.push(buf);
                             editor.current = editor.buffers.len() - 1;
+                            // `set positionlog` (nano's insert_a_file_or).
+                            editor.restore_position();
                             editor.note_buffer_linecount();
                             // Loading into a *new* buffer this way is never
                             // an undoable insert into the current one, so

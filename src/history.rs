@@ -57,7 +57,7 @@ impl HistoryStore {
     /// `~/.local/share/nano/` if that's unset), creating it (and its
     /// parents, for the default path) with owner-only permissions if
     /// missing. Returns `None` if no home directory can be found at all.
-    fn state_dir() -> Option<PathBuf> {
+    pub(crate) fn state_dir() -> Option<PathBuf> {
         let home = dirs::home_dir()?;
 
         let legacy = home.join(".nano");

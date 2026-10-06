@@ -357,6 +357,9 @@ pub struct Editor {
     /// those prompts. Built up in-session regardless of settings; only
     /// loaded from and saved to disk when `historylog` is on.
     pub history: crate::history::HistoryStore,
+    /// `set positionlog`'s record of where each file was left; `None`
+    /// when that's off (or nano's state directory isn't usable).
+    pub positions: Option<crate::poslog::PositionLog>,
     pub mode: Mode,
     pub screen_rows: usize,
     pub screen_cols: usize,
@@ -401,6 +404,11 @@ impl Editor {
         } else {
             crate::history::HistoryStore::new()
         };
+        let positions = if options.positionlog {
+            crate::poslog::PositionLog::open()
+        } else {
+            None
+        };
         Editor {
             buffers: vec![Buffer::empty()],
             current: 0,
@@ -423,6 +431,7 @@ impl Editor {
             spotlight: None,
             spotlight_deadline: None,
             history,
+            positions,
             mode: Mode::Editing,
             screen_rows: 24,
             screen_cols: 80,
@@ -634,6 +643,53 @@ impl Editor {
             buf.cursor.line.saturating_sub(rows / 2)
         };
         self.scroll_horizontal_to_cursor();
+    }
+
+    /// `set positionlog`, on closing a named buffer: remember where its
+    /// cursor was (nano's `update_poshistory` from `close_and_go`).
+    fn record_position(&mut self) {
+        let buf = &self.buffers[self.current];
+        let Some(fullpath) = buf.path.as_deref().and_then(crate::fileio::full_path) else {
+            return;
+        };
+        let text = buf.line(buf.cursor.line);
+        let tabsize = self.options.tabsize as usize;
+        let column = crate::buffer::display_width(&text, buf.cursor.col, tabsize) + 1;
+        let line = buf.cursor.line + 1;
+        if let Some(log) = self.positions.as_mut() {
+            log.update(&fullpath.to_string_lossy(), line, column);
+        }
+    }
+
+    /// `set positionlog`, on opening a file into the current buffer: put
+    /// the cursor back where it was last left (nano's
+    /// `restore_cursor_position_if_any`), placing the viewport as for a
+    /// `+LINE` given on the command line. Returns whether it did.
+    pub fn restore_position(&mut self) -> bool {
+        let Some(fullpath) = self
+            .buf()
+            .path
+            .as_deref()
+            .and_then(crate::fileio::full_path)
+        else {
+            return false;
+        };
+        let Some((line, column)) = self
+            .positions
+            .as_mut()
+            .and_then(|log| log.lookup(&fullpath.to_string_lossy()))
+        else {
+            return false;
+        };
+        let tabsize = self.options.tabsize as usize;
+        let buf = self.buf_mut();
+        // nano's `goto_line_and_column`: clamped to the file, and the
+        // column a display column.
+        buf.cursor.line = line.max(1).min(buf.line_count()) - 1;
+        let text = buf.line(buf.cursor.line);
+        buf.cursor.col = crate::buffer::char_col_for_display(&text, column.max(1) - 1, tabsize);
+        self.place_viewport_for_cli_goto();
+        true
     }
 
     /// Keep nano's magic line (see `Buffer::lacks_magic_line`) under the
@@ -962,6 +1018,7 @@ impl Editor {
         if let Some(lock) = self.buf_mut().lock_filename.take() {
             crate::lockfile::delete_lock(&lock);
         }
+        self.record_position();
         self.buffers.remove(self.current);
         if self.buffers.is_empty() {
             self.mode = Mode::Quit;
@@ -3140,6 +3197,43 @@ mod tests {
             std::fs::read_to_string(dir.join("own.txt~")).unwrap(),
             "theirs\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn positionlog_records_on_close_and_restores_on_open() {
+        let dir = write_test_dir("positionlog");
+        let file = dir.join("f.txt");
+        let text: String = (1..=50).map(|i| format!("\tline {i}\n")).collect();
+        std::fs::write(&file, &text).unwrap();
+        let log = dir.join("filepos_history");
+
+        let mut ed = test_editor(&text);
+        ed.buf_mut().path = Some(file.clone());
+        ed.positions = crate::poslog::PositionLog::at(log.clone());
+        ed.buf_mut().cursor = Pos::new(29, 2);
+        ed.close_current_buffer();
+        let full = std::fs::canonicalize(&file).unwrap();
+        // The column is a display column: past the tab, on the 'i'.
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("{} 30 10\n", full.display())
+        );
+
+        let mut ed = test_editor(&text);
+        ed.screen_rows = 24;
+        ed.buf_mut().path = Some(file.clone());
+        ed.positions = crate::poslog::PositionLog::at(log.clone());
+        assert!(ed.restore_position());
+        assert_eq!(ed.buf().cursor, Pos::new(29, 2));
+        assert!(ed.buf().top_line > 0, "scrolled to it");
+
+        // Unnamed buffers and positionlog off: nothing happens.
+        let mut ed = test_editor("x");
+        ed.positions = crate::poslog::PositionLog::at(log.clone());
+        assert!(!ed.restore_position());
+        ed.close_current_buffer();
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

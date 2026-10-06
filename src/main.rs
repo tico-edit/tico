@@ -21,11 +21,12 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // nano: restricted mode turns off backups, since they would write to
-    // files not named on the command line; otherwise a backup directory
-    // must exist, or nano refuses to start.
+    // nano: restricted mode turns off backups and the position log, since
+    // they would write to files not named on the command line; otherwise a
+    // backup directory must exist, or nano refuses to start.
     if options.restricted {
         options.backup = false;
+        options.positionlog = false;
     } else if let Some(dir) = options.backupdir.take() {
         match fileio::resolve_backup_dir(&dir) {
             Some(full) => options.backupdir = Some(full),
@@ -116,6 +117,10 @@ fn main() -> anyhow::Result<()> {
             if fa.line.is_some() {
                 editor.current = editor.buffers.len() - 1;
                 editor.place_viewport_for_cli_goto();
+            } else if fa.path != "-" {
+                // `set positionlog`; a `+LINE` replaces it, as in nano.
+                editor.current = editor.buffers.len() - 1;
+                editor.restore_position();
             }
         }
     }
