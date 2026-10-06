@@ -1594,12 +1594,27 @@ impl Editor {
         self.set_status("Cut");
     }
 
+    /// `M-T` (and `^V` at the Execute prompt): nano's `cut_till_eof`. The
+    /// cut replaces the cutbuffer and ends any run of consecutive `^K`
+    /// cuts; it clears the status bar rather than reporting anything,
+    /// except when there's nothing to cut -- at the end of the last line,
+    /// or (without `nonewlines`) at the end of a non-empty line directly
+    /// above the magic line. Confirmed against the installed nano 8.7.1.
     fn do_cut_rest_of_file(&mut self) {
         let start = self.buf().cursor;
         let last_line = self.buf().line_count().saturating_sub(1);
+        let at_eol = start.col >= self.buf().line(start.line).chars().count();
+        if at_eol
+            && (start.line == last_line
+                || (!self.options.nonewlines && start.col > 0 && start.line + 1 == last_line))
+        {
+            self.set_status("Nothing was cut");
+            return;
+        }
         let end = Pos::new(last_line, self.buf().line(last_line).chars().count());
         self.cutbuffer = self.buf_mut().delete_range(start, end);
-        self.set_status("Cut to end of file");
+        self.cut_was_consecutive = false;
+        self.status = None;
     }
 
     fn do_copy(&mut self) {
@@ -4986,6 +5001,49 @@ mod tests {
             keystroke(&mut ed, Action::Cycle);
             assert_eq!(ed.buf().top_line, 0);
         }
+    }
+
+    #[test]
+    fn cut_till_end_matches_nanos_nothing_was_cut_cases() {
+        // Confirmed against the installed nano 8.7.1.
+        for (text, cursor, nonewlines, nothing) in [
+            // End of the last text line, magic line below: nothing.
+            ("abc\n", Pos::new(0, 3), false, true),
+            // On the magic line itself: nothing.
+            ("abc\n", Pos::new(1, 0), false, true),
+            // An empty line above the magic line: its newline is cut.
+            ("abc\n\n", Pos::new(1, 0), false, false),
+            // With nonewlines, the last line's end really is the end.
+            ("abc\ndef", Pos::new(0, 3), true, false),
+            ("abc\ndef", Pos::new(1, 3), true, true),
+        ] {
+            let mut ed = test_editor(text);
+            ed.options.nonewlines = nonewlines;
+            ed.buf_mut().cursor = cursor;
+            keystroke(&mut ed, Action::CutRestOfFile);
+            let label = format!("{text:?} at {cursor:?}");
+            if nothing {
+                assert_eq!(ed.status.as_deref(), Some("Nothing was cut"), "{label}");
+                assert!(!ed.buf().modified, "{label}");
+            } else {
+                assert_eq!(ed.status, None, "{label}");
+                assert!(ed.buf().modified, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn cut_till_end_replaces_the_cutbuffer_and_ends_a_cut_run() {
+        let mut ed = test_editor("a\nb\nc\nd\n");
+        keystroke(&mut ed, Action::Cut);
+        keystroke(&mut ed, Action::Cut);
+        assert_eq!(ed.cutbuffer, "a\nb\n");
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        keystroke(&mut ed, Action::CutRestOfFile);
+        assert_eq!(ed.cutbuffer, "d\n");
+        ed.buf_mut().cursor = Pos::new(0, 0);
+        keystroke(&mut ed, Action::Cut);
+        assert_eq!(ed.cutbuffer, "c\n", "a fresh cut, not appended");
     }
 
     #[test]
