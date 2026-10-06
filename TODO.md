@@ -12,7 +12,6 @@ here.
 
 - [ ] Block navigation: previous/next block (`^Up` / `^Down`, `M-7` / `M-8`)
 - [ ] Top/bottom row of screen (`M-Home` / `M-End`)
-- [ ] Find matching bracket (`M-]`)
 - [ ] Anchors: set, previous, next (`M-Ins` / `M-"`, `M-PgUp`, `M-PgDn` / `M-'`)
 - [ ] Macros: record and replay (`M-:` / `M-;`)
 - [ ] Pipe Text (`M-\`) at the Execute prompt
@@ -23,7 +22,6 @@ here.
 ### Display
 
 - [ ] `softwrap` — toggle flips the flag, nothing wraps
-- [ ] `matchbrackets`
 - [ ] `stateflags`
 - [ ] `bookstyle`
 - [ ] `jumpyscrolling`

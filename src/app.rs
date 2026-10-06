@@ -651,6 +651,66 @@ impl Editor {
         self.scroll_horizontal_to_cursor();
     }
 
+    /// `M-]`: nano's `do_find_bracket`. With the cursor on one of the
+    /// `matchbrackets` characters (openers in the first half, their closers
+    /// in the same order in the second), move to its partner -- forward
+    /// from an opener, backward from a closer -- skipping nested pairs of
+    /// the same kind. Other kinds of bracket, quotes and comments are not
+    /// considered, just as in nano. Confirmed against the installed nano
+    /// 8.7.1.
+    fn find_bracket(&mut self) {
+        let brackets: Vec<char> = self.options.matchbrackets.chars().collect();
+        let half = brackets.len() / 2;
+        let cursor = self.buf().cursor;
+        let here = self.buf().line(cursor.line).chars().nth(cursor.col);
+        let Some(index) = here.and_then(|c| brackets.iter().position(|&b| b == c)) else {
+            self.set_status_mild("Not a bracket");
+            return;
+        };
+        let reverse = index >= half;
+        let ch = brackets[index];
+        let wanted = if reverse {
+            brackets[index - half]
+        } else {
+            brackets[index + half]
+        };
+
+        // Scan outward from the cursor, line by line, in the search
+        // direction, keeping count of nested pairs of the same kind.
+        let mut balance = 1usize;
+        let mut line = cursor.line;
+        loop {
+            let chars: Vec<char> = self.buf().line(line).chars().collect();
+            let cols: Box<dyn Iterator<Item = usize>> = match (reverse, line == cursor.line) {
+                (false, true) => Box::new(cursor.col + 1..chars.len()),
+                (false, false) => Box::new(0..chars.len()),
+                (true, true) => Box::new((0..cursor.col).rev()),
+                (true, false) => Box::new((0..chars.len()).rev()),
+            };
+            for col in cols {
+                if chars[col] == ch {
+                    balance += 1;
+                } else if chars[col] == wanted {
+                    balance -= 1;
+                    if balance == 0 {
+                        self.buf_mut().cursor = Pos::new(line, col);
+                        return;
+                    }
+                }
+            }
+            let next = if reverse {
+                line.checked_sub(1)
+            } else {
+                Some(line + 1).filter(|&l| l < self.buf().line_count())
+            };
+            match next {
+                Some(l) => line = l,
+                None => break,
+            }
+        }
+        self.set_status_mild("No matching bracket");
+    }
+
     /// Whether `c` forms part of a word for `^]` completion: nano's
     /// `is_word_char(c, FALSE)` -- alphanumeric, or listed in `wordchars`.
     /// Unlike word movement, an underscore counts only via `wordchars`.
@@ -999,7 +1059,7 @@ impl Editor {
             PrevBlock | NextBlock | TopRow | BottomRow => {
                 self.set_status("block navigation: not yet implemented");
             }
-            FindBracket => self.set_status("find-bracket: not yet implemented"),
+            FindBracket => self.find_bracket(),
             Anchor | PrevAnchor | NextAnchor => self.set_status("anchors: not yet implemented"),
             PrevBuf => self.switch_buffer(-1),
             NextBuf => self.switch_buffer(1),
@@ -5167,6 +5227,53 @@ mod tests {
         ed.buf_mut().cursor = Pos::new(0, 0);
         keystroke(&mut ed, Action::Cut);
         assert_eq!(ed.cutbuffer, "c\n", "a fresh cut, not appended");
+    }
+
+    #[test]
+    fn find_bracket_jumps_to_the_partner_in_either_direction() {
+        // Confirmed against the installed nano 8.7.1.
+        let mut ed = test_editor("f(a[1], {b<c>})\n(\n  x)\n)\nab\n");
+        ed.buf_mut().cursor = Pos::new(0, 1);
+        keystroke(&mut ed, Action::FindBracket);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 14), "( skips the nested pairs");
+        keystroke(&mut ed, Action::FindBracket);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 1), "and ) leads back");
+        ed.buf_mut().cursor = Pos::new(0, 10);
+        keystroke(&mut ed, Action::FindBracket);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 12), "< > count as brackets");
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        keystroke(&mut ed, Action::FindBracket);
+        assert_eq!(ed.buf().cursor, Pos::new(2, 3), "across lines");
+        keystroke(&mut ed, Action::FindBracket);
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0));
+        assert_eq!(ed.status, None);
+    }
+
+    #[test]
+    fn find_bracket_reports_a_non_bracket_or_no_match() {
+        let mut ed = test_editor("f(a)\n)\nab\n");
+        ed.buf_mut().cursor = Pos::new(0, 4);
+        keystroke(&mut ed, Action::FindBracket);
+        assert_eq!(ed.status.as_deref(), Some("Not a bracket"), "end of line");
+        assert!(matches!(ed.status_level, StatusLevel::Mild));
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        keystroke(&mut ed, Action::FindBracket);
+        assert_eq!(ed.status.as_deref(), Some("No matching bracket"));
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0), "the cursor stays put");
+    }
+
+    #[test]
+    fn find_bracket_follows_matchbrackets_and_resets_the_goal_column() {
+        let mut ed = test_editor("«a»\nabcdef\n");
+        ed.options.matchbrackets = "«»".into();
+        // Up from column 5 leaves a goal column of 5 behind.
+        ed.buf_mut().cursor = Pos::new(1, 5);
+        keystroke(&mut ed, Action::Up);
+        ed.buf_mut().cursor = Pos::new(0, 0);
+        keystroke(&mut ed, Action::FindBracket);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 2));
+        keystroke(&mut ed, Action::Down);
+        assert_eq!(ed.buf().cursor, Pos::new(1, 2), "not back to column 5");
     }
 
     /// `^]` at the end of the last line of `text`.

@@ -132,8 +132,12 @@ pub struct Buffer {
     pub left_col: usize,
     pub language: Option<&'static crate::syntax::LanguageDef>,
     /// Remembered column for consecutive up/down movement through shorter
-    /// lines, reset by any horizontal movement or edit (as in nano).
-    goal_col: Option<usize>,
+    /// lines (nano's `placewewant`), together with where the cursor was
+    /// left by that movement. It only applies while the cursor is still
+    /// there: any other way of moving it -- a jump, a search, a click, an
+    /// edit -- makes the next Up/Down start from the cursor's own column,
+    /// as in nano, without every such site having to clear it.
+    goal_col: Option<(usize, Pos)>,
     /// Path of this buffer's vim-style lock file (`set locking`), if one is
     /// currently held.
     pub lock_filename: Option<PathBuf>,
@@ -465,23 +469,37 @@ impl Buffer {
         }
     }
 
+    /// The column Up/Down should aim for: the remembered one if the cursor
+    /// is still where the last vertical move left it, else its own.
+    pub fn goal_column(&self) -> usize {
+        match self.goal_col {
+            Some((goal, at)) if at == self.cursor => goal,
+            _ => self.cursor.col,
+        }
+    }
+
+    /// Put the cursor on `line` as near to column `goal` as that line
+    /// allows, and keep aiming for `goal` on following Up/Down moves --
+    /// nano's Go To Line, which sets `placewewant` to the requested column
+    /// even when the line is too short to reach it.
+    pub fn goto_line_aiming_at(&mut self, line: usize, goal: usize) {
+        self.cursor = self.clamp_pos(Pos::new(line, goal));
+        self.goal_col = Some((goal, self.cursor));
+    }
+
     pub fn move_up(&mut self) {
         if self.cursor.line > 0 {
-            let goal = self.goal_col.get_or_insert(self.cursor.col);
-            let goal = *goal;
-            self.cursor.line -= 1;
-            self.cursor = self.clamp_pos(Pos::new(self.cursor.line, goal));
-            self.goal_col = Some(goal);
+            let goal = self.goal_column();
+            self.cursor = self.clamp_pos(Pos::new(self.cursor.line - 1, goal));
+            self.goal_col = Some((goal, self.cursor));
         }
     }
 
     pub fn move_down(&mut self) {
         if self.cursor.line + 1 < self.rope.len_lines() {
-            let goal = self.goal_col.get_or_insert(self.cursor.col);
-            let goal = *goal;
-            self.cursor.line += 1;
-            self.cursor = self.clamp_pos(Pos::new(self.cursor.line, goal));
-            self.goal_col = Some(goal);
+            let goal = self.goal_column();
+            self.cursor = self.clamp_pos(Pos::new(self.cursor.line + 1, goal));
+            self.goal_col = Some((goal, self.cursor));
         }
     }
 
@@ -534,6 +552,32 @@ impl std::fmt::Display for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_jump_drops_the_remembered_column() {
+        // Confirmed against the installed nano 8.7.1: Down onto a short
+        // line, M-\ to the top, then Down twice stays in column 0.
+        let mut b = Buffer::from_text("abcdefgh\nab\nabcdefgh\nabcdefgh\n", None);
+        b.cursor = Pos::new(0, 6);
+        b.move_down();
+        assert_eq!(b.cursor, Pos::new(1, 2));
+        b.move_down();
+        assert_eq!(b.cursor, Pos::new(2, 6), "still aiming for column 6");
+        b.cursor = Pos::new(0, 0);
+        b.move_down();
+        b.move_down();
+        assert_eq!(b.cursor, Pos::new(2, 0));
+    }
+
+    #[test]
+    fn goto_line_keeps_aiming_at_its_column() {
+        let mut b = Buffer::from_text("abcdefgh\nab\nabcdefgh\n", None);
+        b.goto_line_aiming_at(1, 6);
+        assert_eq!(b.cursor, Pos::new(1, 2));
+        assert_eq!(b.goal_column(), 6);
+        b.move_down();
+        assert_eq!(b.cursor, Pos::new(2, 6));
+    }
 
     #[test]
     fn insert_and_backspace() {
