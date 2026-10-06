@@ -406,6 +406,7 @@ fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
 fn handle_mouse(editor: &mut Editor, mev: MouseEvent) {
     editor.begin_keystroke();
     editor.cycling_aim = 0;
+    editor.completion = None;
     dispatch_mouse(editor, mev);
     editor.ensure_magic_line();
     editor.end_keystroke();
@@ -839,6 +840,7 @@ fn handle_editing_key(editor: &mut Editor, key: KeyEvent) {
             editor.set_status_mild("Key is invalid in view mode");
         } else {
             editor.cycling_aim = 0;
+            editor.completion = None;
             editor.insert_char(c);
             // Plain self-insertion bypasses execute(), which is what
             // normally keeps the cursor in view (vertically and, for a
@@ -890,6 +892,8 @@ fn apply_binding(editor: &mut Editor, binding: Binding) {
         Binding::Macro(text) => {
             // Literal-string bindings; `{function}` substitution is not yet
             // implemented, so braces are inserted literally.
+            editor.cycling_aim = 0;
+            editor.completion = None;
             for c in text.chars() {
                 editor.insert_char(c);
             }

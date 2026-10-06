@@ -10,7 +10,6 @@ here.
 
 ## Bound keys that report "not yet implemented"
 
-- [ ] Word completion (`^]`)
 - [ ] Block navigation: previous/next block (`^Up` / `^Down`, `M-7` / `M-8`)
 - [ ] Top/bottom row of screen (`M-Home` / `M-End`)
 - [ ] Find matching bracket (`M-]`)
@@ -35,7 +34,8 @@ here.
 
 ### Editing
 
-- [ ] `wordchars` / `wordbounds`
+- [ ] `wordchars` / `wordbounds` (word completion honors `wordchars`;
+      word movement and deletion consult neither)
 - [ ] `zap` (the setting: Backspace/Delete erase the marked region)
 - [ ] `colonparsing`
 - [ ] `rebinddelete`
