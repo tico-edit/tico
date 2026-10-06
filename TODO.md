@@ -29,7 +29,6 @@ here.
 ### Display
 
 - [ ] `softwrap` — toggle flips the flag, nothing wraps
-- [ ] `constantshow`
 - [ ] `matchbrackets`
 - [ ] `stateflags`
 - [ ] `bookstyle`
