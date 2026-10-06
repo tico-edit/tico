@@ -39,7 +39,6 @@ here.
 
 ### Files and safety
 
-- [ ] `positionlog` (no position-log machinery exists yet)
 - [ ] `restricted` (which, among other things, should hide the file
       browser's `^T`)
 - [ ] `operatingdir` (which should also confine the file browser)

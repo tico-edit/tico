@@ -15,6 +15,7 @@ pub mod justify;
 pub mod keymap;
 pub mod lockfile;
 pub mod options;
+pub mod poslog;
 pub mod syntax;
 pub mod theme;
 pub mod ui;
