@@ -32,7 +32,6 @@ here.
 - [ ] `constantshow`
 - [ ] `matchbrackets`
 - [ ] `stateflags`
-- [ ] `boldtext`
 - [ ] `bookstyle`
 - [ ] `jumpyscrolling`
 - [ ] `emptyline`

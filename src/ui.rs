@@ -3008,7 +3008,7 @@ fn render_browser_screen(
     if let Some(matches) = &editor.file_completions {
         render_completions_grid(out, start as u16, rows, cols, matches)?;
     } else {
-        let highlight = bar_style(&editor.options.selectedcolor, BarStyle::Reverse);
+        let highlight = bar_style(&editor.options.selectedcolor, hilite(editor));
         for (r, segments) in session.list.render_rows(cols, rows).into_iter().enumerate() {
             queue!(out, MoveTo(0, (start + r) as u16))?;
             for (text, selected) in segments {
@@ -3476,15 +3476,34 @@ fn render_title_bar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::R
         }
     }
     let s: String = line.into_iter().collect();
-    let style = bar_style(&editor.options.titlecolor, BarStyle::Reverse);
-    queue_bar_segment(out, style, &s)
+    queue_bar_segment(out, title_bar_style(editor), &s)
 }
 
 /// The resolved style for the title bar, used directly by the title bar
 /// itself and as the fallback for `promptcolor`/`minicolor` when those are
 /// unset (nano: "the colors of the title bar are used").
 fn title_bar_style(editor: &Editor) -> BarStyle {
-    bar_style(&editor.options.titlecolor, BarStyle::Reverse)
+    bar_style(&editor.options.titlecolor, hilite(editor))
+}
+
+/// nano's `hilite_attribute`: what the title bar, status bar, key combos,
+/// line numbers, selection and the `<`/`>` scroll markers get when their
+/// colors aren't set -- reverse video, or bold under `set boldtext`.
+fn hilite(editor: &Editor) -> BarStyle {
+    if editor.options.boldtext {
+        BarStyle::Bold
+    } else {
+        BarStyle::Reverse
+    }
+}
+
+/// `hilite` as a `Style`, for text drawn through `print_styled`.
+fn hilite_style(editor: &Editor) -> Style {
+    let bold = editor.options.boldtext;
+    Style {
+        modifiers: crate::theme::Modifiers::any(bold, false, !bold),
+        ..Style::default()
+    }
 }
 
 fn render_status_line(
@@ -3532,7 +3551,7 @@ fn render_status_line(
         let shown_len = shown.chars().count();
         match editor.status_level {
             crate::app::StatusLevel::Normal => {
-                let style = bar_style(&editor.options.statuscolor, BarStyle::Reverse);
+                let style = bar_style(&editor.options.statuscolor, hilite(editor));
                 queue_bar_segment(out, style, &shown)?;
             }
             crate::app::StatusLevel::Mild | crate::app::StatusLevel::Alert => {
@@ -3967,7 +3986,7 @@ fn render_shortcut_bar(
     cols: usize,
     entries: &[(String, &str)],
 ) -> io::Result<()> {
-    let key_style = bar_style(&editor.options.keycolor, BarStyle::Reverse);
+    let key_style = bar_style(&editor.options.keycolor, hilite(editor));
     let desc_style = bar_style(&editor.options.functioncolor, BarStyle::Plain);
     let ShortcutBarLayout { col_width, n_pairs } = shortcut_bar_layout(cols, entries);
 
@@ -4098,7 +4117,7 @@ fn render_buffer(
             Vec::new()
         };
     let selection = editor.selection_range();
-    let number_style = numbercolor_style(&editor.options.numbercolor);
+    let number_style = numbercolor_style(&editor.options.numbercolor, hilite_style(editor));
 
     // `set indicator`: a one-column "scrollbar" on the right edge, showing
     // the viewport's position and extent within the buffer -- suppressed
@@ -4220,13 +4239,14 @@ fn render_buffer(
         if show_right {
             chars.push('>');
         }
+        // nano draws both markers in `hilite_attribute`.
         let mut windowed_styles: Vec<Option<Style>> = styles[..gutter_chars].to_vec();
         if show_left {
-            windowed_styles.push(None);
+            windowed_styles.push(Some(hilite_style(editor)));
         }
         windowed_styles.extend_from_slice(&styles[vis_start..vis_end]);
         if show_right {
-            windowed_styles.push(None);
+            windowed_styles.push(Some(hilite_style(editor)));
         }
         let mut styles = windowed_styles;
         let marker_shift = gutter_chars + if show_left { 1 } else { 0 };
@@ -4263,7 +4283,7 @@ fn render_buffer(
             .filter(|(s, e)| s < e);
 
         let (spot_fg, spot_bg) = spotlight_colors(&editor.options.spotlightcolor);
-        let selection_style = selection_render_style(&editor.options.selectedcolor);
+        let selection_style = selection_render_style(&editor.options.selectedcolor, editor);
         let mut i = 0;
         while i < len {
             let in_spot = spot.is_some_and(|(s, e)| i >= s && i < e);
@@ -4303,10 +4323,10 @@ fn render_buffer(
                 )?;
             } else if in_sel {
                 match selection_style {
-                    SelectionStyle::Reverse => {
+                    SelectionStyle::Hilite(attribute) => {
                         queue!(
                             out,
-                            SetAttribute(Attribute::Reverse),
+                            SetAttribute(attribute),
                             Print(segment),
                             SetAttribute(Attribute::Reset)
                         )?;
@@ -4353,11 +4373,17 @@ fn render_buffer(
 /// `A_REVERSE` when unconfigured, unlike `scrollercolor`/`functioncolor`'s
 /// `A_NORMAL` default.
 fn reverse_default_style(cp: &crate::options::ColorPair) -> Style {
+    let reverse = Style {
+        modifiers: crate::theme::Modifiers::any(false, false, true),
+        ..Style::default()
+    };
+    colored_or(cp, reverse)
+}
+
+/// `cp`'s own colors when configured, else `default`.
+fn colored_or(cp: &crate::options::ColorPair, default: Style) -> Style {
     if cp.fg.is_none() && cp.bg.is_none() {
-        Style {
-            modifiers: crate::theme::Modifiers::any(false, false, true),
-            ..Style::default()
-        }
+        default
     } else {
         Style {
             fg: cp.fg.map(map_named_color),
@@ -4368,8 +4394,10 @@ fn reverse_default_style(cp: &crate::options::ColorPair) -> Style {
     }
 }
 
-fn numbercolor_style(cp: &crate::options::ColorPair) -> Style {
-    reverse_default_style(cp)
+/// `numbercolor`'s resolved style: `hilite` (nano's `hilite_attribute`,
+/// so bold under `set boldtext`) unless configured.
+fn numbercolor_style(cp: &crate::options::ColorPair, hilite: Style) -> Style {
+    colored_or(cp, hilite)
 }
 
 /// `stripecolor`'s resolved style for `set guidestripe`'s vertical guide.
@@ -4453,6 +4481,8 @@ fn spotlight_colors(cp: &crate::options::ColorPair) -> (Color, Color) {
 #[derive(Clone, Copy)]
 enum BarStyle {
     Reverse,
+    /// `set boldtext`'s stand-in for `Reverse` (see `hilite`).
+    Bold,
     Plain,
     Colored {
         fg: Color,
@@ -4490,6 +4520,12 @@ fn queue_bar_segment(out: &mut impl Write, style: BarStyle, text: &str) -> io::R
             Print(text),
             SetAttribute(Attribute::Reset)
         ),
+        BarStyle::Bold => queue!(
+            out,
+            SetAttribute(Attribute::Bold),
+            Print(text),
+            SetAttribute(Attribute::Reset)
+        ),
         BarStyle::Colored {
             fg,
             bg,
@@ -4511,16 +4547,20 @@ fn queue_bar_segment(out: &mut impl Write, style: BarStyle, text: &str) -> io::R
 /// How to paint the marked selection (`buf.mark`).
 #[derive(Clone, Copy)]
 enum SelectionStyle {
-    /// nano's own default (`hilite_attribute`, `A_REVERSE`): plain reverse
-    /// video, used whenever `selectedcolor` hasn't been configured.
-    Reverse,
+    /// nano's own default (`hilite_attribute`): plain reverse video, or
+    /// bold under `set boldtext`, whenever `selectedcolor` isn't configured.
+    Hilite(Attribute),
     /// An explicit `set selectedcolor` — a real color pair, like spotlight.
     Colored(Color, Color),
 }
 
-fn selection_render_style(cp: &crate::options::ColorPair) -> SelectionStyle {
+fn selection_render_style(cp: &crate::options::ColorPair, editor: &Editor) -> SelectionStyle {
     if cp.fg.is_none() && cp.bg.is_none() {
-        return SelectionStyle::Reverse;
+        return SelectionStyle::Hilite(if editor.options.boldtext {
+            Attribute::Bold
+        } else {
+            Attribute::Reverse
+        });
     }
     let fg = cp.fg.map(map_named_color).unwrap_or(Color::Reset);
     let bg = cp.bg.map(map_named_color).unwrap_or(Color::Reset);
@@ -6055,16 +6095,22 @@ mod tests {
     #[test]
     fn numbercolor_defaults_to_reverse_video() {
         let unset = crate::options::ColorPair::default();
-        let style = numbercolor_style(&unset);
+        let mut ed = test_editor("x");
+        let style = numbercolor_style(&unset, hilite_style(&ed));
         assert_eq!(style.fg, None);
         assert_eq!(style.bg, None);
         assert!(style.modifiers.contains(crate::theme::Modifiers::REVERSED));
+
+        ed.options.boldtext = true;
+        let style = numbercolor_style(&unset, hilite_style(&ed));
+        assert!(style.modifiers.contains(crate::theme::Modifiers::BOLD));
+        assert!(!style.modifiers.contains(crate::theme::Modifiers::REVERSED));
     }
 
     #[test]
     fn numbercolor_configured_uses_its_own_colors_not_reverse() {
         let cp = crate::options::parse_color_pair("italic,cyan").unwrap();
-        let style = numbercolor_style(&cp);
+        let style = numbercolor_style(&cp, hilite_style(&test_editor("x")));
         assert_eq!(style.fg, Some(Color::DarkCyan));
         assert_eq!(style.bg, None);
         assert!(style.modifiers.contains(crate::theme::Modifiers::ITALIC));
@@ -6201,6 +6247,44 @@ mod tests {
             text.contains("\x1b[7mx\x1b[0m"),
             "expected a lone reverse-video 'x' at the stripe column: {text:?}"
         );
+    }
+
+    #[test]
+    fn scroll_markers_and_selection_use_hilite() {
+        // Confirmed against the installed nano: the `>` of an overlong
+        // line and the selection are reverse video, or bold under
+        // `set boldtext`.
+        let long = "a".repeat(100);
+        let mut ed = test_editor(&format!("{long}\nshort\n"));
+        ed.screen_cols = 40;
+        ed.buf_mut().mark = Some(crate::buffer::Pos::new(1, 0));
+        ed.buf_mut().cursor = crate::buffer::Pos::new(1, 5);
+        let render = |ed: &Editor| {
+            let mut out = Vec::new();
+            render_buffer(ed, &mut out, 0, 2).unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let text = render(&ed);
+        assert!(text.contains("\x1b[7m>\x1b[0m"), "{text:?}");
+        assert!(text.contains("\x1b[7mshort\x1b[0m"), "{text:?}");
+        ed.options.boldtext = true;
+        let text = render(&ed);
+        assert!(text.contains("\x1b[1m>\x1b[0m"), "{text:?}");
+        assert!(text.contains("\x1b[1mshort\x1b[0m"), "{text:?}");
+        assert!(!text.contains("\x1b[7m"), "{text:?}");
+    }
+
+    #[test]
+    fn boldtext_makes_the_unset_bars_bold_but_not_explicit_colors() {
+        let mut ed = test_editor("");
+        ed.options.boldtext = true;
+        assert!(matches!(title_bar_style(&ed), BarStyle::Bold));
+        assert!(matches!(
+            bar_style(&ed.options.promptcolor, title_bar_style(&ed)),
+            BarStyle::Bold
+        ));
+        ed.options.titlecolor = crate::options::parse_color_pair("green,blue").unwrap();
+        assert!(matches!(title_bar_style(&ed), BarStyle::Colored { .. }));
     }
 
     #[test]
