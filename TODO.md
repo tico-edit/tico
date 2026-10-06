@@ -14,7 +14,6 @@ here.
 - [ ] Top/bottom row of screen (`M-Home` / `M-End`)
 - [ ] Anchors: set, previous, next (`M-Ins` / `M-"`, `M-PgUp`, `M-PgDn` / `M-'`)
 - [ ] Macros: record and replay (`M-:` / `M-;`)
-- [ ] Pipe Text (`M-\`) at the Execute prompt
 - [ ] Verbatim input (`M-V`)
 
 ## Options parsed but never consulted
