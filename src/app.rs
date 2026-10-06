@@ -259,6 +259,17 @@ pub enum StatusLevel {
     Alert,
 }
 
+/// Where a `^]` word-completion run has got to: the buffer and position
+/// to resume searching from, and the words already offered (nano's
+/// `scouring`, `pletion_line`/`pletion_x` and `list_of_completions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    buffer: usize,
+    line: usize,
+    col: usize,
+    tried: Vec<String>,
+}
+
 /// `set minibar`'s "(N lines[, DOS/Mac])" note text for a buffer with
 /// `count` lines in the given format -- shared by `Editor::note_buffer_linecount`
 /// and the startup file-loading path in `main.rs`, which needs it before the
@@ -308,6 +319,10 @@ pub struct Editor {
     /// line -- 0 the center, 1 the top row, 2 the bottom row. Reset to 0
     /// by any keystroke other than Cycle itself.
     pub cycling_aim: u8,
+    /// An ongoing `^]` word-completion run (nano's `pletion_line` and
+    /// friends); `None` when the next `^]` starts afresh. Any keystroke
+    /// other than Complete ends the run.
+    pub completion: Option<Completion>,
     /// Set by `^L` Center / `M-%` Cycle / Refresh to ask the UI for a full
     /// terminal repaint (nano's `full_refresh()`, i.e. `wrefresh(curscr)`),
     /// which also repairs a screen garbled by some other program.
@@ -427,6 +442,7 @@ impl Editor {
             cutbuffer: String::new(),
             cut_was_consecutive: false,
             cycling_aim: 0,
+            completion: None,
             full_refresh_pending: false,
             also_the_last: false,
             shift_held: false,
@@ -635,6 +651,110 @@ impl Editor {
         self.scroll_horizontal_to_cursor();
     }
 
+    /// Whether `c` forms part of a word for `^]` completion: nano's
+    /// `is_word_char(c, FALSE)` -- alphanumeric, or listed in `wordchars`.
+    /// Unlike word movement, an underscore counts only via `wordchars`.
+    fn is_completion_word_char(&self, c: char) -> bool {
+        c.is_alphanumeric()
+            || self
+                .options
+                .wordchars
+                .as_deref()
+                .is_some_and(|w| w.contains(c))
+    }
+
+    /// `^]` Complete: nano's `complete_a_word`. Takes the word fragment
+    /// left of the cursor and inserts the rest of the first longer word
+    /// starting with it, searching the current buffer from the top and
+    /// then the other open buffers in order. Pressing `^]` again undoes
+    /// that attempt and tries the next distinct candidate; once they're
+    /// exhausted the bare fragment is left, with "No further matches",
+    /// and the next `^]` starts over. Confirmed against the installed
+    /// nano 8.7.1, multiple buffers included.
+    fn complete_a_word(&mut self) {
+        let mut run = match self.completion.take() {
+            Some(run) => {
+                // Remove the attempted completion from the buffer.
+                self.buf_mut().undo();
+                run
+            }
+            None => {
+                self.status = None;
+                Completion {
+                    buffer: self.current,
+                    line: 0,
+                    col: 0,
+                    tried: Vec::new(),
+                }
+            }
+        };
+
+        let cursor = self.buf().cursor;
+        let current_line: Vec<char> = self.buf().line(cursor.line).chars().collect();
+        let mut start = cursor.col.min(current_line.len());
+        while start > 0 && self.is_completion_word_char(current_line[start - 1]) {
+            start -= 1;
+        }
+        if start == cursor.col {
+            self.set_status_mild("No word fragment");
+            return;
+        }
+        let shard = &current_line[start..cursor.col];
+
+        loop {
+            let buf = &self.buffers[run.buffer];
+            if run.line >= buf.line_count() {
+                // At the end of this buffer: go on to the next one, unless
+                // that would bring the search back around to where it began.
+                let next = (run.buffer + 1) % self.buffers.len();
+                if next == self.current {
+                    break;
+                }
+                run.buffer = next;
+                run.line = 0;
+                run.col = 0;
+                continue;
+            }
+            let text: Vec<char> = buf.line(run.line).chars().collect();
+            let in_current_line = run.buffer == self.current && run.line == cursor.line;
+            let mut i = run.col;
+            while i + shard.len() < text.len() {
+                let at = i;
+                i += 1;
+                if text[at..at + shard.len()] != *shard
+                    // Not longer than the fragment, or not a separate word.
+                    || !self.is_completion_word_char(text[at + shard.len()])
+                    || (at > 0 && self.is_completion_word_char(text[at - 1]))
+                    // The fragment itself.
+                    || (in_current_line && at == start)
+                {
+                    continue;
+                }
+                let end = (at..text.len())
+                    .find(|&k| !self.is_completion_word_char(text[k]))
+                    .unwrap_or(text.len());
+                let word: String = text[at..end].iter().collect();
+                if run.tried.contains(&word) {
+                    continue;
+                }
+                let rest: String = text[at + shard.len()..end].iter().collect();
+                run.tried.push(word);
+                run.col = i;
+                self.buf_mut().insert_str(&rest);
+                self.completion = Some(run);
+                return;
+            }
+            run.line += 1;
+            run.col = 0;
+        }
+
+        if run.tried.is_empty() {
+            self.set_status_mild("No matches");
+        } else {
+            self.set_status_mild("No further matches");
+        }
+    }
+
     /// `M-%` Cycle: nano's `do_cycle`, which puts the cursor line on the
     /// center row, then the top row, then the bottom row on successive
     /// presses (as near as the start of the buffer allows), starting over
@@ -781,6 +901,9 @@ impl Editor {
         if action != Cycle {
             self.cycling_aim = 0;
         }
+        if action != Complete {
+            self.completion = None;
+        }
         let was_line = self.buffers.get(self.current).map(|b| b.cursor.line);
         match action {
             Help => {
@@ -858,7 +981,7 @@ impl Editor {
             Zap => self.do_zap(),
             ChopWordLeft => self.chop_word_left(),
             ChopWordRight => self.chop_word_right(),
-            Complete => self.set_status("complete: not yet implemented"),
+            Complete => self.complete_a_word(),
             Justify => self.run_justify(false),
             FullJustify => self.run_justify(true),
             Indent => self.do_indent(),
@@ -5044,6 +5167,86 @@ mod tests {
         ed.buf_mut().cursor = Pos::new(0, 0);
         keystroke(&mut ed, Action::Cut);
         assert_eq!(ed.cutbuffer, "c\n", "a fresh cut, not appended");
+    }
+
+    /// `^]` at the end of the last line of `text`.
+    fn complete_at_end(text: &str) -> Editor {
+        let mut ed = test_editor(text);
+        let last = ed.buf().line_count() - 1;
+        let len = ed.buf().line(last).chars().count();
+        ed.buf_mut().cursor = Pos::new(last, len);
+        ed
+    }
+
+    fn last_line(ed: &Editor) -> String {
+        ed.buf().line(ed.buf().line_count() - 1)
+    }
+
+    #[test]
+    fn complete_cycles_through_distinct_whole_word_candidates() {
+        // Confirmed against the installed nano 8.7.1.
+        let mut ed = complete_at_end("print println sprintf printf print\nprinter\npr");
+        for want in ["print", "println", "printf", "printer"] {
+            keystroke(&mut ed, Action::Complete);
+            assert_eq!(last_line(&ed), want);
+            assert_eq!(ed.status, None);
+        }
+        keystroke(&mut ed, Action::Complete);
+        assert_eq!(last_line(&ed), "pr", "the last attempt is taken back");
+        assert_eq!(ed.status.as_deref(), Some("No further matches"));
+        assert!(matches!(ed.status_level, StatusLevel::Mild));
+        assert!(!ed.buf().modified);
+        keystroke(&mut ed, Action::Complete);
+        assert_eq!(last_line(&ed), "print", "then it starts over");
+    }
+
+    #[test]
+    fn complete_attempt_is_kept_by_any_other_key() {
+        let mut ed = complete_at_end("println printf\npr");
+        keystroke(&mut ed, Action::Complete);
+        keystroke(&mut ed, Action::Left);
+        keystroke(&mut ed, Action::Right);
+        keystroke(&mut ed, Action::Complete);
+        assert_eq!(last_line(&ed), "println", "a fresh run, nothing longer");
+        assert_eq!(ed.status.as_deref(), Some("No matches"));
+        keystroke(&mut ed, Action::Undo);
+        assert_eq!(last_line(&ed), "pr", "one undo step per completion");
+    }
+
+    #[test]
+    fn complete_reports_a_missing_fragment_or_no_matches() {
+        let mut ed = complete_at_end("abc\nx ");
+        keystroke(&mut ed, Action::Complete);
+        assert_eq!(ed.status.as_deref(), Some("No word fragment"));
+        let mut ed = complete_at_end("abc\nx");
+        keystroke(&mut ed, Action::Complete);
+        assert_eq!(ed.status.as_deref(), Some("No matches"));
+        assert_eq!(last_line(&ed), "x");
+    }
+
+    #[test]
+    fn complete_counts_underscore_only_via_wordchars() {
+        let mut ed = complete_at_end("foo_bar\nfoo");
+        keystroke(&mut ed, Action::Complete);
+        assert_eq!(ed.status.as_deref(), Some("No matches"));
+        let mut ed = complete_at_end("foo_bar\nfoo");
+        ed.options.wordchars = Some("_".into());
+        keystroke(&mut ed, Action::Complete);
+        assert_eq!(last_line(&ed), "foo_bar");
+    }
+
+    #[test]
+    fn complete_searches_the_other_buffers_after_the_current_one() {
+        let mut ed = complete_at_end("prawn\npr");
+        ed.buffers.insert(0, Buffer::from_text("prism\n", None));
+        ed.buffers.push(Buffer::from_text("prize\n", None));
+        ed.current = 1;
+        for want in ["prawn", "prize", "prism"] {
+            keystroke(&mut ed, Action::Complete);
+            assert_eq!(last_line(&ed), want);
+        }
+        keystroke(&mut ed, Action::Complete);
+        assert_eq!(ed.status.as_deref(), Some("No further matches"));
     }
 
     #[test]
