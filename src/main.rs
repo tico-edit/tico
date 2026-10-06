@@ -1,5 +1,7 @@
 use clap::Parser;
-use tico::{app, buffer, cli, config, fileio, keymap, lockfile, options, syntax, theme, ui};
+use tico::{
+    app, browser, buffer, cli, config, fileio, keymap, lockfile, options, syntax, theme, ui,
+};
 
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -21,17 +23,45 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // nano: restricted mode turns off backups and the position log, since
-    // they would write to files not named on the command line; otherwise a
-    // backup directory must exist, or nano refuses to start.
+    // Like nano (rnano), a name starting with 'r' means restricted mode.
+    if std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            std::path::Path::new(&arg0)
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with('r'))
+        })
+        .unwrap_or(false)
+    {
+        options.restricted = true;
+    }
+
+    // nano: restricted mode turns off backups and both history files,
+    // since they would write to files not named on the command line, and
+    // takes an operating directory only from the command line; otherwise
+    // a backup directory must exist, or nano refuses to start.
     if options.restricted {
         options.backup = false;
+        options.historylog = false;
         options.positionlog = false;
+        options.operatingdir = cli.operatingdir.clone();
     } else if let Some(dir) = options.backupdir.take() {
-        match fileio::resolve_backup_dir(&dir) {
+        match fileio::resolve_directory(&dir) {
             Some(full) => options.backupdir = Some(full),
             None => {
                 eprintln!("Invalid backup directory: {dir}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // nano's `init_operating_dir`: everything happens from inside it.
+    if let Some(dir) = options.operatingdir.take() {
+        match fileio::resolve_directory(&dir) {
+            Some(full) if std::env::set_current_dir(&full).is_ok() => {
+                options.operatingdir = Some(full);
+            }
+            _ => {
+                eprintln!("Invalid operating directory: {dir}");
                 std::process::exit(1);
             }
         }
@@ -64,6 +94,19 @@ fn main() -> anyhow::Result<()> {
         for (i, fa) in file_args.iter().enumerate() {
             // A bare `-` reads standard input into an unnamed buffer,
             // matching nano: `echo foo | nano -`.
+            // `set operatingdir`: a file outside it isn't opened at all.
+            let opdir = editor.options.operatingdir.clone();
+            if fa.path != "-"
+                && fileio::outside_of_confinement(
+                    opdir.as_deref(),
+                    std::path::Path::new(&fa.path),
+                    false,
+                )
+            {
+                let opdir = opdir.unwrap_or_default();
+                editor.set_status_alert(format!("Can't read file from outside of {opdir}"));
+                continue;
+            }
             let (mut buf, message, level) = if fa.path == "-" {
                 open_stdin(&editor.options, syntax_override.as_deref())
             } else {
@@ -123,6 +166,11 @@ fn main() -> anyhow::Result<()> {
                 editor.restore_position();
             }
         }
+    }
+    if editor.buffers.is_empty() {
+        let mut buf = buffer::Buffer::empty();
+        buf.language = syntax::detect_with_override(None, "", syntax_override.as_deref());
+        editor.buffers.push(buf);
     }
     editor.current = 0;
 
@@ -389,7 +437,11 @@ fn open_one_inner(
         }
         Err(e) => (
             buffer::Buffer::from_text("", Some(path.to_path_buf())),
-            format!("Error reading {}: {e}", path.display()),
+            format!(
+                "Error reading {}: {}",
+                path.display(),
+                browser::strerror(&e)
+            ),
             app::StatusLevel::Alert,
         ),
     }

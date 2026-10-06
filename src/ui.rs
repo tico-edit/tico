@@ -484,7 +484,7 @@ fn handle_main_screen_click(editor: &mut Editor, row: usize, col: usize) {
         } else {
             None
         };
-        let entries = shortcut_bar_entries(&editor.keymap, prompt);
+        let entries = shortcut_bar_entries(&editor.keymap, prompt, editor.options.restricted);
         activate_shortcut_click(editor, &entries, row_in_bar, col);
     }
     // A click on the title row or the status/prompt row itself is a
@@ -869,6 +869,9 @@ fn apply_binding(editor: &mut Editor, binding: Binding) {
         Binding::Action(Action::Formatter) if editor.blocked_in_view_mode(Action::Formatter) => {
             editor.set_status_mild("Key is invalid in view mode");
         }
+        Binding::Action(
+            action @ (Action::Speller | Action::Formatter | Action::Linter | Action::Suspend),
+        ) if editor.refused_in_restricted_mode(action) => {}
         Binding::Action(Action::Speller) => run_speller(editor),
         Binding::Action(Action::Formatter) => run_formatter(editor),
         Binding::Action(Action::Linter) => run_linter(editor),
@@ -942,6 +945,10 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
                 apply_prompt_action(editor, &mut prompt, Action::Help);
                 return;
             }
+            if write_name_locked(editor, &prompt) {
+                editor.mode = Mode::Prompt(prompt);
+                return;
+            }
             if prompt.cursor > 0 {
                 let idx = prompt
                     .input
@@ -966,8 +973,10 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
                 PromptKind::GotoDir => editor.browser.as_ref().map(|b| b.list.dir.clone()),
                 _ => None,
             };
-            let completes = matches!(prompt.kind, PromptKind::InsertFile { execute: false, .. })
-                || gotodir_base.is_some();
+            // Never in restricted mode, as in nano.
+            let completes = (matches!(prompt.kind, PromptKind::InsertFile { execute: false, .. })
+                || gotodir_base.is_some())
+                && !editor.options.restricted;
             if completes {
                 apply_filename_completion(editor, &mut prompt, gotodir_base.as_deref());
                 editor.mode = Mode::Prompt(prompt);
@@ -1002,6 +1011,7 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
         && !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && !write_name_locked(editor, &prompt)
     {
         let idx = prompt
             .input
@@ -1017,6 +1027,15 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
     editor.mode = Mode::Prompt(prompt);
 }
 
+/// Restricted mode at the Write Out prompt for a buffer that has a name:
+/// nano accepts no typing or deleting there, so it can only be saved
+/// under its own name.
+fn write_name_locked(editor: &Editor, prompt: &Prompt) -> bool {
+    editor.options.restricted
+        && matches!(prompt.kind, PromptKind::WriteOut { .. })
+        && editor.buf().path.is_some()
+}
+
 /// Apply an Action bound within a prompt menu, which generally means
 /// something different from its effect while editing the buffer directly.
 /// Returns true if the prompt was closed (editor.mode has already been
@@ -1027,12 +1046,23 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
 /// here; anything else recognized by the keymap but not listed below is
 /// ignored rather than silently doing the wrong thing.
 fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action) -> bool {
+    // Restricted mode leaves these keys unbound at the prompts (nano
+    // doesn't even register them), so they only beep.
+    if editor.options.restricted && crate::keymap::hidden_when_restricted(prompt.menu, action) {
+        editor.bell_pending = true;
+        return false;
+    }
     match action {
         // `^G` opens the help screen for whichever prompt is currently up
         // (Search and Replace get their own text — see help.rs); closing
         // it (via handle_help_key) returns here to the same prompt.
         Action::Help => {
-            let lines = crate::help::build(prompt.menu, &editor.keymap, editor.screen_cols);
+            let lines = crate::help::build(
+                prompt.menu,
+                &editor.keymap,
+                editor.screen_cols,
+                editor.options.restricted,
+            );
             editor.mode = Mode::Help {
                 lines,
                 top: 0,
@@ -1140,8 +1170,12 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
                 return false;
             };
             *new_buffer = !*new_buffer;
-            prompt.label =
-                crate::app::insert_prompt_label(*new_buffer, *execute, editor.options.noconvert);
+            prompt.label = crate::app::insert_prompt_label(
+                *new_buffer,
+                *execute,
+                editor.options.noconvert,
+                editor.read_from(),
+            );
             false
         }
         // `^X` flips the Insert-File/Execute-Command prompt between its two
@@ -1162,8 +1196,12 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             } else {
                 Menu::Insert
             };
-            prompt.label =
-                crate::app::insert_prompt_label(*new_buffer, *execute, editor.options.noconvert);
+            prompt.label = crate::app::insert_prompt_label(
+                *new_buffer,
+                *execute,
+                editor.options.noconvert,
+                editor.read_from(),
+            );
             false
         }
         // `M-N` No Conversion: nano's `flip_convert` toggles the *global*
@@ -1178,8 +1216,12 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
                 return false;
             };
             editor.options.noconvert = !editor.options.noconvert;
-            prompt.label =
-                crate::app::insert_prompt_label(*new_buffer, *execute, editor.options.noconvert);
+            prompt.label = crate::app::insert_prompt_label(
+                *new_buffer,
+                *execute,
+                editor.options.noconvert,
+                editor.read_from(),
+            );
             false
         }
         // `M-D` DOS Format / `M-M` Mac Format at the Write Out prompt:
@@ -1293,7 +1335,7 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             editor.mode = Mode::Editing;
             if editor.blocked_in_view_mode(Action::Speller) {
                 editor.set_status_mild("Key is invalid in view mode");
-            } else {
+            } else if !editor.refused_in_restricted_mode(action) {
                 run_speller(editor);
             }
             true
@@ -1302,14 +1344,16 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             editor.mode = Mode::Editing;
             if editor.blocked_in_view_mode(Action::Formatter) {
                 editor.set_status_mild("Key is invalid in view mode");
-            } else {
+            } else if !editor.refused_in_restricted_mode(action) {
                 run_formatter(editor);
             }
             true
         }
         Action::Linter => {
             editor.mode = Mode::Editing;
-            run_linter(editor);
+            if !editor.refused_in_restricted_mode(action) {
+                run_linter(editor);
+            }
             true
         }
         // Bound (matching nano's full MEXECUTE menu, so the shortcut bar
@@ -1390,6 +1434,11 @@ fn apply_filename_completion(
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| name.starts_with(&fragment))
         .filter(|name| browsed.is_none() || dir_path.join(name).is_dir())
+        // `set operatingdir`: only what's inside (or on the way there).
+        .filter(|name| {
+            let opdir = editor.options.operatingdir.as_deref();
+            !crate::fileio::outside_of_confinement(opdir, &dir_path.join(name), true)
+        })
         .collect();
     if matches.is_empty() {
         return;
@@ -1421,7 +1470,20 @@ fn apply_filename_completion(
 /// real path to check `is_dir` against), so finishing into that user's
 /// home directory still takes one more keystroke plus a further Tab.
 fn apply_username_completion(editor: &mut Editor, prompt: &mut Prompt, morsel: &str) {
-    let matches = username_completion_matches(&crate::fileio::list_usernames(), &morsel[1..]);
+    let opdir = editor.options.operatingdir.clone();
+    let matches: Vec<String> =
+        username_completion_matches(&crate::fileio::list_usernames(), &morsel[1..])
+            .into_iter()
+            // `set operatingdir`: skip users whose home lies outside it.
+            .filter(|tilde_name| {
+                let home = crate::fileio::expand_leading_tilde(tilde_name);
+                !crate::fileio::outside_of_confinement(
+                    opdir.as_deref(),
+                    std::path::Path::new(&home),
+                    true,
+                )
+            })
+            .collect();
     if matches.is_empty() {
         return;
     }
@@ -1864,6 +1926,13 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
             // `~user`/`~user/rest` to that user's (matching nano exactly —
             // see expand_leading_tilde).
             let path = std::path::PathBuf::from(crate::fileio::expand_leading_tilde(&text));
+            // nano's `open_buffer`: `set operatingdir` comes first.
+            let opdir = editor.options.operatingdir.clone();
+            if crate::fileio::outside_of_confinement(opdir.as_deref(), &path, false) {
+                let opdir = opdir.unwrap_or_default();
+                editor.set_status_alert(format!("Can't read file from outside of {opdir}"));
+                return;
+            }
             if path.is_dir() {
                 editor.set_status_alert(format!("'{}' is a directory", path.display()));
                 return;
@@ -1914,8 +1983,11 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                                 editor.set_status(msg);
                             }
                         }
-                        Err(e) => editor
-                            .set_status_alert(format!("Error reading {}: {e}", path.display())),
+                        Err(e) => editor.set_status_alert(format!(
+                            "Error reading {}: {}",
+                            path.display(),
+                            crate::browser::strerror(&e)
+                        )),
                     }
                 }
             } else {
@@ -1930,9 +2002,11 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                         editor.set_status(msg);
                         editor.note_buffer_linecount();
                     }
-                    Err(e) => {
-                        editor.set_status_alert(format!("Error reading {}: {e}", path.display()))
-                    }
+                    Err(e) => editor.set_status_alert(format!(
+                        "Error reading {}: {}",
+                        path.display(),
+                        crate::browser::strerror(&e)
+                    )),
                 }
             }
         }
@@ -1967,6 +2041,12 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                 return;
             };
             let target = crate::browser::goto_dir_target(&session.list.dir, &text);
+            if refused_outside_operating_dir(editor, &target) {
+                return;
+            }
+            let Some(session) = editor.browser.as_mut() else {
+                return;
+            };
             // Highlighted if listed, in case it then can't be entered.
             session.list.select_if_listed(&target);
             browser_enter_dir(editor, &target, None);
@@ -2667,13 +2747,19 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
 /// prompt then simply stays up, as it does in nano.
 fn open_browser(editor: &mut Editor, prompt: &Prompt) -> bool {
     use crate::browser::{Browser, full_dir_path, start_dir, strerror};
-    let start = match start_dir(&prompt.input) {
+    let mut start = match start_dir(&prompt.input) {
         Ok(dir) => dir,
         Err(msg) => {
             editor.brief_warnings.push(msg);
             return false;
         }
     };
+    // `set operatingdir`: start there instead of anywhere outside it.
+    if let Some(opdir) = editor.options.operatingdir.as_deref()
+        && crate::fileio::outside_of_confinement(Some(opdir), &start, false)
+    {
+        start = PathBuf::from(opdir);
+    }
     match full_dir_path(&start).and_then(|dir| Browser::read(&dir)) {
         Ok(list) => {
             editor.browser = Some(crate::app::BrowserSession {
@@ -2692,6 +2778,18 @@ fn open_browser(editor: &mut Editor, prompt: &Prompt) -> bool {
             false
         }
     }
+}
+
+/// `set operatingdir` in the browser: going to `path` would leave the
+/// operating directory, so say "Can't go outside of DIR" and stay put.
+fn refused_outside_operating_dir(editor: &mut Editor, path: &std::path::Path) -> bool {
+    let opdir = editor.options.operatingdir.clone();
+    if !crate::fileio::outside_of_confinement(opdir.as_deref(), path, false) {
+        return false;
+    }
+    let opdir = opdir.unwrap_or_default();
+    editor.set_status_alert(format!("Can't go outside of {opdir}"));
+    true
 }
 
 /// Leave the browser without choosing anything: back to the prompt it
@@ -2828,7 +2926,12 @@ fn apply_browser_action(editor: &mut Editor, action: Action) {
     }
     match action {
         Action::Help => {
-            let lines = crate::help::build(Menu::Browser, &editor.keymap, editor.screen_cols);
+            let lines = crate::help::build(
+                Menu::Browser,
+                &editor.keymap,
+                editor.screen_cols,
+                editor.options.restricted,
+            );
             editor.mode = Mode::Help {
                 lines,
                 top: 0,
@@ -2896,6 +2999,10 @@ fn browser_choose(editor: &mut Editor) {
     let going_up = entry.name == "..";
     if going_up && dir.parent().is_none() {
         editor.set_status_alert("Can't move up a directory");
+        return;
+    }
+    // Even inside, ".." or a symlink can lead out.
+    if refused_outside_operating_dir(editor, &entry.path) {
         return;
     }
     let meta = match std::fs::metadata(&entry.path) {
@@ -3005,7 +3112,7 @@ fn handle_browser_click(editor: &mut Editor, row: usize, col: usize) {
 /// The shortcut bar under the browser: its own, or its current prompt's.
 fn browser_bar_entries(editor: &Editor) -> Vec<(String, &'static str)> {
     match &editor.mode {
-        Mode::Prompt(p) => shortcut_bar_entries(&editor.keymap, Some(p)),
+        Mode::Prompt(p) => shortcut_bar_entries(&editor.keymap, Some(p), editor.options.restricted),
         _ => {
             // Only as many as nano's `shown_entries_for` would show, so the
             // longer entries further down don't widen every column.
@@ -3160,7 +3267,7 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
         let entries = if blank_bars {
             Vec::new()
         } else {
-            shortcut_bar_entries(&editor.keymap, prompt)
+            shortcut_bar_entries(&editor.keymap, prompt, editor.options.restricted)
         };
         render_shortcut_bar(editor, &mut out, status_row + 1, cols, &entries)?;
     }
@@ -3444,6 +3551,10 @@ fn render_title_bar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::R
     let mut indicator = String::new();
     if editor.options.view {
         indicator.push_str("View");
+    } else if editor.options.restricted && !editor.buf().modified {
+        // nano's state word: "Restricted" until a modification takes over
+        // (tico marks that with the `*` after the name instead).
+        indicator.push_str("Restricted");
     }
     if editor.buffers.len() > 1 {
         if !indicator.is_empty() {
@@ -3794,6 +3905,30 @@ const SHORTCUT_PRIORITY: &[(Action, &str)] = &[
     (Action::FindNext, "Next"),
 ];
 
+/// The main menu's list in restricted mode (nano's `shortcut_init` under
+/// RESTRICTED): Justify takes Read File's place, and Execute and the
+/// second Justify drop out.
+const SHORTCUT_PRIORITY_RESTRICTED: &[(Action, &str)] = &[
+    (Action::Help, "Help"),
+    (Action::Exit, "Exit"),
+    (Action::WriteOut, "Write Out"),
+    (Action::Justify, "Justify"),
+    (Action::WhereIs, "Where Is"),
+    (Action::Replace, "Replace"),
+    (Action::Cut, "Cut"),
+    (Action::Paste, "Paste"),
+    (Action::Location, "Location"),
+    (Action::GotoLine, "Go To Line"),
+    (Action::Undo, "Undo"),
+    (Action::Redo, "Redo"),
+    (Action::Mark, "Set Mark"),
+    (Action::Copy, "Copy"),
+    (Action::FindBracket, "To Bracket"),
+    (Action::WhereWas, "Where Was"),
+    (Action::FindPrevious, "Previous"),
+    (Action::FindNext, "Next"),
+];
+
 /// The Search (WhereIs) prompt's shortcut list, captured the same way.
 const SEARCH_SHORTCUTS: &[(Action, &str)] = &[
     (Action::Help, "Help"),
@@ -3982,9 +4117,18 @@ const LOCK_CONFLICT_SHORTCUTS: &[(&str, &str)] = &[("Y", "Yes"), ("N", "No")];
 /// looks up each function's current binding rather than a fixed table);
 /// menus/prompts not yet curated here fall back to Main's list rather than
 /// showing nothing.
-fn shortcut_bar_entries(keymap: &KeyMap, prompt: Option<&Prompt>) -> Vec<(String, &'static str)> {
+fn shortcut_bar_entries(
+    keymap: &KeyMap,
+    prompt: Option<&Prompt>,
+    restricted: bool,
+) -> Vec<(String, &'static str)> {
+    let main = if restricted {
+        SHORTCUT_PRIORITY_RESTRICTED
+    } else {
+        SHORTCUT_PRIORITY
+    };
     let Some(p) = prompt else {
-        return resolve_shortcuts(keymap, Menu::Main, SHORTCUT_PRIORITY);
+        return resolve_shortcuts(keymap, Menu::Main, main);
     };
     if matches!(p.kind, PromptKind::ExternalChangeConflict) {
         let mut entries: Vec<(String, &str)> = EXTERNAL_CONFLICT_SHORTCUTS
@@ -4019,8 +4163,16 @@ fn shortcut_bar_entries(keymap: &KeyMap, prompt: Option<&Prompt>) -> Vec<(String
         Menu::Linter => LINTER_SHORTCUTS,
         Menu::WhereIsFile => WHEREISFILE_SHORTCUTS,
         Menu::GotoDir => GOTODIR_SHORTCUTS,
-        _ => return resolve_shortcuts(keymap, Menu::Main, SHORTCUT_PRIORITY),
+        _ => return resolve_shortcuts(keymap, Menu::Main, main),
     };
+    if restricted {
+        let kept: Vec<(Action, &'static str)> = table
+            .iter()
+            .copied()
+            .filter(|&(action, _)| !crate::keymap::hidden_when_restricted(p.menu, action))
+            .collect();
+        return resolve_shortcuts(keymap, p.menu, &kept);
+    }
     resolve_shortcuts(keymap, p.menu, table)
 }
 
@@ -5035,7 +5187,7 @@ mod tests {
                 execute: false,
             },
             menu: Menu::Insert,
-            label: crate::app::insert_prompt_label(new_buffer, false, false),
+            label: crate::app::insert_prompt_label(new_buffer, false, false, "./"),
             input: input.to_string(),
             cursor: input.chars().count(),
             history_pos: None,
@@ -6076,6 +6228,88 @@ mod tests {
             WriteMethod::Prepend,
             "ignored when restricted"
         );
+    }
+
+    #[test]
+    fn restricted_write_out_prompt_locks_the_name_and_drops_toggles() {
+        let mut ed = test_editor("x\n");
+        ed.options.restricted = true;
+        ed.buf_mut().path = Some("f.txt".into());
+        ed.execute(Action::WriteOut);
+        for key in [KeyCode::Backspace, KeyCode::Char('z')] {
+            press(&mut ed, key, KeyModifiers::NONE);
+        }
+        press(&mut ed, KeyCode::Char('a'), KeyModifiers::ALT);
+        let Mode::Prompt(p) = &ed.mode else {
+            panic!("expected the Write Out prompt");
+        };
+        assert_eq!(p.input, "f.txt", "no typing or deleting");
+        assert_eq!(p.label, "Write to File", "M-A does nothing...");
+        assert!(ed.bell_pending, "...but beep");
+        let labels: Vec<&str> = shortcut_bar_entries(&ed.keymap, Some(p), true)
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Help",
+                "Cancel",
+                "DOS Format",
+                "Mac Format",
+                "Discard buffer"
+            ]
+        );
+
+        // An unnamed buffer can still be given one.
+        let mut ed = test_editor("x\n");
+        ed.options.restricted = true;
+        ed.execute(Action::WriteOut);
+        press(&mut ed, KeyCode::Char('n'), KeyModifiers::NONE);
+        let Mode::Prompt(p) = &ed.mode else {
+            panic!("expected the Write Out prompt");
+        };
+        assert_eq!(p.input, "n");
+    }
+
+    #[test]
+    fn restricted_main_bar_help_and_title_match_nano() {
+        let mut ed = test_editor("x\n");
+        ed.options.restricted = true;
+        let labels: Vec<&str> = shortcut_bar_entries(&ed.keymap, None, true)
+            .into_iter()
+            .map(|(_, d)| d)
+            .take(12)
+            .collect();
+        // Confirmed against the installed nano 8.7.1 (`nano -R`).
+        assert_eq!(
+            labels,
+            [
+                "Help",
+                "Exit",
+                "Write Out",
+                "Justify",
+                "Where Is",
+                "Replace",
+                "Cut",
+                "Paste",
+                "Location",
+                "Go To Line",
+                "Undo",
+                "Redo"
+            ]
+        );
+        let help = crate::help::build(Menu::Main, &ed.keymap, 80, true).join("\n");
+        assert!(!help.contains("Insert another file"), "{help}");
+        assert!(help.contains("Execute"), "nano keeps Execute listed");
+
+        let mut out = Vec::new();
+        render_title_bar(&ed, &mut out, 80).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("Restricted"));
+        ed.buf_mut().modified = true;
+        let mut out = Vec::new();
+        render_title_bar(&ed, &mut out, 80).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("Restricted"));
     }
 
     #[test]

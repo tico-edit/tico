@@ -680,6 +680,24 @@ pub struct KeyMap {
     table: HashMap<(Menu, Key), Binding>,
 }
 
+/// What nano leaves out of `menu` in restricted mode -- unbound, and so
+/// missing from its shortcut bar and help text: at the Write Out prompt
+/// Append, Prepend, Backup File and Browse; at the Read File and Execute
+/// Command prompts New Buffer, Execute Command, Pipe Text and Browse; and
+/// on the main menu Read File (whose key stays, to report "disabled").
+pub fn hidden_when_restricted(menu: Menu, action: Action) -> bool {
+    use Action as A;
+    match menu {
+        Menu::WriteOut => matches!(action, A::Append | A::Prepend | A::Backup | A::Browser),
+        Menu::Insert | Menu::Execute => matches!(
+            action,
+            A::FlipNewBuffer | A::FlipExecute | A::FlipPipe | A::Browser
+        ),
+        Menu::Main => action == A::Insert,
+        _ => false,
+    }
+}
+
 impl KeyMap {
     pub fn new() -> KeyMap {
         KeyMap {

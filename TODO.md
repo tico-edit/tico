@@ -37,12 +37,6 @@ here.
 - [ ] `atblanks`
 - [ ] `afterends`
 
-### Files and safety
-
-- [ ] `restricted` (which, among other things, should hide the file
-      browser's `^T`)
-- [ ] `operatingdir` (which should also confine the file browser)
-
 ### Editing
 
 - [ ] `wordchars` / `wordbounds`
