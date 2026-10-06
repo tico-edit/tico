@@ -21,6 +21,21 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // nano: restricted mode turns off backups, since they would write to
+    // files not named on the command line; otherwise a backup directory
+    // must exist, or nano refuses to start.
+    if options.restricted {
+        options.backup = false;
+    } else if let Some(dir) = options.backupdir.take() {
+        match fileio::resolve_backup_dir(&dir) {
+            Some(full) => options.backupdir = Some(full),
+            None => {
+                eprintln!("Invalid backup directory: {dir}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let mut warnings = loaded.warnings;
     let (theme, language_themes) = theme::resolve_themes(&options, &mut warnings);
     for w in &warnings {

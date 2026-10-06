@@ -347,6 +347,282 @@ pub fn save_file(buffer: &mut Buffer, path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// nano's `init_backup_dir`: `dir` (from `-C`/`set backupdir`) made
+/// absolute with a trailing slash, or `None` when it doesn't name an
+/// existing directory -- which nano treats as fatal at startup.
+pub fn resolve_backup_dir(dir: &str) -> Option<String> {
+    let full = full_path(Path::new(dir))?;
+    if !full.is_dir() {
+        return None;
+    }
+    let mut s = full.to_string_lossy().into_owned();
+    if !s.ends_with('/') {
+        s.push('/');
+    }
+    Some(s)
+}
+
+/// nano's `get_next_filename`: `name` plus `suffix`, or failing that the
+/// first of `.1`, `.2`, ... appended that doesn't exist yet -- `None` once
+/// a hundred thousand of them do.
+fn next_free_name(name: &str, suffix: &str) -> Option<String> {
+    let base = format!("{name}{suffix}");
+    (0..100_000u32)
+        .map(|i| {
+            if i == 0 {
+                base.clone()
+            } else {
+                format!("{base}.{i}")
+            }
+        })
+        .find(|candidate| std::fs::metadata(candidate).is_err())
+}
+
+/// Where `make_backup_of` first tries to put the backup of `realname`:
+/// without a backup directory, `realname~` alongside it; with one (`dir`,
+/// as `resolve_backup_dir` left it), a numbered name in that directory
+/// built from the file's full path with each `/` turned into `!`.
+fn backup_name(realname: &Path, dir: Option<&str>) -> Option<String> {
+    let Some(dir) = dir else {
+        return Some(format!("{}~", realname.display()));
+    };
+    let thename = match full_path(realname) {
+        Some(full) => full.to_string_lossy().replace('/', "!"),
+        None => realname
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    next_free_name(&format!("{dir}{thename}"), "~")
+}
+
+/// Whether writing to `realname` makes a backup first (the test at the
+/// top of nano's `write_file`): only under `set backup`, of an existing
+/// file that isn't a FIFO, and -- unless writing a selection (`marked`)
+/// -- only when the file's mtime still matches what was last read or
+/// written (`known`), i.e. not after "continue saving?" for a file that
+/// was changed on disk. Returns the file's metadata for the backup.
+pub fn needs_backup(
+    opts: &Options,
+    realname: &Path,
+    known: Option<&DiskState>,
+    marked: bool,
+) -> Option<std::fs::Metadata> {
+    if !opts.backup {
+        return None;
+    }
+    let meta = std::fs::metadata(realname).ok()?;
+    if is_fifo(&meta) {
+        return None;
+    }
+    // nano stats a file it hasn't seen before right here, so an unknown
+    // file always matches itself.
+    let unchanged = known.is_none_or(|k| mtime_secs(k.mtime) == mtime_secs(meta.modified().ok()));
+    (unchanged || marked).then_some(meta)
+}
+
+#[cfg(unix)]
+fn is_fifo(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    meta.file_type().is_fifo()
+}
+
+#[cfg(not(unix))]
+fn is_fifo(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Why `make_backup_of` didn't make a backup.
+#[derive(Debug)]
+pub enum BackupError {
+    /// Every numbered name in the backup directory is taken; nano gives
+    /// up on the save without asking.
+    TooMany,
+    /// Copying failed (in place and then in the home directory):
+    /// `warnings` are what nano flashes one after another, and `error`
+    /// the last failure, which decides whether nano asks to save anyway.
+    Failed {
+        warnings: Vec<String>,
+        error: std::io::Error,
+    },
+}
+
+/// How one attempt at writing the backup copy went wrong: `Problem`s get
+/// a second try in the home directory, an unreadable original doesn't.
+enum CopyError {
+    Problem(std::io::Error),
+    CannotRead(std::io::Error),
+}
+
+/// nano 8.7.1's `make_backup_of`: copy `realname` (whose metadata is
+/// `meta`) to its backup name, with the original's owner, permissions and
+/// timestamps. A backup that can't be made where it belongs is tried
+/// again as `~/NAME~XXXXXX`.
+pub fn make_backup_of(
+    realname: &Path,
+    meta: &std::fs::Metadata,
+    backup_dir: Option<&str>,
+    insecure: bool,
+) -> Result<(), BackupError> {
+    let Some(backupname) = backup_name(realname, backup_dir) else {
+        return Err(BackupError::TooMany);
+    };
+    let mut warnings = Vec::new();
+    let first = remove_old_backup(&backupname, insecure)
+        .and_then(|()| create_backup_file(&backupname, insecure))
+        .map_err(CopyError::Problem)
+        .and_then(|file| fill_backup(file, realname, meta));
+    let error = match first {
+        Ok(()) => return Ok(()),
+        Err(CopyError::CannotRead(e)) => {
+            warnings.push("Cannot read original file".to_string());
+            e
+        }
+        Err(CopyError::Problem(e)) => match dirs::home_dir() {
+            None => {
+                warnings.push("Cannot make backup".to_string());
+                e
+            }
+            Some(home) => {
+                let _ = std::fs::remove_file(&backupname);
+                warnings.push("Cannot make regular backup".to_string());
+                warnings.push("Trying again in your home directory".to_string());
+                let tail = realname
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let second = create_unique_file(&home.join(format!("{tail}~")))
+                    .map_err(CopyError::Problem)
+                    .and_then(|file| fill_backup(file, realname, meta));
+                match second {
+                    Ok(()) => return Ok(()),
+                    Err(CopyError::CannotRead(e)) => {
+                        warnings.push("Cannot read original file".to_string());
+                        e
+                    }
+                    Err(CopyError::Problem(e)) => {
+                        warnings.push("Cannot make backup".to_string());
+                        e
+                    }
+                }
+            }
+        },
+    };
+    warnings.push(crate::browser::strerror(&error));
+    Err(BackupError::Failed { warnings, error })
+}
+
+/// Delete a previous backup, so that the new one is created afresh rather
+/// than written through whatever is there (a symlink, say) -- a failure
+/// to do so only matters without `allow_insecure_backup`.
+fn remove_old_backup(backupname: &str, insecure: bool) -> std::io::Result<()> {
+    match std::fs::remove_file(backupname) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound && !insecure => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Open the backup for writing, owner read/write only until its real
+/// permissions are copied over: newly created (`O_EXCL`), or under
+/// `allow_insecure_backup` truncated if it's there anyway.
+fn create_backup_file(backupname: &str, insecure: bool) -> std::io::Result<std::fs::File> {
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true);
+    if insecure {
+        open.create(true).truncate(true);
+    } else {
+        open.create_new(true);
+    }
+    owner_only(&mut open);
+    open.open(backupname)
+}
+
+#[cfg(unix)]
+fn owner_only(open: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    open.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn owner_only(_open: &mut std::fs::OpenOptions) {}
+
+/// `mkstemp(3)` on `prefix` + six random characters: a new file that
+/// didn't exist before.
+fn create_unique_file(prefix: &Path) -> std::io::Result<std::fs::File> {
+    use std::hash::BuildHasher;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let state = std::collections::hash_map::RandomState::new();
+    let mut last_error = None;
+    for attempt in 0u32..100 {
+        let mut n = state.hash_one(attempt);
+        let suffix: String = (0..6)
+            .map(|_| {
+                let c = CHARS[(n % CHARS.len() as u64) as usize] as char;
+                n /= CHARS.len() as u64;
+                c
+            })
+            .collect();
+        let mut name = prefix.as_os_str().to_owned();
+        name.push(suffix);
+        match create_backup_file(&name.to_string_lossy(), false) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_error = Some(e),
+            result => return result,
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::ErrorKind::AlreadyExists.into()))
+}
+
+/// Give the freshly created backup `file` the original's owner and
+/// permissions (as far as allowed), copy `realname`'s bytes into it, sync
+/// it to disk, and set its timestamps to the original's.
+fn fill_backup(
+    mut file: std::fs::File,
+    realname: &Path,
+    meta: &std::fs::Metadata,
+) -> Result<(), CopyError> {
+    use std::io::{Read, Write};
+    let permitted = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() != std::io::ErrorKind::PermissionDenied => Err(CopyError::Problem(e)),
+        _ => Ok(()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        permitted(std::os::unix::fs::fchown(
+            &file,
+            Some(meta.uid()),
+            Some(meta.gid()),
+        ))?;
+    }
+    permitted(file.set_permissions(meta.permissions()))?;
+    let mut original = std::fs::File::open(realname).map_err(CopyError::CannotRead)?;
+    let mut chunk = vec![0; 64 * 1024];
+    loop {
+        let n = match original.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(CopyError::CannotRead(e)),
+        };
+        file.write_all(&chunk[..n]).map_err(CopyError::Problem)?;
+    }
+    file.sync_all().map_err(CopyError::Problem)?;
+    // Like nano, whole seconds only, and a failure here doesn't matter.
+    let whole_secs = |t: std::io::Result<std::time::SystemTime>| {
+        let secs = mtime_secs(t.ok())?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    };
+    let mut times = std::fs::FileTimes::new();
+    if let Some(t) = whole_secs(meta.accessed()) {
+        times = times.set_accessed(t);
+    }
+    if let Some(t) = whole_secs(meta.modified()) {
+        times = times.set_modified(t);
+    }
+    let _ = file.set_times(times);
+    Ok(())
+}
+
 /// The result of checking whether the file changed on disk since we loaded
 /// or last saved it.
 pub enum ExternalChange {
@@ -641,6 +917,61 @@ mod tests {
             convert_line_endings("a\r\nb\rc", true),
             ("a\r\nb\rc".to_string(), LineFormat::Unix)
         );
+    }
+
+    #[test]
+    fn backup_dir_must_be_an_existing_directory() {
+        let dir = std::env::temp_dir().join(format!("tico_test_backupdir_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolved = resolve_backup_dir(&dir.to_string_lossy()).unwrap();
+        assert!(resolved.ends_with('/'), "{resolved}");
+        assert!(Path::new(&resolved).is_absolute());
+        let file = dir.join("plain");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(resolve_backup_dir(&file.to_string_lossy()), None);
+        assert_eq!(
+            resolve_backup_dir(&dir.join("missing").to_string_lossy()),
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn next_free_name_counts_up_past_taken_names() {
+        let dir = std::env::temp_dir().join(format!("tico_test_nextname_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("f").to_string_lossy().into_owned();
+        assert_eq!(next_free_name(&base, "~"), Some(format!("{base}~")));
+        std::fs::write(format!("{base}~"), "").unwrap();
+        std::fs::write(format!("{base}~.1"), "").unwrap();
+        assert_eq!(next_free_name(&base, "~"), Some(format!("{base}~.2")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_copies_permissions_and_timestamps() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tico_test_backupmeta_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.sh");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        make_backup_of(&path, &meta, None, false).unwrap();
+        let backup = dir.join("f.sh~");
+        let bmeta = std::fs::metadata(&backup).unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "#!/bin/sh\n");
+        assert_eq!(bmeta.permissions().mode() & 0o7777, 0o751);
+        assert_eq!(bmeta.modified().unwrap(), then);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
