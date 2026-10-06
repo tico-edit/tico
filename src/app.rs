@@ -103,7 +103,11 @@ pub struct WriteFlow {
     /// own is fine -- the buffer has no name, or "Save file under
     /// DIFFERENT NAME?" was already answered Yes.
     pub maychange: bool,
+    /// Overwrite, or append/prepend as toggled with `M-A`/`M-P`.
+    pub method: WriteMethod,
 }
+
+pub use crate::fileio::WriteMethod;
 
 /// The questions nano's `write_it_out` asks before writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1785,6 +1789,7 @@ impl Editor {
             exiting,
             withprompt,
             maychange: self.buf().path.is_none(),
+            method: WriteMethod::Overwrite,
         };
         self.prompt_for_write(flow, given);
     }
@@ -1799,7 +1804,7 @@ impl Editor {
             self.check_write_answer(path.display().to_string(), flow);
             return;
         }
-        let label = self.writeout_prompt_label(flow.exiting);
+        let label = self.writeout_prompt_label(flow);
         self.mode = Mode::Prompt(Prompt {
             kind: PromptKind::WriteOut { flow },
             menu: Menu::WriteOut,
@@ -1828,6 +1833,11 @@ impl Editor {
     /// buffer's own name needs "continue saving?" when the file changed on
     /// disk since it was read or written.
     fn check_write_answer(&mut self, answer: String, flow: WriteFlow) {
+        // Appending or prepending asks nothing (nano's checks are all
+        // inside `if (method == OVERWRITE)`).
+        if flow.method != WriteMethod::Overwrite {
+            return self.finish_write(&answer, flow);
+        }
         let expanded = crate::fileio::expand_leading_tilde(&answer);
         let path = std::path::Path::new(&expanded);
         let name_exists = std::fs::metadata(path).is_ok();
@@ -1965,12 +1975,12 @@ impl Editor {
     fn finish_write(&mut self, answer: &str, flow: WriteFlow) {
         // nano's write_file expands a leading ~ or ~user.
         let path = std::path::PathBuf::from(crate::fileio::expand_leading_tilde(answer));
-        let marked = self.buf().mark.is_some();
+        let forced = self.buf().mark.is_some() || flow.method != WriteMethod::Overwrite;
         if let Some(meta) = crate::fileio::needs_backup(
             &self.options,
             &path,
             self.buf().disk_state.as_ref(),
-            marked,
+            forced,
         ) {
             let made = crate::fileio::make_backup_of(
                 &path,
@@ -2024,15 +2034,50 @@ impl Editor {
                 selected.push('\n');
             }
             let bytes = crate::fileio::with_line_breaks(selected.clone(), self.buf().format);
-            match std::fs::write(&path, bytes) {
+            match crate::fileio::write_by_method(&path, bytes.as_bytes(), flow.method) {
                 Ok(()) => {
+                    self.refresh_own_disk_state(&path);
                     self.set_status(wrote_lines(crate::fileio::nano_style_line_count(&selected)))
                 }
-                Err(e) => self.set_status_alert(format!("Error writing {}: {e}", path.display())),
+                Err(msg) => self.set_status_alert(msg),
             }
             return;
         }
-        self.write_buffer_to(&path, flow.exiting);
+        if flow.method == WriteMethod::Overwrite {
+            return self.write_buffer_to(&path, flow.exiting);
+        }
+        // Appending or prepending the whole buffer leaves it as it was:
+        // still modified, still under its own name (nano annotates only
+        // an overwrite).
+        let bytes = crate::fileio::serialized(self.buf());
+        match crate::fileio::write_by_method(&path, bytes.as_bytes(), flow.method) {
+            Ok(()) => {
+                self.refresh_own_disk_state(&path);
+                if self.options.minibar {
+                    self.note_buffer_linecount();
+                } else {
+                    self.set_status(wrote_lines(self.buf().nano_line_count()));
+                }
+                if flow.exiting {
+                    self.close_current_buffer();
+                }
+            }
+            Err(msg) => self.set_status_alert(msg),
+        }
+    }
+
+    /// After appending or prepending to the buffer's own file, refresh its
+    /// disk snapshot (as `write_buffer_plainly` does) so tico's
+    /// external-change watcher doesn't report tico's own write.
+    fn refresh_own_disk_state(&mut self, path: &std::path::Path) {
+        let own = self
+            .buf()
+            .path
+            .as_deref()
+            .and_then(crate::fileio::full_path);
+        if own.is_some() && own == crate::fileio::full_path(path) {
+            self.buf_mut().disk_state = crate::fileio::stat_disk_state(path);
+        }
     }
 
     /// nano's `write_file(..., NONOTES)`: write the whole buffer to `path`
@@ -2093,17 +2138,21 @@ impl Editor {
         self.run_search(&pattern, backwards);
     }
 
-    /// The Write Out prompt's label (nano 8.7's `do_writeout`), rebuilt
-    /// whenever `M-D`/`M-M` toggles the buffer's format or `M-B` toggles
-    /// backups: " [DOS Format]" or " [Mac Format]" is appended for those
-    /// formats, then " [Backup]" under `set backup`.
-    pub(crate) fn writeout_prompt_label(&self, exiting: bool) -> String {
+    /// The Write Out prompt's label (nano 8.7's `write_it_out`), rebuilt
+    /// whenever `M-A`/`M-P` toggles appending/prepending, `M-D`/`M-M` the
+    /// buffer's format, or `M-B` backups: what's written where, then
+    /// " [DOS Format]" or " [Mac Format]" for those formats, then
+    /// " [Backup]" under `set backup`.
+    pub(crate) fn writeout_prompt_label(&self, flow: WriteFlow) -> String {
         use crate::buffer::LineFormat;
-        let selecting = !exiting && self.buf().mark.is_some();
-        let base = if selecting {
-            "Write Selection to File"
-        } else {
-            "Write to File"
+        let selecting = !flow.exiting && self.buf().mark.is_some() && !self.options.restricted;
+        let base = match (selecting, flow.method) {
+            (true, WriteMethod::Prepend) => "Prepend Selection to File",
+            (true, WriteMethod::Append) => "Append Selection to File",
+            (true, WriteMethod::Overwrite) => "Write Selection to File",
+            (false, WriteMethod::Prepend) => "Prepend to File",
+            (false, WriteMethod::Append) => "Append to File",
+            (false, WriteMethod::Overwrite) => "Write to File",
         };
         let format = match self.buf().format {
             LineFormat::Dos => " [DOS Format]",
@@ -2976,6 +3025,121 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&own).unwrap(), "old");
         assert_eq!(ed.buf().path.as_deref(), Some(other.as_path()));
         assert!(!ed.buf().modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Switch the open Write Out prompt to `method`, as `M-A`/`M-P` do.
+    fn set_write_method(ed: &mut Editor, method: WriteMethod) {
+        let Mode::Prompt(Prompt {
+            kind: PromptKind::WriteOut { flow },
+            ..
+        }) = &mut ed.mode
+        else {
+            panic!("expected the Write Out prompt");
+        };
+        flow.method = method;
+    }
+
+    #[test]
+    fn appending_and_prepending_ask_nothing_and_leave_the_buffer_as_is() {
+        let dir = write_test_dir("append_prepend");
+        let own = dir.join("own.txt");
+        let other = dir.join("other.txt");
+        std::fs::write(&other, "middle\n").unwrap();
+        let mut ed = editor_on_file(&own, "old\n", "new\n");
+
+        ed.execute(Action::WriteOut);
+        set_write_method(&mut ed, WriteMethod::Append);
+        submit_write(&mut ed, &other.display().to_string());
+        assert!(
+            matches!(ed.mode, Mode::Editing),
+            "no DIFFERENT NAME question"
+        );
+        assert_eq!(ed.status.as_deref(), Some("Wrote 1 line"));
+
+        ed.execute(Action::WriteOut);
+        set_write_method(&mut ed, WriteMethod::Prepend);
+        submit_write(&mut ed, &other.display().to_string());
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "new\nmiddle\nnew\n"
+        );
+
+        assert!(ed.buf().modified, "still unsaved");
+        assert_eq!(ed.buf().path.as_deref(), Some(own.as_path()));
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "old\n");
+
+        // Appending creates a missing file; prepending needs one to read.
+        ed.execute(Action::WriteOut);
+        set_write_method(&mut ed, WriteMethod::Append);
+        submit_write(&mut ed, &dir.join("fresh.txt").display().to_string());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fresh.txt")).unwrap(),
+            "new\n"
+        );
+        let missing = dir.join("missing.txt");
+        ed.execute(Action::WriteOut);
+        set_write_method(&mut ed, WriteMethod::Prepend);
+        submit_write(&mut ed, &missing.display().to_string());
+        assert_eq!(
+            ed.status.as_deref(),
+            Some(
+                format!(
+                    "Error reading {}: No such file or directory",
+                    missing.display()
+                )
+                .as_str()
+            )
+        );
+        assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appending_a_selection_and_appending_on_exit() {
+        let dir = write_test_dir("append_selection");
+        let own = dir.join("own.txt");
+        let other = dir.join("other.txt");
+        std::fs::write(&other, "start\n").unwrap();
+        let mut ed = editor_on_file(&own, "old\n", "one\ntwo\n");
+        ed.buf_mut().mark = Some(Pos::new(0, 0));
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.execute(Action::WriteOut);
+        set_write_method(&mut ed, WriteMethod::Append);
+        submit_write(&mut ed, &other.display().to_string());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "start\none\n");
+
+        // ^X, Yes, then append: success closes the buffer, unsaved.
+        ed.buf_mut().mark = None;
+        ed.execute(Action::Exit);
+        ed.mode = Mode::Editing; // "Save modified buffer?" Yes
+        ed.begin_writeout_for_exit();
+        set_write_method(&mut ed, WriteMethod::Append);
+        submit_write(&mut ed, &other.display().to_string());
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "start\none\none\ntwo\n"
+        );
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "old\n");
+        assert!(matches!(ed.mode, Mode::Quit), "the buffer was closed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appending_backs_up_even_a_file_changed_on_disk() {
+        let dir = write_test_dir("append_backup");
+        let own = dir.join("own.txt");
+        let mut ed = editor_on_file(&own, "old\n", "new\n");
+        ed.options.backup = true;
+        touch_on_disk(&own, "theirs\n");
+        ed.execute(Action::WriteOut);
+        set_write_method(&mut ed, WriteMethod::Append);
+        submit_write(&mut ed, &own.display().to_string());
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "theirs\nnew\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("own.txt~")).unwrap(),
+            "theirs\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

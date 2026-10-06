@@ -22,7 +22,6 @@ here.
       works; this path is stubbed separately in `src/ui.rs`
 - [ ] Verbatim input (`M-V`)
 - [ ] Center (`^L`) / Cycle (`M-%`)
-- [ ] Write Out prompt toggles: Append (`M-A`), Prepend (`M-P`)
 
 ## Options parsed but never consulted
 

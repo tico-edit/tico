@@ -347,6 +347,48 @@ pub fn save_file(buffer: &mut Buffer, path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// How the Write Out prompt puts text into the file (nano's
+/// `kind_of_writing_type`, toggled there with `M-A` and `M-P`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMethod {
+    Overwrite,
+    Append,
+    Prepend,
+}
+
+/// Write `bytes` to `path` by `method`, the way nano's `write_file` does:
+/// overwriting (creating the file if needed), appending (likewise), or
+/// prepending -- which needs an existing, readable, non-FIFO file. A
+/// failure comes back as nano's status message for it.
+pub fn write_by_method(path: &Path, bytes: &[u8], method: WriteMethod) -> Result<(), String> {
+    use std::io::Write;
+    let name = path.display();
+    let writing =
+        |e: std::io::Error| format!("Error writing {name}: {}", crate::browser::strerror(&e));
+    let mut bytes = std::borrow::Cow::Borrowed(bytes);
+    if method == WriteMethod::Prepend {
+        if std::fs::metadata(path).is_ok_and(|m| is_fifo(&m)) {
+            return Err(format!("Error writing {name}: FIFO"));
+        }
+        let existing = std::fs::read(path)
+            .map_err(|e| format!("Error reading {name}: {}", crate::browser::strerror(&e)))?;
+        bytes.to_mut().extend_from_slice(&existing);
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.create(true);
+    if method == WriteMethod::Append {
+        open.append(true);
+    } else {
+        open.write(true).truncate(true);
+    }
+    let mut file = open.open(path).map_err(writing)?;
+    file.write_all(&bytes).map_err(writing)?;
+    if !std::fs::metadata(path).is_ok_and(|m| is_fifo(&m)) {
+        file.sync_all().map_err(writing)?;
+    }
+    Ok(())
+}
+
 /// nano's `init_backup_dir`: `dir` (from `-C`/`set backupdir`) made
 /// absolute with a trailing slash, or `None` when it doesn't name an
 /// existing directory -- which nano treats as fatal at startup.
@@ -398,15 +440,16 @@ fn backup_name(realname: &Path, dir: Option<&str>) -> Option<String> {
 
 /// Whether writing to `realname` makes a backup first (the test at the
 /// top of nano's `write_file`): only under `set backup`, of an existing
-/// file that isn't a FIFO, and -- unless writing a selection (`marked`)
-/// -- only when the file's mtime still matches what was last read or
-/// written (`known`), i.e. not after "continue saving?" for a file that
-/// was changed on disk. Returns the file's metadata for the backup.
+/// file that isn't a FIFO, and -- unless `forced`, as for a selection or
+/// an append/prepend -- only when the file's mtime still matches what was
+/// last read or written (`known`), i.e. not after "continue saving?" for
+/// a file that was changed on disk. Returns the file's metadata for the
+/// backup.
 pub fn needs_backup(
     opts: &Options,
     realname: &Path,
     known: Option<&DiskState>,
-    marked: bool,
+    forced: bool,
 ) -> Option<std::fs::Metadata> {
     if !opts.backup {
         return None;
@@ -418,7 +461,7 @@ pub fn needs_backup(
     // nano stats a file it hasn't seen before right here, so an unknown
     // file always matches itself.
     let unchanged = known.is_none_or(|k| mtime_secs(k.mtime) == mtime_secs(meta.modified().ok()));
-    (unchanged || marked).then_some(meta)
+    (unchanged || forced).then_some(meta)
 }
 
 #[cfg(unix)]
