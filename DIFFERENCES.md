@@ -61,7 +61,7 @@ whole process group is stopped with SIGSTOP, and `fg` resumes in place.
 But nano also installs SIGTSTP and SIGCONT handlers so that a stop sent
 from outside (`kill -TSTP`, or a shell or multiplexer stopping the job)
 restores the terminal first and re-initializes it on resume. tico has no
-signal handlers, so an externally sent SIGTSTP stops it with the terminal
+SIGTSTP/SIGCONT handlers, so an externally sent SIGTSTP stops it with the terminal
 still in raw mode and on the alternate screen.
 
 A typed `^Z` is unaffected: both editors disable the terminal's ISIG in
@@ -72,6 +72,22 @@ On Windows there is no SIGSTOP/process-group job control to hand off to
 a shell at all, so `^T^Z` there just reports "Could not suspend:
 suspend is not supported on this platform" and leaves the process
 running.
+
+## Cancelling a command with `^C`: not on Windows
+
+While an Execute command (`^T`) runs, `^C` cancels it exactly as in
+nano: the terminal's ISIG is turned back on for the duration and a
+SIGINT handler SIGKILLs the command, which is then reported as
+"Cancelled" and has its changes undone. As in nano, the SIGINT the
+terminal generates goes to tico's whole foreground process group. Run
+from an interactive shell that is just tico and the command, but when
+tico is started from a non-interactive wrapper sharing its process
+group (`sh -c 'tico; ...'`), that wrapper receives the SIGINT too and
+abandons the rest of its script.
+
+On Windows none of this is set up (`src/interrupt.rs` is Unix-only), so
+`^C` cannot cancel a running command there; tico waits until the
+command finishes on its own.
 
 ## Help listing order and contents
 

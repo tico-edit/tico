@@ -338,14 +338,20 @@ impl Buffer {
 
     pub fn insert_str(&mut self, text: &str) {
         let pos = self.cursor;
+        self.replace_text(pos, pos, text);
+    }
+
+    /// Replace `[start,end)` with `text` as a single undo step, leaving
+    /// the cursor at the end of the inserted text.
+    pub fn replace_text(&mut self, start: Pos, end: Pos, text: &str) {
         let newlines = text.matches('\n').count();
         let after = if newlines == 0 {
-            Pos::new(pos.line, pos.col + text.chars().count())
+            Pos::new(start.line, start.col + text.chars().count())
         } else {
             let last_line_len = text.rsplit('\n').next().unwrap_or("").chars().count();
-            Pos::new(pos.line + newlines, last_line_len)
+            Pos::new(start.line + newlines, last_line_len)
         };
-        self.replace_range(pos, pos, text, after);
+        self.replace_range(start, end, text, after);
     }
 
     pub fn backspace(&mut self) {

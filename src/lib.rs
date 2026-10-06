@@ -11,6 +11,7 @@ pub mod config;
 pub mod fileio;
 pub mod help;
 pub mod history;
+pub mod interrupt;
 pub mod justify;
 pub mod keymap;
 pub mod lockfile;

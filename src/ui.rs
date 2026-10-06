@@ -1376,13 +1376,23 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             editor.execute(action);
             true
         }
-        // Bound (matching nano's full MEXECUTE menu, so the shortcut bar
-        // and ^G help show it) but not actually implemented: same
-        // plain-report convention as FlipConvert/Browser above.
+        // `M-\` Pipe Text: nano's `add_or_remove_pipe_symbol_from_answer`
+        // -- it only adds a `|` at the head of the command (or takes one
+        // away), keeping the cursor on the same character. A leading `|`
+        // is what makes `submit_execute_command` pipe the text, so typing
+        // it by hand does exactly the same.
         Action::FlipPipe => {
-            editor.mode = Mode::Editing;
-            editor.set_status("Pipe Text: not yet implemented");
-            true
+            if !matches!(prompt.kind, PromptKind::InsertFile { execute: true, .. }) {
+                return false;
+            }
+            if prompt.input.starts_with('|') {
+                prompt.input.remove(0);
+                prompt.cursor = prompt.cursor.saturating_sub(1);
+            } else {
+                prompt.input.insert(0, '|');
+                prompt.cursor += 1;
+            }
+            false
         }
         // `^Z` from the Execute prompt: the real thing. Like the tools
         // above, nano's `ran_a_tool` closes the prompt first.
@@ -2232,35 +2242,172 @@ fn suspend_editor(editor: &mut Editor) {
     }
 }
 
-/// `^T` Execute Command's submit: run `text` in the shell, and insert its
-/// captured output into the buffer at the cursor (or, with New Buffer on,
-/// into a fresh blank buffer) — matches nano's `execute_command` (the
-/// plain, non-pipe case; nano's `|command` pipe-to-stdin form isn't
-/// implemented).
+/// `^T` Execute Command's submit: matches nano's `execute_command`. The
+/// command runs in `$SHELL -c` with its stdout and stderr captured through
+/// one pipe (so they interleave as they would on a terminal), and that
+/// output is inserted at the cursor -- or, with New Buffer on, into a
+/// fresh blank buffer.
+///
+/// A leading `|` (what `M-\` Pipe Text adds) also feeds the marked region,
+/// or else the whole buffer, to the command's stdin. Without New Buffer
+/// the output then *replaces* that text, as one undo step; for the whole
+/// buffer the cursor goes back to the start of the line it was on. With
+/// New Buffer the original buffer is left alone. A second leading `|` lets
+/// the command's stdout go to the terminal instead of being captured.
+///
+/// A command that fails has what it did undone, and the shell's complaint
+/// shown -- nano takes it from the line above the cursor, after the first
+/// `": "`, and shows `---` when there is none.
 fn submit_execute_command(editor: &mut Editor, command: &str, new_buffer: bool) {
+    let should_pipe = command.starts_with('|');
+    let capture_output = !command.starts_with("||");
+    let shell_command = if !should_pipe {
+        command
+    } else if capture_output {
+        &command[1..]
+    } else {
+        &command[2..]
+    };
+
+    // What gets fed to the command, and (unless New Buffer) where the
+    // output goes: in place of the region or the whole buffer.
+    let piped_text = should_pipe.then(|| editor.tool_input_text());
+    let was_line = editor.buf().cursor.line;
+    let marked = editor.selection_range();
+    let (start, end) = match (new_buffer, should_pipe, marked) {
+        (true, ..) => (Pos::new(0, 0), Pos::new(0, 0)),
+        (false, true, Some(range)) => range,
+        (false, true, None) => {
+            let last_line = editor.buf().line_count().saturating_sub(1);
+            let last_col = editor.buf().line(last_line).chars().count();
+            (Pos::new(0, 0), Pos::new(last_line, last_col))
+        }
+        (false, false, _) => (editor.buf().cursor, editor.buf().cursor),
+    };
+
     if new_buffer {
         editor.buffers.push(crate::buffer::Buffer::empty());
         editor.current = editor.buffers.len() - 1;
     }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    editor.history.add_execute(command);
     editor.set_status("Executing...");
-    match std::process::Command::new(&shell)
-        .arg("-c")
-        .arg(command)
-        .output()
+
+    let (raw, status, sending) = match run_shell_command(shell_command, piped_text, capture_output)
     {
-        Ok(output) => {
-            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            if !text.is_empty() {
-                editor.buf_mut().insert_str(&text);
-                editor.buf_mut().modified = true;
-            }
-            editor.history.add_execute(command);
-            editor.set_status("Executing...");
+        Ok(result) => result,
+        Err(e) => {
+            editor.set_status_alert(format!("Could not fork: {e}"));
+            return;
         }
-        Err(e) => editor.set_status_alert(format!("Could not fork: {e}")),
+    };
+
+    let (mut text, detected) = crate::fileio::convert_line_endings(&raw, editor.options.noconvert);
+    let at_end = end.line + 1 >= editor.buf().line_count()
+        && end.col >= editor.buf().line(end.line).chars().count();
+    if at_end {
+        crate::fileio::with_magic_line(&mut text, editor.options.nonewlines);
     }
+    let msg = crate::fileio::describe_read(&text, detected);
+    let unix = editor.options.unix;
+    let edited = !text.is_empty() || start != end;
+    let buf = editor.buf_mut();
+    if edited {
+        buf.replace_text(start, end, &text);
+        buf.mark = None;
+        buf.softmark = false;
+    }
+    buf.adopt_format(detected, unix);
+    if should_pipe && !new_buffer && marked.is_none() {
+        let line = was_line.min(buf.line_count().saturating_sub(1));
+        buf.cursor = Pos::new(line, 0);
+    }
+
+    let failure = match status {
+        Some(code) if code != 0 => {
+            let cursor = editor.buf().cursor;
+            let above = (cursor.line > 0).then(|| editor.buf().line(cursor.line - 1));
+            let complaint = above
+                .as_deref()
+                .and_then(|l| l.split_once(": "))
+                .map_or("---".to_string(), |(_, rest)| rest.to_string());
+            Some(format!("Error: {complaint}"))
+        }
+        Some(_) if sending.is_err() => Some("Piping failed".to_string()),
+        Some(_) => None,
+        None => Some("Cancelled".to_string()),
+    };
+    match failure {
+        Some(alert) => {
+            if edited {
+                let buf = editor.buf_mut();
+                buf.undo();
+                buf.redo_stack.pop();
+            }
+            editor.set_status_alert(alert);
+        }
+        None => editor.set_status(msg),
+    }
+    editor.scroll_to_cursor();
+}
+
+/// Run `command` under `$SHELL -c` (nano's choice of shell, falling back
+/// to `/bin/sh`), writing `input` (if any) to its stdin from a separate
+/// thread while its stdout and stderr are collected through one shared
+/// pipe -- or just its stderr, when `capture_output` is off and stdout
+/// goes to the terminal. `^C` kills it meanwhile (see `interrupt`).
+/// Returns the output, the exit code (`None` when killed by a signal),
+/// and how sending the input went.
+fn run_shell_command(
+    command: &str,
+    input: Option<String>,
+    capture_output: bool,
+) -> io::Result<(String, Option<i32>, io::Result<()>)> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let (mut reader, writer) = io::pipe()?;
+    let mut cmd = Command::new(&shell);
+    cmd.arg("-c").arg(command).stderr(writer.try_clone()?);
+    if capture_output {
+        cmd.stdout(writer);
+    } else {
+        cmd.stdout(Stdio::inherit());
+        drop(writer);
+    }
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = cmd.spawn()?;
+    // The Command still holds the pipe's write end; without dropping it
+    // the read below would never see end-of-file.
+    drop(cmd);
+
+    let sender = child
+        .stdin
+        .take()
+        .zip(input)
+        .map(|(mut stdin, text)| std::thread::spawn(move || stdin.write_all(text.as_bytes())));
+    // `^C` kills the command from here until it has finished.
+    let interrupt = crate::interrupt::CommandInterrupt::arm(child.id());
+    let mut output = Vec::new();
+    let read = reader.read_to_end(&mut output);
+    let status = child.wait()?;
+    drop(interrupt);
+    read?;
+    let sending = sender.map_or(Ok(()), |handle| {
+        handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("sender panicked")))
+    });
+    // No exit code means a signal ended it (only possible on Unix).
+    Ok((
+        String::from_utf8_lossy(&output).into_owned(),
+        status.code(),
+        sending,
+    ))
 }
 
 /// `F12` (Main menu) / `^T` from within the Execute-Command prompt: spell
@@ -4016,9 +4163,6 @@ const WRITEOUT_SHORTCUTS: &[(Action, &str)] = &[
 
 /// The `^T` Execute Command prompt's shortcut list, matching nano's full
 /// MEXECUTE menu (confirmed against the installed nano's own bottom bar).
-/// Full Justify (`^J`), Cut Till End (`^V`), and Pipe Text (`M-\`) aren't
-/// actually implemented yet — see apply_prompt_action's arms for them —
-/// but are still listed rather than silently omitted.
 const EXECUTE_SHORTCUTS: &[(Action, &str)] = &[
     (Action::Help, "Help"),
     (Action::Cancel, "Cancel"),
@@ -6030,8 +6174,123 @@ mod tests {
         submit_execute_command(&mut ed, "echo -n hi", true);
         assert_eq!(ed.buffers.len(), 2);
         assert_eq!(ed.current, 1);
-        assert_eq!(ed.buf().to_string(), "hi");
+        // nano's read_file gives the output its magic line.
+        assert_eq!(ed.buf().to_string(), "hi\n");
         assert_eq!(ed.buffers[0].to_string(), "original");
+    }
+
+    #[test]
+    fn pipe_text_adds_or_removes_a_leading_bar_keeping_the_cursor_in_place() {
+        let mut ed = test_editor("text");
+        press(&mut ed, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "wc");
+        press(&mut ed, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut ed, KeyCode::Char('\\'), KeyModifiers::ALT);
+        let Mode::Prompt(prompt) = &ed.mode else {
+            panic!("M-\\ should leave the Execute prompt up");
+        };
+        assert_eq!((prompt.input.as_str(), prompt.cursor), ("|wc", 2));
+        press(&mut ed, KeyCode::Char('\\'), KeyModifiers::ALT);
+        let Mode::Prompt(prompt) = &ed.mode else {
+            panic!("M-\\ should leave the Execute prompt up");
+        };
+        assert_eq!((prompt.input.as_str(), prompt.cursor), ("wc", 1));
+    }
+
+    #[test]
+    fn piped_command_filters_the_whole_buffer_as_one_undo_step() {
+        let mut ed = test_editor("one\ntwo\nthree\n");
+        ed.buf_mut().cursor = Pos::new(1, 2);
+        submit_execute_command(&mut ed, "|tr a-z A-Z", false);
+        assert_eq!(ed.buf().to_string(), "ONE\nTWO\nTHREE\n");
+        // nano goes back to the start of the line the cursor was on.
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0));
+        assert_eq!(ed.status.as_deref(), Some("Read 3 lines"));
+        assert_eq!(ed.history.execute, vec!["|tr a-z A-Z".to_string()]);
+        ed.buf_mut().undo();
+        assert_eq!(ed.buf().to_string(), "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn piped_command_filters_just_the_marked_region() {
+        let mut ed = test_editor("one\ntwo\nthree\n");
+        ed.buf_mut().mark = Some(Pos::new(1, 0));
+        ed.buf_mut().cursor = Pos::new(2, 0);
+        submit_execute_command(&mut ed, "|tr a-z A-Z", false);
+        assert_eq!(ed.buf().to_string(), "one\nTWO\nthree\n");
+        assert_eq!(ed.buf().mark, None);
+        assert_eq!(ed.buf().cursor, Pos::new(2, 0));
+    }
+
+    #[test]
+    fn piped_command_output_gets_a_magic_line_at_the_end_of_the_buffer() {
+        let mut ed = test_editor("one\n");
+        submit_execute_command(&mut ed, "|printf x", false);
+        assert_eq!(ed.buf().to_string(), "x\n");
+    }
+
+    #[test]
+    fn piped_command_with_new_buffer_leaves_the_original_alone() {
+        let mut ed = test_editor("one\ntwo\n");
+        submit_execute_command(&mut ed, "|wc -l", true);
+        assert_eq!(ed.buffers.len(), 2);
+        assert_eq!(ed.buffers[0].to_string(), "one\ntwo\n");
+        assert_eq!(ed.buf().to_string().trim(), "2");
+    }
+
+    #[test]
+    fn failing_piped_command_restores_the_buffer() {
+        let mut ed = test_editor("one\ntwo\n");
+        submit_execute_command(&mut ed, "|cat; exit 3", false);
+        assert_eq!(ed.buf().to_string(), "one\ntwo\n");
+        // Back on line 1, there is no line above to take a complaint from.
+        assert_eq!(ed.status.as_deref(), Some("Error: ---"));
+    }
+
+    #[test]
+    fn failing_command_reports_the_shells_complaint() {
+        let mut ed = test_editor("");
+        submit_execute_command(
+            &mut ed,
+            "echo 'sh: 1: oops: not found' >&2; exit 127",
+            false,
+        );
+        assert_eq!(ed.buf().to_string(), "");
+        assert_eq!(ed.status.as_deref(), Some("Error: 1: oops: not found"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_piped_command_is_cancelled_and_undone() {
+        // Other tests run commands too: only interrupt this one, picked
+        // out by its distinctive argument.
+        let interrupter = std::thread::spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if let Some(pid) = crate::interrupt::armed_pid() {
+                    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                    if cmdline.ends_with(b"sleep\x0030.25\x00") {
+                        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let mut ed = test_editor("abc\n");
+        let start = std::time::Instant::now();
+        submit_execute_command(&mut ed, "|exec sleep 30.25", false);
+        interrupter.join().unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(ed.buf().to_string(), "abc\n");
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+    }
+
+    #[test]
+    fn double_bar_lets_stdout_through_but_still_captures_stderr() {
+        let mut ed = test_editor("abc\n");
+        submit_execute_command(&mut ed, "||tr a-z A-Z >&2", false);
+        assert_eq!(ed.buf().to_string(), "ABC\n");
     }
 
     #[test]
