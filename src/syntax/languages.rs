@@ -185,7 +185,13 @@ const LANGUAGES: &[LanguageDef] = &[
         shebangs: &[],
         modeline_aliases: &["c++"],
         language: lang_cpp,
-        highlights_query: include_str!("queries/cpp.scm"),
+        // Upstream's cpp query only covers what C++ adds to C, and is
+        // meant to be layered over the C query (tree-sitter-cpp's
+        // tree-sitter.json lists both, C first) -- later patterns win.
+        highlights_query: concat!(
+            include_str!("queries/c.scm"),
+            include_str!("queries/cpp.scm")
+        ),
         linter: None,
         formatter: None,
         comment: "//",

@@ -1284,6 +1284,38 @@ mod tests {
         assert_eq!(at("out.txt").as_deref(), Some("string.special"));
     }
 
+    /// tree-sitter-cpp's query only adds C++'s extras to C's, so tico
+    /// layers `cpp.scm` over `c.scm` (issue #44): comments, strings,
+    /// `#include`, primitive types and core keywords come from the C
+    /// query, `auto` from the C++ one.
+    #[test]
+    fn cpp_highlights_include_the_c_layer() {
+        let src = "// hello.cxx: a greeting\n#include <iostream>\n\nint main(int argc, char *argv[])\n{\n    std::vector<std::string> names(argv + 1, argv + argc);\n    for (const auto &name : names)\n        std::cout << \"Hello, \" << name << std::endl;\n    return 0;\n}\n";
+        let lang = languages::detect(Some(std::path::Path::new("hello.cxx")), src).unwrap();
+        assert_eq!(lang.name, "cpp");
+        let spans = highlight(src, lang);
+        let at = |needle: &str| {
+            let start = src.find(needle).unwrap();
+            spans
+                .iter()
+                .filter(|s| s.start == start && s.end == start + needle.len())
+                .map(|s| s.scope.name().to_string())
+                .next_back()
+        };
+        assert_eq!(at("// hello.cxx: a greeting").as_deref(), Some("comment"));
+        assert_eq!(at("#include").as_deref(), Some("keyword"));
+        assert_eq!(at("<iostream>").as_deref(), Some("string"));
+        assert_eq!(at("int").as_deref(), Some("type"));
+        assert_eq!(at("char").as_deref(), Some("type"));
+        assert_eq!(at("for").as_deref(), Some("keyword"));
+        assert_eq!(at("const").as_deref(), Some("keyword"));
+        assert_eq!(at("return").as_deref(), Some("keyword"));
+        assert_eq!(at("\"Hello, \"").as_deref(), Some("string"));
+        // From the C++ layer.
+        assert_eq!(at("auto").as_deref(), Some("type"));
+        assert_eq!(at("0").as_deref(), Some("constant.numeric"));
+    }
+
     /// The vendored CUE query has its generic `(identifier) @variable`
     /// pattern moved first so the specific field/type/function captures
     /// survive tico's last-wins painting.
