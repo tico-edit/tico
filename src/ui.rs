@@ -1203,7 +1203,7 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             } else {
                 wanted
             };
-            prompt.label = editor.writeout_prompt_label(flow.exiting);
+            prompt.label = editor.writeout_prompt_label(flow);
             false
         }
         // `M-B` Backup File at the Write Out prompt: nano's `back_it_up`
@@ -1216,8 +1216,40 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             };
             if !editor.options.restricted {
                 editor.options.backup = !editor.options.backup;
-                prompt.label = editor.writeout_prompt_label(flow.exiting);
+                prompt.label = editor.writeout_prompt_label(flow);
             }
+            false
+        }
+        // `M-A` Append / `M-P` Prepend at the Write Out prompt: nano's
+        // `append_it`/`prepend_it` switch to that method, or back to
+        // overwriting if it already was. The buffer's own name, if that's
+        // what was offered, is cleared -- appending a file to itself is
+        // rarely what's meant. Ignored in restricted mode.
+        Action::Append | Action::Prepend => {
+            let PromptKind::WriteOut { flow } = &mut prompt.kind else {
+                return false;
+            };
+            if editor.options.restricted {
+                return false;
+            }
+            use crate::app::WriteMethod;
+            let wanted = if action == Action::Append {
+                WriteMethod::Append
+            } else {
+                WriteMethod::Prepend
+            };
+            flow.method = if flow.method == wanted {
+                WriteMethod::Overwrite
+            } else {
+                wanted
+            };
+            let flow = *flow;
+            let own_name = editor.buf().path.as_ref().map(|p| p.display().to_string());
+            if own_name.as_deref() == Some(prompt.input.as_str()) {
+                prompt.input.clear();
+                prompt.cursor = 0;
+            }
+            prompt.label = editor.writeout_prompt_label(flow);
             false
         }
         // `^T` Browse, at the Read File and Write Out prompts: nano's
@@ -1252,16 +1284,6 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
         // messages don't show while a prompt is up (the status line is the
         // prompt itself), so this closes the prompt to make the message
         // visible, same as a real result would.
-        Action::Append => {
-            editor.mode = Mode::Editing;
-            editor.set_status("Append: not yet implemented");
-            true
-        }
-        Action::Prepend => {
-            editor.mode = Mode::Editing;
-            editor.set_status("Prepend: not yet implemented");
-            true
-        }
         // `^T`/`^Y`/`^O` from within the Insert-File/Execute-Command
         // prompt run the tool immediately, ignoring whatever was typed —
         // matches nano's `ran_a_tool` flag, which makes `insert_a_file_or`
@@ -3824,9 +3846,7 @@ const INSERT_SHORTCUTS: &[(Action, &str)] = &[
 ];
 
 /// The `^O` Write Out prompt's shortcut list, matching nano 8.7's
-/// MWRITEFILE bar (confirmed against the installed nano). Append and
-/// Prepend aren't implemented yet but are listed rather than silently
-/// omitted.
+/// MWRITEFILE bar (confirmed against the installed nano).
 const WRITEOUT_SHORTCUTS: &[(Action, &str)] = &[
     (Action::Help, "Help"),
     (Action::Cancel, "Cancel"),
@@ -4982,6 +5002,7 @@ mod tests {
                     exiting: false,
                     withprompt: true,
                     maychange: true,
+                    method: crate::app::WriteMethod::Overwrite,
                 },
             },
             menu: Menu::WriteOut,
@@ -5355,6 +5376,7 @@ mod tests {
                     exiting: false,
                     withprompt: true,
                     maychange: true,
+                    method: crate::app::WriteMethod::Overwrite,
                 },
             },
             menu: Menu::WriteOut,
@@ -5673,6 +5695,7 @@ mod tests {
             exiting: false,
             withprompt: true,
             maychange: true,
+            method: crate::app::WriteMethod::Overwrite,
         };
         ed.mode = Mode::Prompt(Prompt {
             kind: PromptKind::WriteOut { flow },
@@ -5721,40 +5744,6 @@ mod tests {
         assert!(text.contains("Go To Dir"), "{text}");
         assert!(text.contains("Where Was"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn unimplemented_write_out_actions_report_plainly_and_close_the_prompt() {
-        for (action, expected) in [
-            (Action::Append, "Append: not yet implemented"),
-            (Action::Prepend, "Prepend: not yet implemented"),
-        ] {
-            let mut ed = test_editor("x");
-            let mut prompt = Prompt {
-                kind: PromptKind::WriteOut {
-                    flow: crate::app::WriteFlow {
-                        exiting: false,
-                        withprompt: true,
-                        maychange: true,
-                    },
-                },
-                menu: Menu::WriteOut,
-                label: "Write Out".to_string(),
-                input: String::new(),
-                cursor: 0,
-                history_pos: None,
-                saved_input: None,
-            };
-            assert!(
-                apply_prompt_action(&mut ed, &mut prompt, action),
-                "{action:?}"
-            );
-            assert!(
-                matches!(ed.mode, Mode::Editing),
-                "{action:?} should close the prompt"
-            );
-            assert_eq!(ed.status.as_deref(), Some(expected), "{action:?}");
-        }
     }
 
     #[test]
@@ -6023,6 +6012,69 @@ mod tests {
         assert_eq!(ed.buf().mark, None);
     }
 
+    /// `^O`'s flow for a named buffer.
+    fn plain_write_flow() -> crate::app::WriteFlow {
+        crate::app::WriteFlow {
+            exiting: false,
+            withprompt: true,
+            maychange: true,
+            method: crate::app::WriteMethod::Overwrite,
+        }
+    }
+
+    #[test]
+    fn append_and_prepend_toggle_the_method_label_and_clear_the_own_name() {
+        use crate::app::WriteMethod;
+        let mut ed = test_editor("x\n");
+        ed.buf_mut().path = Some("t.txt".into());
+        let flow = plain_write_flow();
+        let mut prompt = Prompt {
+            kind: PromptKind::WriteOut { flow },
+            menu: Menu::WriteOut,
+            label: ed.writeout_prompt_label(flow),
+            input: "t.txt".to_string(),
+            cursor: 5,
+            history_pos: None,
+            saved_input: None,
+        };
+        let method = |p: &Prompt| match p.kind {
+            PromptKind::WriteOut { flow } => flow.method,
+            _ => panic!("not the Write Out prompt"),
+        };
+        // Confirmed against the installed nano 8.7.1.
+        assert!(!apply_prompt_action(&mut ed, &mut prompt, Action::Append));
+        assert_eq!(method(&prompt), WriteMethod::Append);
+        assert_eq!(prompt.label, "Append to File");
+        assert_eq!((prompt.input.as_str(), prompt.cursor), ("", 0));
+        assert!(!apply_prompt_action(&mut ed, &mut prompt, Action::Prepend));
+        assert_eq!(prompt.label, "Prepend to File");
+        assert!(!apply_prompt_action(&mut ed, &mut prompt, Action::Prepend));
+        assert_eq!(method(&prompt), WriteMethod::Overwrite);
+        assert_eq!(prompt.label, "Write to File");
+
+        // Another name stays.
+        prompt.input = "o.txt".to_string();
+        apply_prompt_action(&mut ed, &mut prompt, Action::Append);
+        assert_eq!(prompt.input, "o.txt");
+
+        ed.buf_mut().mark = Some(crate::buffer::Pos::new(0, 0));
+        ed.buf_mut().format = crate::buffer::LineFormat::Dos;
+        ed.options.backup = true;
+        apply_prompt_action(&mut ed, &mut prompt, Action::Prepend);
+        assert_eq!(
+            prompt.label,
+            "Prepend Selection to File [DOS Format] [Backup]"
+        );
+
+        ed.options.restricted = true;
+        apply_prompt_action(&mut ed, &mut prompt, Action::Append);
+        assert_eq!(
+            method(&prompt),
+            WriteMethod::Prepend,
+            "ignored when restricted"
+        );
+    }
+
     #[test]
     fn dos_and_mac_toggles_at_the_write_out_prompt_flip_label_and_format() {
         use crate::buffer::LineFormat;
@@ -6033,10 +6085,11 @@ mod tests {
                     exiting: false,
                     withprompt: true,
                     maychange: true,
+                    method: crate::app::WriteMethod::Overwrite,
                 },
             },
             menu: Menu::WriteOut,
-            label: ed.writeout_prompt_label(false),
+            label: ed.writeout_prompt_label(plain_write_flow()),
             input: String::new(),
             cursor: 0,
             history_pos: None,
@@ -6083,10 +6136,11 @@ mod tests {
                     exiting: false,
                     withprompt: true,
                     maychange: true,
+                    method: crate::app::WriteMethod::Overwrite,
                 },
             },
             menu: Menu::WriteOut,
-            label: ed.writeout_prompt_label(false),
+            label: ed.writeout_prompt_label(plain_write_flow()),
             input: String::new(),
             cursor: 0,
             history_pos: None,
