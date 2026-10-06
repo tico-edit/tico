@@ -1364,19 +1364,17 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             }
             true
         }
+        // `^J` Full Justify and `^V` Cut Till End at the Execute prompt
+        // are the main menu's `M-J` / `M-T` -- nano runs the very same
+        // function and, like the tools above, closes the prompt.
+        Action::FullJustify | Action::CutRestOfFile => {
+            editor.mode = Mode::Editing;
+            editor.execute(action);
+            true
+        }
         // Bound (matching nano's full MEXECUTE menu, so the shortcut bar
-        // and ^G help show them) but not actually implemented: same
+        // and ^G help show it) but not actually implemented: same
         // plain-report convention as FlipConvert/Browser above.
-        Action::FullJustify => {
-            editor.mode = Mode::Editing;
-            editor.set_status("Full Justify: not yet implemented");
-            true
-        }
-        Action::CutRestOfFile => {
-            editor.mode = Mode::Editing;
-            editor.set_status("Cut Till End: not yet implemented");
-            true
-        }
         Action::FlipPipe => {
             editor.mode = Mode::Editing;
             editor.set_status("Pipe Text: not yet implemented");
@@ -5652,6 +5650,36 @@ mod tests {
             .iter()
             .map(|e| e.name.clone())
             .collect()
+    }
+
+    #[test]
+    fn ctrl_j_at_the_execute_prompt_justifies_the_whole_file() {
+        // Confirmed against the installed nano 8.7.1: `^T ^J` closes the
+        // prompt and does exactly what `M-J` does.
+        let mut ed = test_editor("one two\nthree four\n\nfive six\nseven\n");
+        ed.screen_cols = 80;
+        press(&mut ed, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(matches!(ed.mode, Mode::Prompt(_)));
+        press(&mut ed, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(
+            ed.buf().to_string(),
+            "one two three four\n\nfive six seven\n"
+        );
+        assert_eq!(ed.status.as_deref(), Some("Justified file"));
+    }
+
+    #[test]
+    fn ctrl_v_at_the_execute_prompt_cuts_till_the_end_of_the_file() {
+        let mut ed = test_editor("one two\nthree four\nfive\n");
+        ed.buf_mut().cursor = crate::buffer::Pos::new(1, 2);
+        press(&mut ed, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "ls");
+        press(&mut ed, KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.buf().to_string(), "one two\nth\n");
+        assert_eq!(ed.cutbuffer, "ree four\nfive\n");
+        assert_eq!(ed.status, None, "nano reports nothing after a cut");
     }
 
     #[test]

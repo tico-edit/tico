@@ -17,9 +17,6 @@ here.
 - [ ] Anchors: set, previous, next (`M-Ins` / `M-"`, `M-PgUp`, `M-PgDn` / `M-'`)
 - [ ] Macros: record and replay (`M-:` / `M-;`)
 - [ ] Pipe Text (`M-\`) at the Execute prompt
-- [ ] Cut Till End (`^V`) from the Execute menu
-- [ ] Full Justify (`^J`) from the Execute menu — main-menu `M-J` already
-      works; this path is stubbed separately in `src/ui.rs`
 - [ ] Verbatim input (`M-V`)
 
 ## Options parsed but never consulted
