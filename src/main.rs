@@ -32,6 +32,12 @@ fn main() -> anyhow::Result<()> {
     editor.theme = theme;
     editor.language_themes = language_themes;
     editor.buffers.clear();
+    // Known up front (ui::run re-reads it) so a `+LINE` below can place
+    // its viewport for the real screen height.
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        editor.screen_cols = cols as usize;
+        editor.screen_rows = rows as usize;
+    }
 
     let syntax_override = editor.options.syntax_name.clone();
     if file_args.is_empty() {
@@ -92,6 +98,10 @@ fn main() -> anyhow::Result<()> {
                 editor.mode = app::Mode::Prompt(prompt);
             }
             editor.buffers.push(buf);
+            if fa.line.is_some() {
+                editor.current = editor.buffers.len() - 1;
+                editor.place_viewport_for_cli_goto();
+            }
         }
     }
     editor.current = 0;

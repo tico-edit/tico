@@ -579,6 +579,37 @@ impl Editor {
         self.scroll_horizontal_to_cursor();
     }
 
+    /// Center the cursor's line in the viewport even when it's already
+    /// visible, matching nano's `adjust_viewport(CENTERING)` after an
+    /// interactive Go To Line (confirmed against the installed nano:
+    /// `^_ 15` from the top of a long file scrolls line 15 to mid-screen).
+    pub fn center_cursor_line(&mut self) {
+        let rows = self.text_rows();
+        let buf = self.buf_mut();
+        buf.top_line = buf.cursor.line.saturating_sub(rows / 2);
+        self.scroll_horizontal_to_cursor();
+    }
+
+    /// Place the viewport for a `+LINE[,COLUMN]` given on the command
+    /// line, matching nano's non-interactive `goto_line_and_column`: center
+    /// the target line, except that within half a screen of the end of the
+    /// file the last line goes on the bottom row instead (unless
+    /// `jumpyscrolling`) -- confirmed against the installed nano, where
+    /// `+995` in a 1000-line file shows lines 982..1001 but `^_ 995` (and
+    /// `-j +995`) shows 985..1001.
+    pub fn place_viewport_for_cli_goto(&mut self) {
+        let rows = self.text_rows();
+        let jumpy = self.options.jumpyscrolling;
+        let buf = self.buf_mut();
+        let rows_from_tail = buf.line_count().saturating_sub(1) - buf.cursor.line;
+        buf.top_line = if rows_from_tail < rows / 2 && !jumpy {
+            buf.line_count().saturating_sub(rows)
+        } else {
+            buf.cursor.line.saturating_sub(rows / 2)
+        };
+        self.scroll_horizontal_to_cursor();
+    }
+
     /// Keep nano's magic line (see `Buffer::lacks_magic_line`) under the
     /// current buffer's text unless `nonewlines`; run after every event
     /// that might have edited it.
@@ -3260,6 +3291,48 @@ mod tests {
         ed.run_search("line45".to_string().as_str(), false);
         let rows = ed.text_rows();
         assert_eq!(ed.buf().top_line, 45 - rows / 2);
+    }
+
+    /// A 1000-line file (plus nano's magic line) on a 24-row screen,
+    /// cursor already moved to `line` (0-based) as main.rs does for
+    /// `+LINE`, viewport then placed; returns the resulting top_line.
+    fn cli_goto_top_line(line: usize, jumpy: bool) -> usize {
+        let text = (1..=1000).map(|i| format!("{i}\n")).collect::<String>();
+        let mut ed = test_editor(&text);
+        ed.screen_rows = 24;
+        ed.options.jumpyscrolling = jumpy;
+        ed.ensure_magic_line();
+        ed.buf_mut().cursor = Pos::new(line, 0);
+        ed.place_viewport_for_cli_goto();
+        ed.buf().top_line
+    }
+
+    #[test]
+    fn cli_goto_centers_target_line_like_nano() {
+        // Expected values captured from the installed nano 8.7 on a
+        // 24-row terminal (20 text rows): `+500` shows 490..509, `+15`
+        // scrolls even though line 15 was already on the first screen.
+        assert_eq!(cli_goto_top_line(499, false), 489);
+        assert_eq!(cli_goto_top_line(14, false), 4);
+        assert_eq!(cli_goto_top_line(4, false), 0);
+    }
+
+    #[test]
+    fn cli_goto_near_tail_puts_last_line_at_bottom_like_nano() {
+        // nano: `+995` and `+1000` both show 982..1001 (the magic line on
+        // the bottom row); with `-j` it just centers, showing 985..
+        assert_eq!(cli_goto_top_line(994, false), 981);
+        assert_eq!(cli_goto_top_line(999, false), 981);
+        assert_eq!(cli_goto_top_line(994, true), 984);
+    }
+
+    #[test]
+    fn cli_goto_in_short_file_stays_at_top() {
+        let mut ed = test_editor("1\n2\n3\n");
+        ed.screen_rows = 24;
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.place_viewport_for_cli_goto();
+        assert_eq!(ed.buf().top_line, 0);
     }
 
     #[test]
