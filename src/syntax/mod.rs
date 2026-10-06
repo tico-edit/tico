@@ -130,6 +130,9 @@ pub fn highlight(text: &str, lang: &'static LanguageDef) -> Vec<HighlightSpan> {
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut captures = cursor.captures(&query, tree.root_node(), text.as_bytes());
     while let Some((m, capture_ix)) = captures.next() {
+        if !general_predicates_hold(&query, m) {
+            continue;
+        }
         let capture = m.captures[*capture_ix];
         if let Some(scope) = scopes[capture.index as usize] {
             spans.push(HighlightSpan {
@@ -165,6 +168,52 @@ pub fn highlight(text: &str, lang: &'static LanguageDef) -> Vec<HighlightSpan> {
     inject_inline_c(&tree, text, &mut spans);
 
     spans
+}
+
+/// nvim-treesitter's `#has-ancestor?` / `#has-parent?` predicates (and
+/// their `#not-` forms), which some vendored queries use: tree-sitter
+/// itself only applies `#eq?`/`#match?`/`#any-of?` and hands anything
+/// else back unevaluated, which would leave e.g. objc's struct-member
+/// pattern matching every identifier. Whether a capture's node has an
+/// ancestor (or parent) of one of the listed kinds. Any other predicate
+/// is still ignored.
+fn general_predicates_hold(query: &tree_sitter::Query, m: &tree_sitter::QueryMatch) -> bool {
+    use tree_sitter::QueryPredicateArg;
+    query.general_predicates(m.pattern_index).iter().all(|p| {
+        let (negated, op) = match p.operator.strip_prefix("not-") {
+            Some(op) => (true, op),
+            None => (false, &*p.operator),
+        };
+        let parent_only = match op {
+            "has-ancestor?" => false,
+            "has-parent?" => true,
+            _ => return true,
+        };
+        let Some(QueryPredicateArg::Capture(ix)) = p.args.first() else {
+            return true;
+        };
+        let kinds: Vec<&str> = p.args[1..]
+            .iter()
+            .filter_map(|a| match a {
+                QueryPredicateArg::String(kind) => Some(&**kind),
+                QueryPredicateArg::Capture(_) => None,
+            })
+            .collect();
+        let found = m.captures.iter().filter(|c| c.index == *ix).any(|c| {
+            let mut node = c.node.parent();
+            while let Some(n) = node {
+                if kinds.contains(&n.kind()) {
+                    return true;
+                }
+                if parent_only {
+                    break;
+                }
+                node = n.parent();
+            }
+            false
+        });
+        found != negated
+    })
 }
 
 fn parse(text: &str, language: &tree_sitter::Language) -> Option<tree_sitter::Tree> {
@@ -1282,6 +1331,104 @@ mod tests {
         assert_eq!(at("%%f").as_deref(), Some("variable.parameter"));
         assert_eq!(at_start_of(":sub\necho", 4).as_deref(), Some("label"));
         assert_eq!(at("out.txt").as_deref(), Some("string.special"));
+    }
+
+    /// tree-sitter-cpp's query only adds C++'s extras to C's, so tico
+    /// layers `cpp.scm` over `c.scm` (issue #44): comments, strings,
+    /// `#include`, primitive types and core keywords come from the C
+    /// query, `auto` from the C++ one.
+    #[test]
+    fn cpp_highlights_include_the_c_layer() {
+        let src = "// hello.cxx: a greeting\n#include <iostream>\n\nint main(int argc, char *argv[])\n{\n    std::vector<std::string> names(argv + 1, argv + argc);\n    for (const auto &name : names)\n        std::cout << \"Hello, \" << name << std::endl;\n    return 0;\n}\n";
+        let lang = languages::detect(Some(std::path::Path::new("hello.cxx")), src).unwrap();
+        assert_eq!(lang.name, "cpp");
+        let spans = highlight(src, lang);
+        let at = |needle: &str| {
+            let start = src.find(needle).unwrap();
+            spans
+                .iter()
+                .filter(|s| s.start == start && s.end == start + needle.len())
+                .map(|s| s.scope.name().to_string())
+                .next_back()
+        };
+        assert_eq!(at("// hello.cxx: a greeting").as_deref(), Some("comment"));
+        assert_eq!(at("#include").as_deref(), Some("keyword"));
+        assert_eq!(at("<iostream>").as_deref(), Some("string"));
+        assert_eq!(at("int").as_deref(), Some("type"));
+        assert_eq!(at("char").as_deref(), Some("type"));
+        assert_eq!(at("for").as_deref(), Some("keyword"));
+        assert_eq!(at("const").as_deref(), Some("keyword"));
+        assert_eq!(at("return").as_deref(), Some("keyword"));
+        assert_eq!(at("\"Hello, \"").as_deref(), Some("string"));
+        // From the C++ layer.
+        assert_eq!(at("auto").as_deref(), Some("type"));
+        assert_eq!(at("0").as_deref(), Some("constant.numeric"));
+    }
+
+    /// Like C++ over C, tree-sitter-typescript's query only adds
+    /// TypeScript's extras to tree-sitter-javascript's, so tico layers
+    /// `typescript.scm` over `javascript.scm`.
+    #[test]
+    fn typescript_highlights_include_the_javascript_layer() {
+        let src = "// a comment\nconst x: number = 1;\nfunction f(s: string) { return \"hi\"; }\nif (x) { let y = true; }\ninterface P { n: number }\n";
+        let lang = languages::detect(Some(std::path::Path::new("a.ts")), src).unwrap();
+        assert_eq!(lang.name, "typescript");
+        let spans = highlight(src, lang);
+        let at = |needle: &str| {
+            let start = src.find(needle).unwrap();
+            spans
+                .iter()
+                .filter(|s| s.start == start && s.end == start + needle.len())
+                .map(|s| s.scope.name().to_string())
+                .next_back()
+        };
+        assert_eq!(at("// a comment").as_deref(), Some("comment"));
+        assert_eq!(at("const").as_deref(), Some("keyword"));
+        assert_eq!(at("function").as_deref(), Some("keyword"));
+        assert_eq!(at("return").as_deref(), Some("keyword"));
+        assert_eq!(at("\"hi\"").as_deref(), Some("string"));
+        assert_eq!(at("if").as_deref(), Some("keyword"));
+        assert_eq!(at("let").as_deref(), Some("keyword"));
+        assert_eq!(at("true").as_deref(), Some("constant.builtin"));
+        assert_eq!(at("1").as_deref(), Some("constant.numeric"));
+        // From the TypeScript layer.
+        assert_eq!(at("number").as_deref(), Some("type.builtin"));
+        assert_eq!(at("string").as_deref(), Some("type.builtin"));
+        assert_eq!(at("interface").as_deref(), Some("keyword"));
+    }
+
+    /// `objc.scm` says `; inherits: c`: tico layers it over `c.scm`. It
+    /// also relies on nvim's `#has-ancestor?` (`general_predicates_hold`).
+    #[test]
+    fn objc_highlights_include_the_c_layer() {
+        let src = "// a comment\n#import <Foundation/Foundation.h>\nstruct Pos { int xpos; };\nint main(void) {\n    NSString *s = @\"hi\";\n    if (s) { return 0; }\n    return 1;\n}\n";
+        let lang = languages::detect(Some(std::path::Path::new("a.m")), src).unwrap();
+        assert_eq!(lang.name, "objc");
+        let spans = highlight(src, lang);
+        let at = |needle: &str| {
+            let start = src.find(needle).unwrap();
+            spans
+                .iter()
+                .filter(|s| s.start == start && s.end == start + needle.len())
+                .map(|s| s.scope.name().to_string())
+                .next_back()
+        };
+        assert_eq!(at("// a comment").as_deref(), Some("comment"));
+        assert_eq!(at("<Foundation/Foundation.h>").as_deref(), Some("string"));
+        assert_eq!(at("int").as_deref(), Some("type"));
+        assert_eq!(at("void").as_deref(), Some("type"));
+        assert_eq!(at("if").as_deref(), Some("keyword"));
+        assert_eq!(at("return").as_deref(), Some("keyword"));
+        assert_eq!(at("@\"hi\"").as_deref(), Some("string"));
+        assert_eq!(at("NSString").as_deref(), Some("type"));
+        assert_eq!(at("main").as_deref(), Some("function"));
+        // `(identifier) @property (#has-ancestor? @property
+        // struct_declaration)` must hold only inside a struct -- unevaluated,
+        // it repainted every identifier, `main` included, as a member.
+        assert_eq!(at("xpos").as_deref(), Some("variable.other.member"));
+        // From the Objective-C layer.
+        assert_eq!(at("#import").as_deref(), Some("keyword.control.import"));
+        assert_eq!(at("0").as_deref(), Some("constant.numeric"));
     }
 
     /// The vendored CUE query has its generic `(identifier) @variable`

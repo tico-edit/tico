@@ -185,7 +185,13 @@ const LANGUAGES: &[LanguageDef] = &[
         shebangs: &[],
         modeline_aliases: &["c++"],
         language: lang_cpp,
-        highlights_query: include_str!("queries/cpp.scm"),
+        // Upstream's cpp query only covers what C++ adds to C, and is
+        // meant to be layered over the C query (tree-sitter-cpp's
+        // tree-sitter.json lists both, C first) -- later patterns win.
+        highlights_query: concat!(
+            include_str!("queries/c.scm"),
+            include_str!("queries/cpp.scm")
+        ),
         linter: None,
         formatter: None,
         comment: "//",
@@ -360,7 +366,15 @@ const LANGUAGES: &[LanguageDef] = &[
         shebangs: &["ts-node", "deno"],
         modeline_aliases: &["ts"],
         language: lang_typescript,
-        highlights_query: include_str!("queries/typescript.scm"),
+        // Like cpp: upstream's typescript query only covers what
+        // TypeScript adds to JavaScript, and tree-sitter-typescript's
+        // tree-sitter.json pairs it with the javascript one. That list
+        // puts TypeScript's first for the CLI's first-match-wins; under
+        // tico's last-wins painting the base query goes first instead.
+        highlights_query: concat!(
+            include_str!("queries/javascript.scm"),
+            include_str!("queries/typescript.scm")
+        ),
         linter: None,
         formatter: None,
         comment: "//",
@@ -456,7 +470,12 @@ const LANGUAGES: &[LanguageDef] = &[
         shebangs: &[],
         modeline_aliases: &["objc", "objective-c"],
         language: lang_objc,
-        highlights_query: include_str!("queries/objc.scm"),
+        // objc.scm opens with `; inherits: c` (nvim-treesitter's way of
+        // saying it's layered over the C query), so the same as cpp.
+        highlights_query: concat!(
+            include_str!("queries/c.scm"),
+            include_str!("queries/objc.scm")
+        ),
         linter: None,
         formatter: None,
         comment: "//",
