@@ -125,10 +125,11 @@ pub fn apply(
             Ok(())
         }
         "tabsize" => {
-            if let Some(v) = arg.and_then(|s| s.parse::<u32>().ok())
-                && v > 0
-            {
-                options.tabsize = v;
+            if let Some(v) = arg {
+                match v.parse::<u32>() {
+                    Ok(n) if n > 0 => options.tabsize = n,
+                    _ => return Err(format!("Requested tab size \"{v}\" is invalid")),
+                }
             }
             Ok(())
         }
@@ -163,7 +164,7 @@ pub fn apply(
         "stripecolor" => set_color(&mut options.stripecolor, arg),
         "titlecolor" => set_color(&mut options.titlecolor, arg),
 
-        _ => Err(format!("unknown option: {name}")),
+        _ => Err(format!("Unknown option: {name}")),
     }
 }
 
@@ -181,6 +182,24 @@ fn set_color(field: &mut options::ColorPair, arg: Option<&str>) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bad_tabsize_and_unknown_options_are_reported_in_nanos_words() {
+        let mut o = Options::default();
+        for bad in ["x", "0", "-2"] {
+            assert_eq!(
+                apply(&mut o, "tabsize", Some(bad), true),
+                Err(format!("Requested tab size \"{bad}\" is invalid"))
+            );
+        }
+        assert_eq!(o.tabsize, Options::default().tabsize);
+        assert_eq!(apply(&mut o, "tabsize", Some("4"), true), Ok(()));
+        assert_eq!(o.tabsize, 4);
+        assert_eq!(
+            apply(&mut o, "bogus", None, true),
+            Err("Unknown option: bogus".to_string())
+        );
+    }
 
     #[test]
     fn matchbrackets_needs_an_even_number_of_non_blank_characters() {

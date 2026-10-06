@@ -49,6 +49,7 @@ fn main() -> anyhow::Result<()> {
         match fileio::resolve_directory(&dir) {
             Some(full) => options.backupdir = Some(full),
             None => {
+                print_config_warnings(&loaded.warnings);
                 eprintln!("Invalid backup directory: {dir}");
                 std::process::exit(1);
             }
@@ -61,6 +62,7 @@ fn main() -> anyhow::Result<()> {
                 options.operatingdir = Some(full);
             }
             _ => {
+                print_config_warnings(&loaded.warnings);
                 eprintln!("Invalid operating directory: {dir}");
                 std::process::exit(1);
             }
@@ -69,9 +71,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut warnings = loaded.warnings;
     let (theme, language_themes) = theme::resolve_themes(&options, &mut warnings);
-    for w in &warnings {
-        eprintln!("tico: {w}");
-    }
+    // nano reports the gist on the status bar at startup and the details
+    // on stderr once the screen is restored. A theme problem has no file
+    // to name, so it stands for itself.
+    let startup_problem = loaded.startup_problem.or_else(|| warnings.first().cloned());
 
     let file_args = cli::parse_file_args(&cli.files);
     let mut editor = app::Editor::new(options, loaded.keymap);
@@ -173,13 +176,27 @@ fn main() -> anyhow::Result<()> {
         editor.buffers.push(buf);
     }
     editor.current = 0;
+    if let Some(problem) = startup_problem {
+        editor.set_status_alert(problem);
+    }
 
-    ui::run(&mut editor)?;
+    let result = ui::run(&mut editor);
+    print_config_warnings(&warnings);
+    result?;
 
     if editor.options.historylog {
         editor.history.save();
     }
     Ok(())
+}
+
+/// nano's `display_rcfile_errors`: once the terminal is back to normal
+/// (or before bailing out early), list every configuration problem on
+/// stderr, one per line.
+fn print_config_warnings(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("{w}");
+    }
 }
 
 /// Print the names of tico's built-in syntax-highlighting languages, for
