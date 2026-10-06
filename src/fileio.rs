@@ -347,6 +347,25 @@ pub fn save_file(buffer: &mut Buffer, path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// nano's `outside_of_confinement`: whether `path` lies outside the
+/// operating directory `opdir` (`set operatingdir`, already resolved by
+/// `resolve_directory`'s rules; `None` confines nothing). A path whose
+/// directory doesn't exist counts as inside -- unless `tabbing`, where it
+/// counts as outside, but a directory on the way down *to* `opdir`
+/// counts as inside, so that completion can reach it.
+pub fn outside_of_confinement(opdir: Option<&str>, path: &Path, tabbing: bool) -> bool {
+    let Some(opdir) = opdir else {
+        return false;
+    };
+    let Some(full) = full_path(path) else {
+        return tabbing;
+    };
+    let opdir = Path::new(opdir);
+    let is_inside = full.starts_with(opdir);
+    let begins_to_be = tabbing && opdir.starts_with(&full);
+    !is_inside && !begins_to_be
+}
+
 /// How the Write Out prompt puts text into the file (nano's
 /// `kind_of_writing_type`, toggled there with `M-A` and `M-P`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,10 +408,11 @@ pub fn write_by_method(path: &Path, bytes: &[u8], method: WriteMethod) -> Result
     Ok(())
 }
 
-/// nano's `init_backup_dir`: `dir` (from `-C`/`set backupdir`) made
-/// absolute with a trailing slash, or `None` when it doesn't name an
-/// existing directory -- which nano treats as fatal at startup.
-pub fn resolve_backup_dir(dir: &str) -> Option<String> {
+/// nano's `init_backup_dir` (and, for `set operatingdir`,
+/// `init_operating_dir`): `dir` made absolute with a trailing slash, or
+/// `None` when it doesn't name an existing directory -- which nano treats
+/// as fatal at startup.
+pub fn resolve_directory(dir: &str) -> Option<String> {
     let full = full_path(Path::new(dir))?;
     if !full.is_dir() {
         return None;
@@ -422,7 +442,7 @@ fn next_free_name(name: &str, suffix: &str) -> Option<String> {
 
 /// Where `make_backup_of` first tries to put the backup of `realname`:
 /// without a backup directory, `realname~` alongside it; with one (`dir`,
-/// as `resolve_backup_dir` left it), a numbered name in that directory
+/// as `resolve_directory` left it), a numbered name in that directory
 /// built from the file's full path with each `/` turned into `!`.
 fn backup_name(realname: &Path, dir: Option<&str>) -> Option<String> {
     let Some(dir) = dir else {
@@ -966,17 +986,47 @@ mod tests {
     fn backup_dir_must_be_an_existing_directory() {
         let dir = std::env::temp_dir().join(format!("tico_test_backupdir_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let resolved = resolve_backup_dir(&dir.to_string_lossy()).unwrap();
+        let resolved = resolve_directory(&dir.to_string_lossy()).unwrap();
         assert!(resolved.ends_with('/'), "{resolved}");
         assert!(Path::new(&resolved).is_absolute());
         let file = dir.join("plain");
         std::fs::write(&file, "x").unwrap();
-        assert_eq!(resolve_backup_dir(&file.to_string_lossy()), None);
+        assert_eq!(resolve_directory(&file.to_string_lossy()), None);
         assert_eq!(
-            resolve_backup_dir(&dir.join("missing").to_string_lossy()),
+            resolve_directory(&dir.join("missing").to_string_lossy()),
             None
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn confinement_follows_nanos_outside_of_confinement() {
+        let base = std::env::temp_dir().join(format!("tico_test_confine_{}", std::process::id()));
+        let inner = base.join("op");
+        std::fs::create_dir_all(inner.join("sub")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        let opdir = resolve_directory(&inner.to_string_lossy()).unwrap();
+        let op = Some(opdir.as_str());
+        let out = |p: &Path, tabbing| outside_of_confinement(op, p, tabbing);
+
+        assert!(!outside_of_confinement(
+            None,
+            Path::new("/etc/passwd"),
+            false
+        ));
+        assert!(!out(&inner, false), "the directory itself is inside");
+        assert!(!out(&inner.join("sub/new.txt"), false));
+        assert!(out(&base.join("other/x"), false));
+        assert!(out(&inner.join("../other"), false), "`..` is resolved");
+        // A name in a directory that doesn't exist counts as inside,
+        // except when completing.
+        assert!(!out(&base.join("nowhere/x"), false));
+        assert!(out(&base.join("nowhere/x"), true));
+        // Completing, the way down to the operating directory is open.
+        assert!(out(&base, false));
+        assert!(!out(&base, true));
+        assert!(out(&base.join("other"), true));
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

@@ -741,6 +741,9 @@ impl Editor {
             self.set_status_mild("Key is invalid in view mode");
             return;
         }
+        if self.refused_in_restricted_mode(action) {
+            return;
+        }
         // Any action other than Cut clears nano's "consecutive cuts append
         // to the same cutbuffer" chain.
         if !matches!(action, Cut | CutRestOfFile) {
@@ -749,7 +752,12 @@ impl Editor {
         let was_line = self.buffers.get(self.current).map(|b| b.cursor.line);
         match action {
             Help => {
-                let lines = crate::help::build(Menu::Main, &self.keymap, self.screen_cols);
+                let lines = crate::help::build(
+                    Menu::Main,
+                    &self.keymap,
+                    self.screen_cols,
+                    self.options.restricted,
+                );
                 self.mode = Mode::Help {
                     lines,
                     top: 0,
@@ -1291,6 +1299,24 @@ impl Editor {
         self.options.view && action_changes_something(action)
     }
 
+    /// nano's `in_restricted_mode()` check at the top of the functions
+    /// that would read, write or run something not named on the command
+    /// line: under `--restricted`, say so (with a beep) and return true.
+    pub(crate) fn refused_in_restricted_mode(&mut self, action: Action) -> bool {
+        use Action::*;
+        if !self.options.restricted
+            || !matches!(
+                action,
+                Insert | Execute | Suspend | Speller | Linter | Formatter
+            )
+        {
+            return false;
+        }
+        self.set_status_mild("This function is disabled in restricted mode");
+        self.bell_pending = true;
+        true
+    }
+
     /// What the spell checker and formatter operate on: the marked
     /// selection if one is active, otherwise the whole buffer — matching
     /// nano's own `write_region_to_file`/`write_file` choice in `do_spell`.
@@ -1786,7 +1812,7 @@ impl Editor {
                 execute: false,
             },
             menu: Menu::Insert,
-            label: insert_prompt_label(new_buffer, false, self.options.noconvert),
+            label: insert_prompt_label(new_buffer, false, self.options.noconvert, self.read_from()),
             input: String::new(),
             cursor: 0,
             history_pos: None,
@@ -1805,7 +1831,7 @@ impl Editor {
                 execute: true,
             },
             menu: Menu::Execute,
-            label: insert_prompt_label(new_buffer, true, self.options.noconvert),
+            label: insert_prompt_label(new_buffer, true, self.options.noconvert, self.read_from()),
             input: String::new(),
             cursor: 0,
             history_pos: None,
@@ -1902,6 +1928,13 @@ impl Editor {
             None => name_exists,
             Some(own) => crate::fileio::full_path(path) != crate::fileio::full_path(own),
         };
+        if do_warning && self.options.restricted {
+            // Restricted mode may neither overwrite another file nor
+            // rename the buffer; back to the prompt.
+            self.brief_warnings
+                .push("File exists -- cannot overwrite".to_string());
+            return self.prompt_for_write(flow, answer);
+        }
         if do_warning {
             if !flow.maychange && (flow.exiting || self.buf().mark.is_none()) {
                 self.ask_write_question(WriteQuestion::DifferentName, answer, flow);
@@ -2032,6 +2065,9 @@ impl Editor {
     fn finish_write(&mut self, answer: &str, flow: WriteFlow) {
         // nano's write_file expands a leading ~ or ~user.
         let path = std::path::PathBuf::from(crate::fileio::expand_leading_tilde(answer));
+        if self.refused_outside_confinement(&path) {
+            return;
+        }
         let forced = self.buf().mark.is_some() || flow.method != WriteMethod::Overwrite;
         if let Some(meta) = crate::fileio::needs_backup(
             &self.options,
@@ -2080,6 +2116,7 @@ impl Editor {
         // nano: the selection stays highlighted afterward).
         if flow.withprompt
             && !flow.exiting
+            && !self.options.restricted
             && let Some((start, end)) = self.selection_range()
         {
             let mut selected = self.buf().text_range(start, end);
@@ -2137,12 +2174,33 @@ impl Editor {
         }
     }
 
+    /// Where the `^R` prompt reads a relative name from, for its label:
+    /// the operating directory, if one is set.
+    pub(crate) fn read_from(&self) -> &str {
+        self.options.operatingdir.as_deref().unwrap_or("./")
+    }
+
+    /// `set operatingdir`: nano's `write_file` refusing a path outside it
+    /// ("Can't write outside of DIR"). Returns whether it refused.
+    fn refused_outside_confinement(&mut self, path: &std::path::Path) -> bool {
+        let opdir = self.options.operatingdir.clone();
+        if !crate::fileio::outside_of_confinement(opdir.as_deref(), path, false) {
+            return false;
+        }
+        let opdir = opdir.unwrap_or_default();
+        self.set_status_alert(format!("Can't write outside of {opdir}"));
+        true
+    }
+
     /// nano's `write_file(..., NONOTES)`: write the whole buffer to `path`
     /// without marking it saved or renaming it. tico still refreshes the
     /// buffer's disk snapshot, which only its own external-change watcher
     /// reads, so that watcher doesn't then report tico's own write.
     fn write_buffer_plainly(&mut self, path: &str) -> bool {
         let path = std::path::Path::new(path);
+        if self.refused_outside_confinement(path) {
+            return false;
+        }
         match std::fs::write(path, crate::fileio::serialized(self.buf())) {
             Ok(()) => {
                 self.buf_mut().disk_state = crate::fileio::stat_disk_state(path);
@@ -2152,7 +2210,11 @@ impl Editor {
                 true
             }
             Err(e) => {
-                self.set_status_alert(format!("Error writing {}: {e}", path.display()));
+                self.set_status_alert(format!(
+                    "Error writing {}: {}",
+                    path.display(),
+                    crate::browser::strerror(&e)
+                ));
                 false
             }
         }
@@ -2238,7 +2300,11 @@ impl Editor {
                     self.close_current_buffer();
                 }
             }
-            Err(e) => self.set_status_alert(format!("Error writing {}: {e}", path.display())),
+            Err(e) => self.set_status_alert(format!(
+                "Error writing {}: {}",
+                path.display(),
+                crate::browser::strerror(&e)
+            )),
         }
     }
 
@@ -2590,14 +2656,16 @@ pub fn search_prompt_label(base: &str, suffix: &str, search: &SearchState) -> St
 
 /// The `^R` Read File prompt's label, matching the installed nano's exact
 /// wording for both states (it toggles with `M-F`, no other wording change).
-pub fn insert_prompt_label(new_buffer: bool, execute: bool, noconvert: bool) -> String {
+/// `from` is where a relative name is read from: `./`, or the operating
+/// directory under `set operatingdir`.
+pub fn insert_prompt_label(new_buffer: bool, execute: bool, noconvert: bool, from: &str) -> String {
     match (execute, new_buffer, noconvert) {
         (true, true, _) => "Command to execute in new buffer".to_string(),
         (true, false, _) => "Command to execute".to_string(),
-        (false, true, false) => "File to read into new buffer [from ./]".to_string(),
-        (false, true, true) => "File to read unconverted into new buffer [from ./]".to_string(),
-        (false, false, false) => "File to insert [from ./]".to_string(),
-        (false, false, true) => "File to insert unconverted [from ./]".to_string(),
+        (false, true, false) => format!("File to read into new buffer [from {from}]"),
+        (false, true, true) => format!("File to read unconverted into new buffer [from {from}]"),
+        (false, false, false) => format!("File to insert [from {from}]"),
+        (false, false, true) => format!("File to insert unconverted [from {from}]"),
     }
 }
 
@@ -3238,6 +3306,86 @@ mod tests {
     }
 
     #[test]
+    fn restricted_mode_refuses_what_would_reach_outside_files() {
+        for action in [Action::Insert, Action::Execute] {
+            let mut ed = test_editor("x");
+            ed.options.restricted = true;
+            ed.execute(action);
+            assert!(matches!(ed.mode, Mode::Editing), "{action:?}");
+            assert_eq!(
+                ed.status.as_deref(),
+                Some("This function is disabled in restricted mode")
+            );
+            assert!(ed.bell_pending);
+        }
+        let mut ed = test_editor("x");
+        ed.options.restricted = true;
+        ed.execute(Action::End);
+        assert_eq!(ed.status, None, "everything else still works");
+        assert_eq!(ed.buf().cursor, Pos::new(0, 1));
+    }
+
+    #[test]
+    fn restricted_mode_will_not_overwrite_another_file_or_write_a_selection() {
+        let dir = write_test_dir("restricted_write");
+        let existing = dir.join("existing.txt");
+        std::fs::write(&existing, "keep\n").unwrap();
+        let mut ed = test_editor("new\n");
+        ed.options.restricted = true;
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &existing.display().to_string());
+        assert_eq!(ed.brief_warnings, ["File exists -- cannot overwrite"]);
+        assert!(matches!(
+            &ed.mode,
+            Mode::Prompt(p) if matches!(p.kind, PromptKind::WriteOut { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "keep\n");
+
+        // With a mark, still the whole buffer, under the plain label.
+        let own = dir.join("own.txt");
+        let mut ed = editor_on_file(&own, "old\n", "one\ntwo\n");
+        ed.options.restricted = true;
+        ed.buf_mut().mark = Some(Pos::new(0, 0));
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.execute(Action::WriteOut);
+        let Mode::Prompt(p) = &ed.mode else {
+            panic!("expected the Write Out prompt");
+        };
+        assert_eq!(p.label, "Write to File");
+        submit_write(&mut ed, &own.display().to_string());
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "one\ntwo\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operatingdir_refuses_writes_outside_it() {
+        let dir = write_test_dir("opdir_write");
+        std::fs::create_dir(dir.join("op")).unwrap();
+        let opdir = crate::fileio::resolve_directory(&dir.join("op").to_string_lossy()).unwrap();
+        let inside = dir.join("op/in.txt");
+        let outside = dir.join("out.txt");
+        let mut ed = test_editor("text\n");
+        ed.options.operatingdir = Some(opdir.clone());
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &outside.display().to_string());
+        assert_eq!(
+            ed.status.as_deref(),
+            Some(format!("Can't write outside of {opdir}").as_str())
+        );
+        assert!(!outside.exists());
+        ed.execute(Action::WriteOut);
+        submit_write(&mut ed, &inside.display().to_string());
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "text\n");
+
+        ed.execute(Action::Insert);
+        let Mode::Prompt(p) = &ed.mode else {
+            panic!("expected the Read File prompt");
+        };
+        assert_eq!(p.label, format!("File to insert [from {opdir}]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn set_backup_keeps_the_previous_contents_as_name_tilde() {
         let dir = write_test_dir("backup_tilde");
         let own = dir.join("own.txt");
@@ -3275,7 +3423,7 @@ mod tests {
         let own = dir.join("own.txt");
         let mut ed = editor_on_file(&own, "one", "two");
         ed.options.backup = true;
-        ed.options.backupdir = crate::fileio::resolve_backup_dir(&backups.to_string_lossy());
+        ed.options.backupdir = crate::fileio::resolve_directory(&backups.to_string_lossy());
         ed.execute(Action::SaveFile);
         ed.buf_mut().insert_str("three ");
         ed.execute(Action::SaveFile);

@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 /// Build the help screen for `menu`. Element 0 is the title, shown on its
 /// own reverse-video row and never scrolled; the rest is the scrollable
 /// body, already word-wrapped to `width` columns.
-pub fn build(menu: Menu, keymap: &KeyMap, width: usize) -> Vec<String> {
+/// `restricted` leaves out what nano's restricted mode doesn't offer (see
+/// `keymap::hidden_when_restricted`).
+pub fn build(menu: Menu, keymap: &KeyMap, width: usize, restricted: bool) -> Vec<String> {
     let width = width.max(20);
     let (title, paragraphs) = intro_for(menu);
 
@@ -25,7 +27,7 @@ pub fn build(menu: Menu, keymap: &KeyMap, width: usize) -> Vec<String> {
         lines.extend(wrap(para, width.saturating_sub(1)));
         lines.push(String::new());
     }
-    lines.extend(shortcut_lines(menu, keymap));
+    lines.extend(shortcut_lines(menu, keymap, restricted));
     lines
 }
 
@@ -250,7 +252,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// this help text"), built from the live keymap rather than a static
 /// table — grouping every key bound to the same action onto one line, the
 /// way nano shows a primary key plus its alternates in parentheses.
-fn shortcut_lines(menu: Menu, keymap: &KeyMap) -> Vec<String> {
+fn shortcut_lines(menu: Menu, keymap: &KeyMap, restricted: bool) -> Vec<String> {
     let mut by_description: BTreeMap<&'static str, Vec<Key>> = BTreeMap::new();
     for ((m, key), binding) in keymap.entries() {
         if *m != menu {
@@ -265,6 +267,9 @@ fn shortcut_lines(menu: Menu, keymap: &KeyMap) -> Vec<String> {
             // Nor is Enter, anywhere but the main menu: it's how a prompt
             // (or the browser's selection) is accepted, not a function.
             if *action == Action::Enter && menu != Menu::Main {
+                continue;
+            }
+            if restricted && crate::keymap::hidden_when_restricted(menu, *action) {
                 continue;
             }
             by_description
@@ -309,8 +314,8 @@ mod tests {
     #[test]
     fn search_and_replace_get_distinct_intros() {
         let km = KeyMap::defaults(false);
-        let search = build(Menu::Search, &km, 80);
-        let replace_with = build(Menu::ReplaceWith, &km, 80);
+        let search = build(Menu::Search, &km, 80, false);
+        let replace_with = build(Menu::ReplaceWith, &km, 80, false);
         assert_eq!(search[0], "Search Command Help Text");
         assert_eq!(replace_with[0], "=== Replacement ===");
         assert_ne!(search[0], replace_with[0]);
@@ -319,7 +324,7 @@ mod tests {
     #[test]
     fn shortcut_listing_reflects_live_keymap() {
         let km = KeyMap::defaults(false);
-        let lines = build(Menu::Main, &km, 80);
+        let lines = build(Menu::Main, &km, 80, false);
         assert!(
             lines
                 .iter()
