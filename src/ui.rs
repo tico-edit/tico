@@ -1906,8 +1906,15 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                 } else {
                     (line - 1).max(0)
                 };
-                let col = col_s.trim().parse::<i64>().unwrap_or(1).max(1) as usize - 1;
-                editor.buf_mut().cursor = Pos::new(target_line as usize, col);
+                // No column (or 0) keeps the column the cursor was aiming
+                // for, as nano's `goto_line_and_column` does.
+                let col = match col_s.trim().parse::<i64>() {
+                    Ok(c) if c > 0 => c as usize - 1,
+                    _ => editor.buf().goal_column(),
+                };
+                editor
+                    .buf_mut()
+                    .goto_line_aiming_at(target_line as usize, col);
                 editor.center_cursor_line();
             }
         }
@@ -5684,6 +5691,36 @@ mod tests {
         assert_eq!(ed.buf().to_string(), "one two\nth\n");
         assert_eq!(ed.cutbuffer, "ree four\nfive\n");
         assert_eq!(ed.status, None, "nano reports nothing after a cut");
+    }
+
+    fn goto_prompt(input: &str) -> Prompt {
+        Prompt {
+            kind: PromptKind::GotoLine,
+            menu: Menu::GotoLine,
+            label: String::new(),
+            input: input.to_string(),
+            cursor: input.chars().count(),
+            history_pos: None,
+            saved_input: None,
+        }
+    }
+
+    #[test]
+    fn go_to_line_without_a_column_keeps_the_wanted_column() {
+        // Confirmed against the installed nano 8.7.1: after Down onto a
+        // short line from column 6, `^/ 4` lands in column 6, and `^/ 2`
+        // (a short line) at its end but still aims for 6 on the way down.
+        let mut ed = test_editor("abcdefgh\nab\nabcdefgh\nabcdefgh\n");
+        ed.buf_mut().cursor = crate::buffer::Pos::new(0, 6);
+        ed.execute(Action::Down);
+        submit_prompt(&mut ed, goto_prompt("4"));
+        assert_eq!(ed.buf().cursor, crate::buffer::Pos::new(3, 6));
+        submit_prompt(&mut ed, goto_prompt("2"));
+        assert_eq!(ed.buf().cursor, crate::buffer::Pos::new(1, 2));
+        ed.execute(Action::Down);
+        assert_eq!(ed.buf().cursor, crate::buffer::Pos::new(2, 6));
+        submit_prompt(&mut ed, goto_prompt("1,3"));
+        assert_eq!(ed.buf().cursor, crate::buffer::Pos::new(0, 2));
     }
 
     #[test]

@@ -693,7 +693,7 @@ impl Editor {
                 } else if chars[col] == wanted {
                     balance -= 1;
                     if balance == 0 {
-                        self.buf_mut().set_cursor(Pos::new(line, col));
+                        self.buf_mut().cursor = Pos::new(line, col);
                         return;
                     }
                 }
