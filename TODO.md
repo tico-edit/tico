@@ -22,8 +22,7 @@ here.
       works; this path is stubbed separately in `src/ui.rs`
 - [ ] Verbatim input (`M-V`)
 - [ ] Center (`^L`) / Cycle (`M-%`)
-- [ ] Write Out prompt toggles: Append (`M-A`), Prepend (`M-P`), Backup
-      (`M-B`)
+- [ ] Write Out prompt toggles: Append (`M-A`), Prepend (`M-P`)
 
 ## Options parsed but never consulted
 
@@ -43,8 +42,6 @@ here.
 
 ### Files and safety
 
-- [ ] `backup` / `backupdir` (no backup-file machinery exists yet)
-- [ ] `allow_insecure_backup` — not even recognized by the nanorc parser
 - [ ] `positionlog` (no position-log machinery exists yet)
 - [ ] `restricted` (which, among other things, should hide the file
       browser's `^T`)

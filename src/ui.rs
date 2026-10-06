@@ -215,23 +215,28 @@ fn ring_pending_bell(editor: &mut Editor) -> io::Result<()> {
     Ok(())
 }
 
-/// nano's `warn_and_briefly_pause`: blank the shortcut bars, show the
-/// queued `brief_warning` as an Alert (errorcolor plus the bell), and hold
-/// it on screen for 1.5s so it can be read before the mode set up behind
-/// it (e.g. the "Save modified buffer?" prompt) is drawn. Keys typed
+/// nano's `warn_and_briefly_pause`: blank the shortcut bars, show each
+/// queued `brief_warnings` entry as an Alert (errorcolor plus the bell),
+/// and hold it on screen for 1.5s so it can be read before the mode set up
+/// behind it (e.g. the "Save modified buffer?" prompt) is drawn. Keys typed
 /// meanwhile stay queued for that mode, as they do across nano's `napms`.
-/// The message is dropped afterward, like nano's `lastmessage = VACUUM`.
+/// The messages are dropped afterward, like nano's `lastmessage = VACUUM`.
 fn show_brief_warning(editor: &mut Editor) -> io::Result<()> {
-    let Some(msg) = editor.brief_warning.take() else {
+    if editor.brief_warnings.is_empty() {
         return Ok(());
-    };
+    }
     let mode = std::mem::replace(&mut editor.mode, Mode::Editing);
-    editor.set_status_alert(msg);
-    render_frame(editor, true)?;
-    ring_pending_bell(editor)?;
-    std::thread::sleep(Duration::from_millis(1500));
+    for msg in std::mem::take(&mut editor.brief_warnings) {
+        editor.set_status_alert(msg);
+        render_frame(editor, true)?;
+        ring_pending_bell(editor)?;
+        std::thread::sleep(Duration::from_millis(1500));
+    }
     editor.mode = mode;
     editor.status = None;
+    if let Some(msg) = editor.status_after_warnings.take() {
+        editor.set_status(msg);
+    }
     Ok(())
 }
 
@@ -1197,6 +1202,20 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
             prompt.label = editor.writeout_prompt_label(flow.exiting);
             false
         }
+        // `M-B` Backup File at the Write Out prompt: nano's `back_it_up`
+        // flips `set backup` itself (so it sticks for later saves too) and
+        // re-shows the prompt with its " [Backup]" tag updated -- except in
+        // restricted mode, where backups are off for good.
+        Action::Backup => {
+            let PromptKind::WriteOut { flow } = prompt.kind else {
+                return false;
+            };
+            if !editor.options.restricted {
+                editor.options.backup = !editor.options.backup;
+                prompt.label = editor.writeout_prompt_label(flow.exiting);
+            }
+            false
+        }
         // `^T` Browse, at the Read File and Write Out prompts: nano's
         // `to_files`. The prompt waits behind the browser, to get the
         // chosen filename or to be shown again when the browser is left.
@@ -1237,11 +1256,6 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
         Action::Prepend => {
             editor.mode = Mode::Editing;
             editor.set_status("Prepend: not yet implemented");
-            true
-        }
-        Action::Backup => {
-            editor.mode = Mode::Editing;
-            editor.set_status("Backup File: not yet implemented");
             true
         }
         // `^T`/`^Y`/`^O` from within the Insert-File/Execute-Command
@@ -2627,7 +2641,7 @@ fn open_browser(editor: &mut Editor, prompt: &Prompt) -> bool {
     let start = match start_dir(&prompt.input) {
         Ok(dir) => dir,
         Err(msg) => {
-            editor.brief_warning = Some(msg);
+            editor.brief_warnings.push(msg);
             return false;
         }
     };
@@ -2643,7 +2657,9 @@ fn open_browser(editor: &mut Editor, prompt: &Prompt) -> bool {
             true
         }
         Err(e) => {
-            editor.brief_warning = Some(format!("Cannot open directory: {}", strerror(&e)));
+            editor
+                .brief_warnings
+                .push(format!("Cannot open directory: {}", strerror(&e)));
             false
         }
     }
@@ -3683,9 +3699,9 @@ const INSERT_SHORTCUTS: &[(Action, &str)] = &[
 ];
 
 /// The `^O` Write Out prompt's shortcut list, matching nano 8.7's
-/// MWRITEFILE bar (confirmed against the installed nano). Append,
-/// Prepend and Backup File aren't implemented yet but are listed rather
-/// than silently omitted.
+/// MWRITEFILE bar (confirmed against the installed nano). Append and
+/// Prepend aren't implemented yet but are listed rather than silently
+/// omitted.
 const WRITEOUT_SHORTCUTS: &[(Action, &str)] = &[
     (Action::Help, "Help"),
     (Action::Cancel, "Cancel"),
@@ -5493,7 +5509,6 @@ mod tests {
         for (action, expected) in [
             (Action::Append, "Append: not yet implemented"),
             (Action::Prepend, "Prepend: not yet implemented"),
-            (Action::Backup, "Backup File: not yet implemented"),
         ] {
             let mut ed = test_editor("x");
             let mut prompt = Prompt {
@@ -5837,6 +5852,40 @@ mod tests {
             !ed.buf().modified,
             "a format flip alone doesn't dirty the buffer"
         );
+    }
+
+    #[test]
+    fn backup_file_flips_set_backup_and_the_prompt_label() {
+        let mut ed = test_editor("x");
+        ed.buf_mut().format = crate::buffer::LineFormat::Dos;
+        let mut prompt = Prompt {
+            kind: PromptKind::WriteOut {
+                flow: crate::app::WriteFlow {
+                    exiting: false,
+                    withprompt: true,
+                    maychange: true,
+                },
+            },
+            menu: Menu::WriteOut,
+            label: ed.writeout_prompt_label(false),
+            input: String::new(),
+            cursor: 0,
+            history_pos: None,
+            saved_input: None,
+        };
+        assert!(
+            !apply_prompt_action(&mut ed, &mut prompt, Action::Backup),
+            "the prompt stays open"
+        );
+        assert!(ed.options.backup);
+        assert_eq!(prompt.label, "Write to File [DOS Format] [Backup]");
+        assert!(!apply_prompt_action(&mut ed, &mut prompt, Action::Backup));
+        assert!(!ed.options.backup);
+        assert_eq!(prompt.label, "Write to File [DOS Format]");
+
+        ed.options.restricted = true;
+        assert!(!apply_prompt_action(&mut ed, &mut prompt, Action::Backup));
+        assert!(!ed.options.backup, "no backups in restricted mode");
     }
 
     #[test]

@@ -106,7 +106,7 @@ pub struct WriteFlow {
 }
 
 /// The questions nano's `write_it_out` asks before writing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteQuestion {
     /// "Save file under DIFFERENT NAME? "
     DifferentName,
@@ -114,6 +114,9 @@ pub enum WriteQuestion {
     Overwrite,
     /// "File was modified since you opened it; continue saving? "
     DiskChanged,
+    /// "Cannot make backup; continue and save actual file? " (nano's
+    /// `make_backup_of`), with why the backup failed for a "No".
+    CannotBackup { reason: String },
 }
 
 /// An answer to one of nano's `ask_user` Yes/No questions.
@@ -315,11 +318,15 @@ pub struct Editor {
     /// the terminal bell once and clears this, matching nano's beep() in
     /// statusline() for ALERT-importance messages.
     pub bell_pending: bool,
-    /// A warning to flash before the next frame, nano's
-    /// `warn_and_briefly_pause`: the UI layer shows it as an Alert with the
-    /// shortcut bars blanked, holds it for 1.5s, then clears it and draws
-    /// whatever mode was set up behind it (e.g. the prompt that follows).
-    pub brief_warning: Option<String>,
+    /// Warnings to flash before the next frame, nano's
+    /// `warn_and_briefly_pause`: the UI layer shows each in turn as an
+    /// Alert with the shortcut bars blanked, holds it for 1.5s, then clears
+    /// them and draws whatever mode was set up behind them (e.g. the prompt
+    /// that follows).
+    pub brief_warnings: Vec<String>,
+    /// A plain status message to post once `brief_warnings` have been
+    /// shown (nano's `statusline(HUSH, ...)` right after its warnings).
+    pub status_after_warnings: Option<String>,
     /// The currently highlighted search/replace match, if any (position +
     /// length in characters), rendered black-on-yellow like nano's
     /// `spotlightcolor` (confirmed against the installed nano's own
@@ -396,7 +403,8 @@ impl Editor {
             status_level: StatusLevel::Normal,
             status_countdown: 0,
             bell_pending: false,
-            brief_warning: None,
+            brief_warnings: Vec::new(),
+            status_after_warnings: None,
             spotlight: None,
             spotlight_deadline: None,
             history,
@@ -1775,7 +1783,8 @@ impl Editor {
                 .as_ref()
                 .is_some_and(|known| crate::fileio::changed_on_disk_since(known, path))
         {
-            self.brief_warning = Some("File on disk has changed".to_string());
+            self.brief_warnings
+                .push("File on disk has changed".to_string());
             self.ask_write_question(WriteQuestion::DiskChanged, answer, flow);
         } else {
             self.finish_write(&answer, flow);
@@ -1795,6 +1804,9 @@ impl Editor {
             }
             WriteQuestion::DiskChanged => {
                 "File was modified since you opened it; continue saving? ".to_string()
+            }
+            WriteQuestion::CannotBackup { .. } => {
+                "Cannot make backup; continue and save actual file? ".to_string()
             }
         };
         self.mode = Mode::Prompt(Prompt {
@@ -1870,13 +1882,62 @@ impl Editor {
                     self.finish_write(&answer, flow);
                 }
             }
+            WriteQuestion::CannotBackup { reason } => {
+                if choice == YesNo::Yes {
+                    self.write_without_backup(&answer, flow);
+                } else {
+                    self.set_status(format!("Cannot make backup: {reason}"));
+                }
+            }
         }
     }
 
-    /// The end of `write_it_out`: the marked region when one was prompted
-    /// for (and not exiting), else the whole buffer.
+    /// The end of `write_it_out`: under `set backup`, first back up the
+    /// file about to be overwritten (nano's `write_file` calling
+    /// `make_backup_of`), then write.
     fn finish_write(&mut self, answer: &str, flow: WriteFlow) {
         // nano's write_file expands a leading ~ or ~user.
+        let path = std::path::PathBuf::from(crate::fileio::expand_leading_tilde(answer));
+        let marked = self.buf().mark.is_some();
+        if let Some(meta) = crate::fileio::needs_backup(
+            &self.options,
+            &path,
+            self.buf().disk_state.as_ref(),
+            marked,
+        ) {
+            let made = crate::fileio::make_backup_of(
+                &path,
+                &meta,
+                self.options.backupdir.as_deref(),
+                self.options.allow_insecure_backup,
+            );
+            match made {
+                Ok(()) => {}
+                Err(crate::fileio::BackupError::TooMany) => {
+                    self.set_status_alert("Too many existing backup files");
+                    return;
+                }
+                Err(crate::fileio::BackupError::Failed { warnings, error }) => {
+                    self.brief_warnings.extend(warnings);
+                    let reason = crate::browser::strerror(&error);
+                    // Out of disk space, the actual save would likely fail
+                    // as well, so nano doesn't offer it.
+                    if error.kind() == std::io::ErrorKind::StorageFull {
+                        self.status_after_warnings = Some(format!("Cannot make backup: {reason}"));
+                    } else {
+                        let question = WriteQuestion::CannotBackup { reason };
+                        self.ask_write_question(question, answer.to_string(), flow);
+                    }
+                    return;
+                }
+            }
+        }
+        self.write_without_backup(answer, flow);
+    }
+
+    /// Write the marked region when one was prompted for (and not
+    /// exiting), else the whole buffer.
+    fn write_without_backup(&mut self, answer: &str, flow: WriteFlow) {
         let path = std::path::PathBuf::from(crate::fileio::expand_leading_tilde(answer));
         // A marked region writes just the selection to `path` as a
         // standalone file -- it doesn't touch the current buffer's own
@@ -1938,7 +1999,7 @@ impl Editor {
                 self.write_it_out(true, true);
                 return;
             }
-            self.brief_warning = Some("No file name".to_string());
+            self.brief_warnings.push("No file name".to_string());
         }
         if self.buf().modified {
             self.mode = Mode::Prompt(Prompt {
@@ -1966,9 +2027,9 @@ impl Editor {
     }
 
     /// The Write Out prompt's label (nano 8.7's `do_writeout`), rebuilt
-    /// whenever `M-D`/`M-M` toggles the buffer's format: " [DOS Format]"
-    /// or " [Mac Format]" is appended for those formats (and " [Backup]"
-    /// under `set backup`, which tico doesn't have).
+    /// whenever `M-D`/`M-M` toggles the buffer's format or `M-B` toggles
+    /// backups: " [DOS Format]" or " [Mac Format]" is appended for those
+    /// formats, then " [Backup]" under `set backup`.
     pub(crate) fn writeout_prompt_label(&self, exiting: bool) -> String {
         use crate::buffer::LineFormat;
         let selecting = !exiting && self.buf().mark.is_some();
@@ -1977,11 +2038,13 @@ impl Editor {
         } else {
             "Write to File"
         };
-        match self.buf().format {
-            LineFormat::Dos => format!("{base} [DOS Format]"),
-            LineFormat::Mac => format!("{base} [Mac Format]"),
-            LineFormat::Unix | LineFormat::Unspecified => base.to_string(),
-        }
+        let format = match self.buf().format {
+            LineFormat::Dos => " [DOS Format]",
+            LineFormat::Mac => " [Mac Format]",
+            LineFormat::Unix | LineFormat::Unspecified => "",
+        };
+        let backup = if self.options.backup { " [Backup]" } else { "" };
+        format!("{base}{format}{backup}")
     }
 
     /// Write the whole current buffer to `path` (the Write Out prompt's
@@ -2721,7 +2784,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(ed.brief_warning.as_deref(), Some("No file name"));
+        assert_eq!(ed.brief_warnings, ["No file name"]);
     }
 
     #[test]
@@ -2729,7 +2792,7 @@ mod tests {
         let mut ed = test_editor("hello");
         ed.buf_mut().modified = true;
         ed.execute(Action::Exit);
-        assert_eq!(ed.brief_warning, None);
+        assert!(ed.brief_warnings.is_empty());
     }
 
     /// A fresh scratch directory for one write-question test.
@@ -2783,7 +2846,7 @@ mod tests {
                 kind: PromptKind::WriteConfirm { question, .. },
                 label,
                 ..
-            }) => Some((*question, label.clone())),
+            }) => Some((question.clone(), label.clone())),
             _ => None,
         }
     }
@@ -2846,6 +2909,117 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&own).unwrap(), "old");
         assert_eq!(ed.buf().path.as_deref(), Some(other.as_path()));
         assert!(!ed.buf().modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_backup_keeps_the_previous_contents_as_name_tilde() {
+        let dir = write_test_dir("backup_tilde");
+        let own = dir.join("own.txt");
+        let mut ed = editor_on_file(&own, "old", "new");
+        ed.execute(Action::SaveFile);
+        assert!(
+            !dir.join("own.txt~").exists(),
+            "no backup without set backup"
+        );
+
+        let mut ed = editor_on_file(&own, "old", "new");
+        ed.options.backup = true;
+        ed.execute(Action::SaveFile);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("own.txt~")).unwrap(),
+            "old"
+        );
+        // The tilde backup is simply replaced on the next save.
+        ed.buf_mut().insert_str("newer ");
+        ed.execute(Action::SaveFile);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("own.txt~")).unwrap(),
+            "new"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backupdir_backups_are_numbered_and_named_after_the_full_path() {
+        let dir = write_test_dir("backupdir");
+        let backups = dir.join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        let own = dir.join("own.txt");
+        let mut ed = editor_on_file(&own, "one", "two");
+        ed.options.backup = true;
+        ed.options.backupdir = crate::fileio::resolve_backup_dir(&backups.to_string_lossy());
+        ed.execute(Action::SaveFile);
+        ed.buf_mut().insert_str("three ");
+        ed.execute(Action::SaveFile);
+
+        let mangled = std::fs::canonicalize(&own)
+            .unwrap()
+            .to_string_lossy()
+            .replace('/', "!");
+        let first = backups.join(format!("{mangled}~"));
+        let second = backups.join(format!("{mangled}~.1"));
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "two");
+        assert!(!dir.join("own.txt~").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_backup_of_a_file_changed_on_disk() {
+        let dir = write_test_dir("backup_changed");
+        let own = dir.join("own.txt");
+        let mut ed = editor_on_file(&own, "old", "mine");
+        ed.options.backup = true;
+        touch_on_disk(&own, "theirs");
+        ed.execute(Action::SaveFile);
+        answer(&mut ed, YesNo::Yes);
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "mine");
+        assert!(!dir.join("own.txt~").exists(), "nano skips the backup here");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_backup_asks_whether_to_save_anyway() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root can read the unreadable file
+        }
+        let dir = write_test_dir("backup_fails");
+        let own = dir.join("own.txt");
+        let mut ed = editor_on_file(&own, "old", "new");
+        ed.options.backup = true;
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        ed.execute(Action::SaveFile);
+        assert_eq!(
+            ed.brief_warnings,
+            ["Cannot read original file", "Permission denied"]
+        );
+        let (question, label) = write_question(&ed).unwrap();
+        assert_eq!(
+            question,
+            WriteQuestion::CannotBackup {
+                reason: "Permission denied".to_string()
+            }
+        );
+        assert_eq!(label, "Cannot make backup; continue and save actual file? ");
+        answer(&mut ed, YesNo::No);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("Cannot make backup: Permission denied")
+        );
+        assert!(ed.buf().modified, "not saved");
+
+        ed.brief_warnings.clear();
+        ed.execute(Action::SaveFile);
+        answer(&mut ed, YesNo::Yes);
+        assert!(!ed.buf().modified, "saved without a backup");
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "new");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3004,10 +3178,7 @@ mod tests {
         touch_on_disk(&own, "theirs");
 
         ed.execute(Action::SaveFile);
-        assert_eq!(
-            ed.brief_warning.as_deref(),
-            Some("File on disk has changed")
-        );
+        assert_eq!(ed.brief_warnings, ["File on disk has changed"]);
         assert_eq!(
             write_question(&ed),
             Some((
@@ -3021,7 +3192,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&own).unwrap(), "theirs");
         assert!(ed.buf().modified);
 
-        ed.brief_warning = None;
+        ed.brief_warnings.clear();
         ed.execute(Action::SaveFile);
         answer(&mut ed, YesNo::Yes);
         assert_eq!(std::fs::read_to_string(&own).unwrap(), "mine");
@@ -3036,7 +3207,7 @@ mod tests {
         let mut ed = editor_on_file(&own, "old", "mine");
         ed.execute(Action::SaveFile);
         assert!(matches!(ed.mode, Mode::Editing));
-        assert_eq!(ed.brief_warning, None);
+        assert!(ed.brief_warnings.is_empty());
         assert_eq!(std::fs::read_to_string(&own).unwrap(), "mine");
         let _ = std::fs::remove_dir_all(&dir);
     }
