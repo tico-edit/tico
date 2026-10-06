@@ -304,6 +304,14 @@ pub struct Editor {
     pub language_themes: std::collections::HashMap<String, crate::theme::Theme>,
     pub cutbuffer: String,
     pub cut_was_consecutive: bool,
+    /// nano's `cycling_aim`: where the next `M-%` Cycle puts the cursor
+    /// line -- 0 the center, 1 the top row, 2 the bottom row. Reset to 0
+    /// by any keystroke other than Cycle itself.
+    pub cycling_aim: u8,
+    /// Set by `^L` Center / `M-%` Cycle / Refresh to ask the UI for a full
+    /// terminal repaint (nano's `full_refresh()`, i.e. `wrefresh(curscr)`),
+    /// which also repairs a screen garbled by some other program.
+    pub full_refresh_pending: bool,
     /// nano's `also_the_last`: whether a marked region that ends exactly
     /// at column 0 should nonetheless include that last line when
     /// indenting/unindenting/commenting. Set once such an action has run on a region
@@ -418,6 +426,8 @@ impl Editor {
             language_themes: std::collections::HashMap::new(),
             cutbuffer: String::new(),
             cut_was_consecutive: false,
+            cycling_aim: 0,
+            full_refresh_pending: false,
             also_the_last: false,
             shift_held: false,
             search,
@@ -625,6 +635,25 @@ impl Editor {
         self.scroll_horizontal_to_cursor();
     }
 
+    /// `M-%` Cycle: nano's `do_cycle`, which puts the cursor line on the
+    /// center row, then the top row, then the bottom row on successive
+    /// presses (as near as the start of the buffer allows), starting over
+    /// at the center after any other keystroke.
+    fn do_cycle(&mut self) {
+        let rows = self.text_rows();
+        match self.cycling_aim {
+            0 => self.center_cursor_line(),
+            aim => {
+                let goal = if aim == 1 { 0 } else { rows.saturating_sub(1) };
+                let buf = self.buf_mut();
+                buf.top_line = buf.cursor.line.saturating_sub(goal);
+                self.scroll_horizontal_to_cursor();
+            }
+        }
+        self.cycling_aim = (self.cycling_aim + 1) % 3;
+        self.full_refresh_pending = true;
+    }
+
     /// Place the viewport for a `+LINE[,COLUMN]` given on the command
     /// line, matching nano's non-interactive `goto_line_and_column`: center
     /// the target line, except that within half a screen of the end of the
@@ -749,6 +778,9 @@ impl Editor {
         if !matches!(action, Cut | CutRestOfFile) {
             self.cut_was_consecutive = false;
         }
+        if action != Cycle {
+            self.cycling_aim = 0;
+        }
         let was_line = self.buffers.get(self.current).map(|b| b.cursor.line);
         match action {
             Help => {
@@ -832,8 +864,11 @@ impl Editor {
             Indent => self.do_indent(),
             Unindent => self.do_unindent(),
             Comment => self.do_comment(),
-            Center => self.set_status("center: not yet implemented"),
-            Cycle => self.set_status("cycle: not yet implemented"),
+            Center => {
+                self.center_cursor_line();
+                self.full_refresh_pending = true;
+            }
+            Cycle => self.do_cycle(),
             ScrollUp => self.scroll_view(-1),
             ScrollDown => self.scroll_view(1),
             BeginPara => self.move_para_begin(),
@@ -847,7 +882,7 @@ impl Editor {
             NextBuf => self.switch_buffer(1),
             Verbatim => self.set_status("verbatim input: not yet implemented"),
             RecordMacro | RunMacro => self.set_status("macros: not yet implemented"),
-            Refresh => {}
+            Refresh => self.full_refresh_pending = true,
             SuggestSuspend => self.suggest_ctrl_t_ctrl_z(),
             Execute => self.begin_execute(),
             // Speller/Formatter/Linter need to run an external process (and,
@@ -4896,17 +4931,71 @@ mod tests {
         assert_eq!(ed.status, None, "the minibar is back");
     }
 
+    fn hundred_lines_at(line: usize) -> Editor {
+        let text: String = (1..=100).map(|n| format!("{n}\n")).collect();
+        let mut ed = test_editor(&text);
+        ed.screen_rows = 24;
+        ed.buf_mut().cursor = Pos::new(line, 0);
+        ed.scroll_to_cursor();
+        ed
+    }
+
+    #[test]
+    fn center_puts_the_cursor_line_mid_screen_even_when_visible() {
+        let mut ed = hundred_lines_at(5);
+        assert_eq!(ed.buf().top_line, 0);
+        keystroke(&mut ed, Action::Center);
+        assert_eq!(ed.buf().top_line, 0, "can't scroll above line 1");
+        ed.buf_mut().cursor = Pos::new(15, 0);
+        keystroke(&mut ed, Action::Center);
+        assert_eq!(ed.buf().top_line, 15 - ed.text_rows() / 2);
+        assert_eq!(ed.buf().cursor, Pos::new(15, 0), "the cursor stays put");
+        assert!(ed.full_refresh_pending);
+    }
+
+    #[test]
+    fn cycle_goes_center_top_bottom_and_restarts_after_another_key() {
+        // Confirmed against the installed nano 8.7.1 in a 24-row terminal
+        // (20 text rows): `+50`, then M-% repeatedly.
+        let mut ed = hundred_lines_at(49);
+        let rows = ed.text_rows();
+        assert_eq!(rows, 20);
+        keystroke(&mut ed, Action::Cycle);
+        assert_eq!(ed.buf().top_line, 49 - rows / 2);
+        keystroke(&mut ed, Action::Cycle);
+        assert_eq!(ed.buf().top_line, 49);
+        keystroke(&mut ed, Action::Cycle);
+        assert_eq!(ed.buf().top_line, 49 - (rows - 1));
+        keystroke(&mut ed, Action::Cycle);
+        assert_eq!(ed.buf().top_line, 49 - rows / 2, "back to the center");
+        keystroke(&mut ed, Action::Cycle);
+        assert_eq!(ed.buf().top_line, 49, "then the top");
+        keystroke(&mut ed, Action::Down);
+        keystroke(&mut ed, Action::Cycle);
+        assert_eq!(
+            ed.buf().top_line,
+            50 - rows / 2,
+            "any other key restarts it"
+        );
+    }
+
+    #[test]
+    fn cycle_near_the_start_of_the_buffer_stops_at_line_one() {
+        let mut ed = hundred_lines_at(0);
+        for _ in 0..3 {
+            keystroke(&mut ed, Action::Cycle);
+            assert_eq!(ed.buf().top_line, 0);
+        }
+    }
+
     #[test]
     fn genuinely_inert_actions_report_plainly_instead_of_doing_nothing() {
-        for (action, expected) in [
-            (Action::Center, "center: not yet implemented"),
-            (Action::Cycle, "cycle: not yet implemented"),
-            (Action::Verbatim, "verbatim input: not yet implemented"),
-        ] {
-            let mut ed = test_editor("hello");
-            ed.execute(action);
-            assert_eq!(ed.status.as_deref(), Some(expected), "{action:?}");
-        }
+        let mut ed = test_editor("hello");
+        ed.execute(Action::Verbatim);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("verbatim input: not yet implemented")
+        );
     }
 
     // `set minibar`

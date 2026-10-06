@@ -21,7 +21,6 @@ here.
 - [ ] Full Justify (`^J`) from the Execute menu — main-menu `M-J` already
       works; this path is stubbed separately in `src/ui.rs`
 - [ ] Verbatim input (`M-V`)
-- [ ] Center (`^L`) / Cycle (`M-%`)
 
 ## Options parsed but never consulted
 

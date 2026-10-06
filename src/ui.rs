@@ -174,6 +174,12 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
 
         show_brief_warning(editor)?;
 
+        if editor.full_refresh_pending {
+            editor.full_refresh_pending = false;
+            execute!(io::stdout(), Clear(ClearType::All))?;
+            dirty = true;
+        }
+
         if dirty {
             render_and_ring(editor)?;
         }
@@ -399,6 +405,7 @@ fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
 /// mouse handling has no drag/motion case at all.
 fn handle_mouse(editor: &mut Editor, mev: MouseEvent) {
     editor.begin_keystroke();
+    editor.cycling_aim = 0;
     dispatch_mouse(editor, mev);
     editor.ensure_magic_line();
     editor.end_keystroke();
@@ -831,6 +838,7 @@ fn handle_editing_key(editor: &mut Editor, key: KeyEvent) {
         if editor.options.view {
             editor.set_status_mild("Key is invalid in view mode");
         } else {
+            editor.cycling_aim = 0;
             editor.insert_char(c);
             // Plain self-insertion bypasses execute(), which is what
             // normally keeps the cursor in view (vertically and, for a
