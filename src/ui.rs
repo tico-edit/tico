@@ -2354,8 +2354,9 @@ fn submit_execute_command(editor: &mut Editor, command: &str, new_buffer: bool) 
 /// to `/bin/sh`), writing `input` (if any) to its stdin from a separate
 /// thread while its stdout and stderr are collected through one shared
 /// pipe -- or just its stderr, when `capture_output` is off and stdout
-/// goes to the terminal. Returns the output, the exit code (`None` when
-/// killed by a signal), and how sending the input went.
+/// goes to the terminal. `^C` kills it meanwhile (see `interrupt`).
+/// Returns the output, the exit code (`None` when killed by a signal),
+/// and how sending the input went.
 fn run_shell_command(
     command: &str,
     input: Option<String>,
@@ -2389,9 +2390,12 @@ fn run_shell_command(
         .take()
         .zip(input)
         .map(|(mut stdin, text)| std::thread::spawn(move || stdin.write_all(text.as_bytes())));
+    // `^C` kills the command from here until it has finished.
+    let interrupt = crate::interrupt::CommandInterrupt::arm(child.id());
     let mut output = Vec::new();
     let read = reader.read_to_end(&mut output);
     let status = child.wait()?;
+    drop(interrupt);
     read?;
     let sending = sender.map_or(Ok(()), |handle| {
         handle
@@ -6253,6 +6257,33 @@ mod tests {
         );
         assert_eq!(ed.buf().to_string(), "");
         assert_eq!(ed.status.as_deref(), Some("Error: 1: oops: not found"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_piped_command_is_cancelled_and_undone() {
+        // Other tests run commands too: only interrupt this one, picked
+        // out by its distinctive argument.
+        let interrupter = std::thread::spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if let Some(pid) = crate::interrupt::armed_pid() {
+                    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                    if cmdline.ends_with(b"sleep\x0030.25\x00") {
+                        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let mut ed = test_editor("abc\n");
+        let start = std::time::Instant::now();
+        submit_execute_command(&mut ed, "|exec sleep 30.25", false);
+        interrupter.join().unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(ed.buf().to_string(), "abc\n");
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
     }
 
     #[test]
