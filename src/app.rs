@@ -262,6 +262,12 @@ pub enum StatusLevel {
 /// which reads the *current* buffer, isn't usable yet). Singular "line" and
 /// the format tag only appear when they apply, confirmed against the
 /// installed nano's own escape-code output.
+/// nano's `digits()`: how many columns a number takes -- but never fewer
+/// than two, which is how nano's own version happens to count.
+pub fn nano_digits(n: usize) -> usize {
+    n.max(10).to_string().len()
+}
+
 pub fn minibar_linecount_note(count: usize, format: crate::buffer::LineFormat) -> String {
     use crate::buffer::LineFormat;
     let word = if count == 1 { "line" } else { "lines" };
@@ -314,6 +320,10 @@ pub struct Editor {
     /// 20 keystrokes (or 1, with `quickblank`) in the main editing window —
     /// it is not a timer.
     status_countdown: u32,
+    /// Whether a status message was posted since the last keystroke --
+    /// nano's `lastmessage` not being `VACUUM`, which keeps `set
+    /// constantshow`'s cursor report from replacing it straight away.
+    message_posted: bool,
     /// Set when an Alert-level message was just posted; the UI layer rings
     /// the terminal bell once and clears this, matching nano's beep() in
     /// statusline() for ALERT-importance messages.
@@ -402,6 +412,7 @@ impl Editor {
             status: None,
             status_level: StatusLevel::Normal,
             status_countdown: 0,
+            message_posted: false,
             bell_pending: false,
             brief_warnings: Vec::new(),
             status_after_warnings: None,
@@ -429,6 +440,7 @@ impl Editor {
         self.status = Some(msg.into());
         self.status_level = StatusLevel::Normal;
         self.status_countdown = if self.options.quickblank { 1 } else { 20 };
+        self.message_posted = true;
     }
 
     /// Like `set_status`, but for error-class messages (unwritable file,
@@ -439,6 +451,7 @@ impl Editor {
         self.status = Some(msg.into());
         self.status_level = StatusLevel::Alert;
         self.status_countdown = if self.options.quickblank { 1 } else { 20 };
+        self.message_posted = true;
         self.bell_pending = true;
     }
 
@@ -448,6 +461,7 @@ impl Editor {
         self.status = Some(msg.into());
         self.status_level = StatusLevel::Mild;
         self.status_countdown = if self.options.quickblank { 1 } else { 20 };
+        self.message_posted = true;
     }
 
     /// Highlight a plain search match, auto-clearing after ~1.5s (0.8s with
@@ -703,7 +717,7 @@ impl Editor {
             Copy => self.do_copy(),
             Paste => self.do_paste(),
             Mark => self.toggle_mark(),
-            Location => self.report_location(),
+            Location => self.set_status(self.cursor_position_report()),
             WordCount => self.report_word_count(),
             Undo => {
                 if self.buf_mut().undo() {
@@ -788,12 +802,25 @@ impl Editor {
                 });
             }
             Zero => self.options.zero = !self.options.zero,
-            ConstantShow => self.options.constantshow = !self.options.constantshow,
             // Zero and ConstantShow stay silent here like nano itself:
             // zero hides every bar there'd be room to report on, and
             // constantshow's toggle is immediately superseded by the
             // live cursor-position display, so nano's do_toggle skips the
             // generic message for both (verified against installed nano 8.6).
+            // Under `set zero`, nano's M-C instead turns constantshow on
+            // and zero off; otherwise it blanks the status bar (unless the
+            // minibar is there).
+            ConstantShow => {
+                if self.options.zero {
+                    self.options.constantshow = true;
+                    self.options.zero = false;
+                } else {
+                    self.options.constantshow = !self.options.constantshow;
+                    if !self.options.minibar {
+                        self.status = None;
+                    }
+                }
+            }
             SoftWrap => {
                 self.options.softwrap = !self.options.softwrap;
                 self.set_status(if self.options.softwrap {
@@ -1595,14 +1622,54 @@ impl Editor {
         self.minibar_note = Some(minibar_linecount_note(buf.nano_line_count(), buf.format));
     }
 
-    fn report_location(&mut self) {
+    /// nano's `report_cursor_position`, for `^C` Location and `set
+    /// constantshow`: the cursor's line, display column and character
+    /// offset, each out of the total and as a percentage.
+    pub fn cursor_position_report(&self) -> String {
         let buf = self.buf();
-        self.set_status(format!(
-            "line {}/{}, col {}",
-            buf.cursor.line + 1,
-            buf.line_count(),
-            buf.cursor.col + 1
-        ));
+        let tabsize = self.options.tabsize as usize;
+        let line = buf.line(buf.cursor.line);
+        let fullwidth = crate::buffer::display_width(&line, usize::MAX, tabsize) + 1;
+        let column = crate::buffer::display_width(&line, buf.cursor.col, tabsize) + 1;
+        let lineno = buf.cursor.line + 1;
+        let lines = buf.line_count().max(1);
+        let sum = buf.rope.line_to_char(buf.cursor.line) + buf.cursor.col;
+        let totsize = buf.rope.len_chars();
+        let linepct = 100 * lineno / lines;
+        let colpct = 100 * column / fullwidth;
+        let charpct = (100 * sum).checked_div(totsize).unwrap_or(0);
+        let (lw, cw) = (nano_digits(lines), nano_digits(totsize));
+        format!(
+            "line {lineno:>lw$}/{lines} ({linepct:>2}%), col {column:>2}/{fullwidth:>2} \
+             ({colpct:>3}%), char {sum:>cw$}/{totsize} ({charpct:>2}%)"
+        )
+    }
+
+    /// Call before handling each keystroke or mouse event: nano's
+    /// `lastmessage = VACUUM` once a key is read.
+    pub fn begin_keystroke(&mut self) {
+        self.message_posted = false;
+    }
+
+    /// Call after handling each keystroke or mouse event -- nano's main
+    /// loop: back in the edit window with no fresh message, the minibar
+    /// replaces whatever message was showing, or else `set constantshow`
+    /// shows where the cursor is (`report_cursor_position`); neither under
+    /// `set zero`.
+    pub fn end_keystroke(&mut self) {
+        if self.message_posted
+            || self.options.zero
+            || self.screen_rows <= 1
+            || !matches!(self.mode, Mode::Editing)
+        {
+            return;
+        }
+        if self.options.minibar {
+            self.status = None;
+        } else if self.options.constantshow {
+            self.set_status(self.cursor_position_report());
+            self.message_posted = false;
+        }
     }
 
     fn report_word_count(&mut self) {
@@ -4335,6 +4402,92 @@ mod tests {
         let mut ed = test_editor("x");
         ed.execute(Action::ConstantShow);
         assert_eq!(ed.status, None);
+    }
+
+    /// One keystroke the way ui.rs's `handle_key` frames it.
+    fn keystroke(ed: &mut Editor, action: Action) {
+        ed.begin_keystroke();
+        ed.execute(action);
+        ed.end_keystroke();
+    }
+
+    #[test]
+    fn location_reports_like_nano() {
+        // Confirmed against the installed nano 8.7.1: the column is a
+        // display column (tabs expanded), "char" counts line breaks, and
+        // small numbers are padded to nano's minimum of two digits.
+        let mut ed = test_editor("hello world\n\tsecond line\nthird\n");
+        ed.buf_mut().cursor = Pos::new(1, 1);
+        ed.execute(Action::Location);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("line  2/4 (50%), col  9/20 ( 45%), char 13/31 (41%)")
+        );
+        let mut ed = test_editor("");
+        assert_eq!(
+            ed.cursor_position_report(),
+            "line  1/1 (100%), col  1/ 1 (100%), char  0/0 ( 0%)"
+        );
+        ed.execute(Action::Location);
+    }
+
+    #[test]
+    fn constantshow_reports_the_position_after_every_keystroke() {
+        let mut ed = test_editor("abc\ndef\n");
+        ed.screen_rows = 24;
+        keystroke(&mut ed, Action::Right);
+        assert_eq!(ed.status, None, "nothing without constantshow");
+
+        ed.options.constantshow = true;
+        keystroke(&mut ed, Action::Right);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("line  1/3 (33%), col  3/ 4 ( 75%), char  2/8 (25%)")
+        );
+        // A fresh message wins for the keystroke that posted it...
+        keystroke(&mut ed, Action::NoHelp);
+        assert_eq!(ed.status.as_deref(), Some("Help mode disabled"));
+        // ...and is replaced by the position on the next one.
+        keystroke(&mut ed, Action::Down);
+        assert!(ed.status.as_deref().unwrap().starts_with("line  2/3"));
+
+        ed.options.zero = true;
+        ed.status = None;
+        keystroke(&mut ed, Action::Up);
+        assert_eq!(ed.status, None, "no report under set zero");
+    }
+
+    #[test]
+    fn constantshow_toggle_turns_zero_off_or_blanks_the_status_bar() {
+        let mut ed = test_editor("x");
+        ed.screen_rows = 24;
+        ed.options.zero = true;
+        ed.options.constantshow = true;
+        ed.execute(Action::ConstantShow);
+        assert!(ed.options.constantshow, "stays on");
+        assert!(!ed.options.zero);
+
+        let mut ed = test_editor("x");
+        ed.screen_rows = 24;
+        ed.set_status("old news");
+        keystroke(&mut ed, Action::ConstantShow);
+        assert!(ed.options.constantshow);
+        assert!(ed.status.as_deref().unwrap().starts_with("line  1/1"));
+        keystroke(&mut ed, Action::ConstantShow);
+        assert!(!ed.options.constantshow);
+        assert_eq!(ed.status, None);
+    }
+
+    #[test]
+    fn the_minibar_replaces_a_message_on_the_next_keystroke() {
+        let mut ed = test_editor("abc\n");
+        ed.screen_rows = 24;
+        ed.options.minibar = true;
+        ed.options.constantshow = true;
+        keystroke(&mut ed, Action::Location);
+        assert!(ed.status.is_some(), "^C's report shows for now");
+        keystroke(&mut ed, Action::Right);
+        assert_eq!(ed.status, None, "the minibar is back");
     }
 
     #[test]

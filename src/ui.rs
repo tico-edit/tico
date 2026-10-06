@@ -327,8 +327,10 @@ fn maybe_check_external_change(editor: &mut Editor) -> bool {
 // ---------------------------------------------------------------------
 
 fn handle_key(editor: &mut Editor, key: KeyEvent) {
+    editor.begin_keystroke();
     dispatch_key(editor, key);
     editor.ensure_magic_line();
+    editor.end_keystroke();
 }
 
 fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
@@ -396,8 +398,10 @@ fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
 /// expects dragging to work (see `set mouse` in `nanorc(5)`): nano's own
 /// mouse handling has no drag/motion case at all.
 fn handle_mouse(editor: &mut Editor, mev: MouseEvent) {
+    editor.begin_keystroke();
     dispatch_mouse(editor, mev);
     editor.ensure_magic_line();
+    editor.end_keystroke();
 }
 
 fn dispatch_mouse(editor: &mut Editor, mev: MouseEvent) {
@@ -3541,13 +3545,21 @@ fn render_status_line(
         // directory", ...) in `errorcolor` (bold white-on-red by default)
         // instead, confirmed against the installed nano's own escape-code
         // output for both cases.
-        let bracketed = format!("[ {msg} ]");
-        let pad = cols.saturating_sub(bracketed.chars().count()) / 2;
+        // nano's `statusline`: centered, and bracketed only when that
+        // leaves room for the brackets; a message wider than the screen
+        // is cut off.
+        let message: String = msg.chars().take(cols).collect();
+        let start_col = (cols - message.chars().count()) / 2;
+        let (pad, text) = if start_col > 1 {
+            (start_col - 2, format!("[ {message} ]"))
+        } else {
+            (start_col, message)
+        };
         if pad > 0 {
             queue!(out, Print(" ".repeat(pad)))?;
         }
         let remaining = cols.saturating_sub(pad);
-        let shown: String = bracketed.chars().take(remaining).collect();
+        let shown: String = text.chars().take(remaining).collect();
         let shown_len = shown.chars().count();
         match editor.status_level {
             crate::app::StatusLevel::Normal => {
@@ -3576,61 +3588,155 @@ fn render_status_line(
 
 /// `set minibar`'s condensed one-line summary of the current buffer, shown
 /// where the status bar normally goes once no prompt or status message is
-/// active: the filename (plus `*` if modified) on the left, then either the
-/// one-shot `minibar_note` (right after a load/save/buffer-switch) or,
-/// once that's gone, an `[i/n]` counter when multiple buffers are open, and
-/// finally the cursor's percentage into the file, right-aligned. Colored
-/// with `minicolor` (falling back to the title bar's own colors, same as
-/// `promptcolor`) -- confirmed layout and colors against the installed
-/// nano's own escape-code output.
+/// active -- nano's `minibar()`: the filename (`...`-shortened from the
+/// left when too long) plus `*` if modified; then either the one-shot
+/// `minibar_note` (right after a load/save/buffer-switch) or, when
+/// multiple buffers are open, an `[i/n]` counter; under `set
+/// constantshow`, the cursor's `line,column` and the code of the character
+/// under it; and the cursor's percentage into the file, right-aligned.
+/// Each piece only appears when nano's own width test says it fits.
+/// Colored with `minicolor` (falling back to the title bar's own colors,
+/// same as `promptcolor`).
 fn render_minibar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Result<()> {
+    use unicode_width::UnicodeWidthStr;
     let buf = editor.buf();
-    let name = buf
+    let constantshow = editor.options.constantshow;
+    let mut line = MinibarLine::new(cols);
+
+    let thename = buf
         .path
         .as_ref()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "New Buffer".to_string());
-    let mark = if buf.modified { '*' } else { ' ' };
-    let left = format!("  {name} {mark} ");
+        .unwrap_or_else(|| "(nameless)".to_string());
+    let namewidth = thename.width();
+    let text = buf.line(buf.cursor.line);
+    let column =
+        crate::buffer::display_width(&text, buf.cursor.col, editor.options.tabsize as usize) + 1;
+    let location = format!("{},{}", buf.cursor.line + 1, column);
+    let placewidth = location.len();
+    let padding = if namewidth + 19 > cols { 0 } else { 2 };
 
-    let mut line: Vec<char> = vec![' '; cols];
-    let mut cursor = 0;
-    for c in left.chars() {
-        if cursor >= cols {
+    if cols > 4 {
+        if namewidth > cols - 2 {
+            line.put(0, "...");
+            line.add(&tail_of_width(&thename, cols - 5));
+        } else {
+            line.put(padding, &thename);
+        }
+        line.add(if buf.modified { " *" } else { "  " });
+    }
+
+    let mut tallywidth = 0;
+    if let Some(note) = editor.minibar_note.as_ref().filter(|_| cols > 35) {
+        let tally = format!(" {note}");
+        if namewidth + tally.width() + 11 < cols {
+            tallywidth = tally.width();
+            line.add(&tally);
+        }
+    } else if editor.buffers.len() > 1 && cols > 35 {
+        let ranking = format!(" [{}/{}]", editor.current + 1, editor.buffers.len());
+        if namewidth + placewidth + ranking.width() + 32 < cols {
+            line.add(&ranking);
+        }
+    }
+
+    if constantshow && namewidth + tallywidth + placewidth + 32 < cols {
+        line.put(cols - 27 - placewidth, &location);
+    }
+    if constantshow && namewidth + tallywidth + 28 < cols {
+        line.put(cols - 23, &minibar_char_codes(buf));
+    }
+
+    if namewidth + 6 < cols {
+        let pct = 100 * (buf.cursor.line + 1) / buf.line_count().max(1);
+        line.put(cols - 4 - padding, &format!("{pct:>3}%"));
+    }
+
+    let style = bar_style(&editor.options.minicolor, title_bar_style(editor));
+    queue_bar_segment(out, style, &line.into_string())
+}
+
+/// The minibar's code for the character under the cursor (nano's
+/// "hexadecimal" in `minibar()`): `U+XXXX`, or for the end of a line
+/// `U+000A` (`  ----` at the end of the last one), followed by `|XXXX` for
+/// up to two zero-width characters riding on it.
+fn minibar_char_codes(buf: &crate::buffer::Buffer) -> String {
+    let rest: Vec<char> = buf
+        .line(buf.cursor.line)
+        .chars()
+        .skip(buf.cursor.col)
+        .collect();
+    let Some(&c) = rest.first() else {
+        return if buf.cursor.line + 1 < buf.line_count() {
+            "U+000A".to_string()
+        } else {
+            "  ----".to_string()
+        };
+    };
+    let mut codes = format!("U+{:04X}", c as u32);
+    let zerowidth = |c: &&char| unicode_width::UnicodeWidthChar::width(**c) == Some(0);
+    for z in rest[1..].iter().take(2).take_while(|c| zerowidth(c)) {
+        codes.push_str(&format!("|{:04X}", *z as u32));
+    }
+    codes
+}
+
+/// The last `width` columns' worth of `s` (nano's `display_string(name,
+/// namewidth - COLS + 5, COLS - 5, ...)` for a too-long minibar name).
+fn tail_of_width(s: &str, width: usize) -> String {
+    let mut taken = 0;
+    let mut tail: Vec<char> = Vec::new();
+    for c in s.chars().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        if taken + w > width {
             break;
         }
-        line[cursor] = c;
-        cursor += 1;
+        taken += w;
+        tail.push(c);
+    }
+    tail.into_iter().rev().collect()
+}
+
+/// A row of screen cells written like a curses window: `put` at a column,
+/// `add` at wherever the last write left off, clipped at the right edge.
+/// A double-width character takes two cells (the second one `None`).
+struct MinibarLine {
+    cells: Vec<Option<char>>,
+    at: usize,
+}
+
+impl MinibarLine {
+    fn new(cols: usize) -> Self {
+        MinibarLine {
+            cells: vec![Some(' '); cols],
+            at: 0,
+        }
     }
 
-    let right_note = editor.minibar_note.clone().or_else(|| {
-        (editor.buffers.len() > 1)
-            .then(|| format!("[{}/{}]", editor.current + 1, editor.buffers.len()))
-    });
-    if let Some(note) = right_note {
-        for c in note.chars() {
-            if cursor >= cols {
-                break;
+    fn put(&mut self, col: usize, text: &str) {
+        self.at = col;
+        self.add(text);
+    }
+
+    fn add(&mut self, text: &str) {
+        for c in text.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(c)
+                .unwrap_or(1)
+                .max(1);
+            if self.at + w > self.cells.len() {
+                return;
             }
-            line[cursor] = c;
-            cursor += 1;
+            self.cells[self.at] = Some(c);
+            if w == 2 {
+                self.cells[self.at + 1] = None;
+            }
+            self.at += w;
         }
     }
 
-    // Right-aligned, 2 columns in from the edge -- the same margin the
-    // title bar's own `[i/n]`/"View" indicator uses.
-    let pct = 100 * (buf.cursor.line + 1) / buf.line_count().max(1);
-    let pct_str = format!("{pct}%");
-    let pct_start = cols.saturating_sub(pct_str.chars().count() + 2);
-    for (i, c) in pct_str.chars().enumerate() {
-        if pct_start + i < cols {
-            line[pct_start + i] = c;
-        }
+    fn into_string(self) -> String {
+        self.cells.into_iter().flatten().collect()
     }
-
-    let s: String = line.into_iter().collect();
-    let style = bar_style(&editor.options.minicolor, title_bar_style(editor));
-    queue_bar_segment(out, style, &s)
 }
 
 /// The default main-menu shortcut priority list, in the exact order GNU
@@ -5126,6 +5232,79 @@ mod tests {
             "original buffer untouched"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    fn minibar_text(ed: &Editor, cols: usize) -> String {
+        let mut out = Vec::new();
+        render_minibar(ed, &mut out, cols).unwrap();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let plain = regex::Regex::new("\x1b\\[[0-9;]*m").unwrap();
+        plain.replace_all(&text, "").into_owned()
+    }
+
+    #[test]
+    fn minibar_under_constantshow_shows_position_and_character_code() {
+        // Layouts confirmed against the installed nano 8.7.1.
+        let mut ed = test_editor("a\u{301}b\n\tx\n");
+        ed.buf_mut().path = Some("c.txt".into());
+        let shown = |ed: &Editor, cols| minibar_text(ed, cols).trim_end().to_string();
+        assert_eq!(shown(&ed, 80), format!("  c.txt{} 33%", " ".repeat(67)));
+        ed.options.constantshow = true;
+        assert_eq!(
+            shown(&ed, 80),
+            format!(
+                "  c.txt{}1,1    U+0061|0301{} 33%",
+                " ".repeat(43),
+                " ".repeat(6)
+            )
+        );
+        ed.buf_mut().cursor = crate::buffer::Pos::new(1, 2);
+        assert_eq!(
+            shown(&ed, 50),
+            format!(
+                "  c.txt{}2,10    U+000A{} 66%",
+                " ".repeat(12),
+                " ".repeat(11)
+            )
+        );
+        ed.buf_mut().cursor = crate::buffer::Pos::new(2, 0);
+        assert!(shown(&ed, 50).contains("3,1      ----"));
+        // Too narrow for the position: just the code.
+        assert_eq!(
+            shown(&ed, 36),
+            format!("  c.txt{}  ----{}100%", " ".repeat(6), " ".repeat(11))
+        );
+    }
+
+    #[test]
+    fn minibar_shortens_a_long_name_and_names_an_unnamed_buffer() {
+        let mut ed = test_editor("x");
+        ed.buf_mut().modified = true;
+        assert!(minibar_text(&ed, 50).starts_with("  (nameless) *"));
+        ed.buf_mut().path = Some(format!("/{}", "d".repeat(60)).into());
+        assert_eq!(minibar_text(&ed, 50), format!("...{} *", "d".repeat(45)));
+    }
+
+    #[test]
+    fn a_status_message_too_wide_for_brackets_goes_without() {
+        let mut ed = test_editor("x");
+        ed.set_status("a".repeat(37));
+        let mut out = Vec::new();
+        render_status_line(&ed, &mut out, 0, 40).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains(&format!(" \x1b[7m{}\x1b[0m  ", "a".repeat(37))),
+            "{text:?}"
+        );
+        assert!(!text.contains("[ "), "{text:?}");
+        ed.set_status("a".repeat(36));
+        let mut out = Vec::new();
+        render_status_line(&ed, &mut out, 0, 40).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains(&format!("[ {} ]", "a".repeat(36))),
+            "{text:?}"
+        );
     }
 
     #[test]
