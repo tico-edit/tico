@@ -595,6 +595,14 @@ impl Editor {
     }
 
     pub fn scroll_to_cursor(&mut self) {
+        // nano's `edit_redraw`/`edit_refresh` bring an off-screen cursor
+        // back by centering it, rather than flowing, under
+        // `jumpyscrolling` -- which is also what makes Up/Down past an
+        // edge jump half a screen instead of scrolling a line.
+        if self.options.jumpyscrolling {
+            self.scroll_to_cursor_centered();
+            return;
+        }
         let rows = self.text_rows();
         let buf = self.buf_mut();
         if buf.cursor.line < buf.top_line {
@@ -643,7 +651,7 @@ impl Editor {
     /// specifically for search/find-next/find-previous and replace jumps
     /// (confirmed directly against the installed nano for both) — ordinary
     /// cursor movement (arrows, page up/down, ...) keeps the minimal-scroll
-    /// behavior of plain `scroll_to_cursor`.
+    /// behavior of plain `scroll_to_cursor`, unless `jumpyscrolling`.
     pub fn scroll_to_cursor_centered(&mut self) {
         let rows = self.text_rows();
         let buf = self.buf_mut();
@@ -1935,17 +1943,46 @@ impl Editor {
     }
 
     fn page_up(&mut self) {
-        let rows = self.text_rows();
-        for _ in 0..rows {
-            self.buf_mut().move_up();
-        }
+        self.page(false);
     }
 
     fn page_down(&mut self) {
+        self.page(true);
+    }
+
+    /// nano's `do_page_up`/`do_page_down`: move two lines short of a
+    /// screenful, keeping the cursor on the same screen row and aiming for
+    /// the same column -- or, under `jumpyscrolling`, starting from the
+    /// top row's line and landing at the start of the line on the top row
+    /// (as Pico does). Without that many lines left, go to the first line
+    /// (its start) or the last one (its end) instead.
+    fn page(&mut self, forward: bool) {
         let rows = self.text_rows();
-        for _ in 0..rows {
-            self.buf_mut().move_down();
+        let mustmove = if rows < 3 { 1 } else { rows - 2 };
+        let jumpy = self.options.jumpyscrolling;
+        let buf = self.buf_mut();
+        let last = buf.line_count().saturating_sub(1);
+        let (from, goal, row) = if jumpy {
+            (buf.top_line, 0, 0)
+        } else {
+            let row = buf.cursor.line.saturating_sub(buf.top_line);
+            (buf.cursor.line, buf.goal_column(), row)
+        };
+        if !forward && from < mustmove {
+            buf.cursor = Pos::new(0, 0);
+            return;
         }
+        if forward && last - from.min(last) < mustmove {
+            buf.cursor = Pos::new(last, buf.line(last).chars().count());
+            return;
+        }
+        let line = if forward {
+            from + mustmove
+        } else {
+            from - mustmove
+        };
+        buf.goto_line_aiming_at(line, goal);
+        buf.top_line = line.saturating_sub(row);
     }
 
     fn scroll_view(&mut self, delta: isize) {
@@ -5482,5 +5519,58 @@ mod tests {
         ed.minibar_note = Some("unchanged".to_string());
         ed.execute(Action::NextBuf);
         assert_eq!(ed.minibar_note.as_deref(), Some("unchanged"));
+    }
+
+    /// After `keys` in a 100-line file ("line 1".."line 100", plus the
+    /// magic line) on a 14-row screen (10 text rows): the top line and the
+    /// cursor, both 0-based. The expectations in the tests below were
+    /// captured from the installed nano 8.7.1 doing the same in tmux.
+    fn scrolled_after(jumpy: bool, keys: &[Action]) -> (usize, Pos) {
+        let text = (1..=100).map(|i| format!("line {i}\n")).collect::<String>();
+        let mut ed = test_editor(&text);
+        ed.screen_rows = 14;
+        ed.options.jumpyscrolling = jumpy;
+        ed.ensure_magic_line();
+        for &key in keys {
+            keystroke(&mut ed, key);
+        }
+        (ed.buf().top_line, ed.buf().cursor)
+    }
+
+    #[test]
+    fn paging_moves_two_lines_short_of_a_screen_keeping_the_row_like_nano() {
+        use Action::*;
+        let both = |keys: &[Action]| (scrolled_after(false, keys), scrolled_after(true, keys));
+        let (smooth, jumpy) = both(&[PageDown, PageDown]);
+        assert_eq!(smooth, (16, Pos::new(16, 0)));
+        assert_eq!(jumpy, (16, Pos::new(16, 0)));
+        // The cursor's row and column survive a page, unless jumpy.
+        let keys = [
+            Down, Down, Down, Right, Right, Right, Right, Right, Right, PageDown,
+        ];
+        assert_eq!(scrolled_after(false, &keys), (8, Pos::new(11, 6)));
+        assert_eq!(scrolled_after(true, &keys), (8, Pos::new(8, 0)));
+        let (smooth, jumpy) = both(&[LastLine, PageUp]);
+        assert_eq!(smooth, (83, Pos::new(92, 0)));
+        assert_eq!(jumpy, (87, Pos::new(87, 0)));
+        // Without a full page left: the last line, which is the magic one.
+        let (smooth, jumpy) = both(&[PageDown; 14]);
+        assert_eq!(smooth, (96, Pos::new(100, 0)));
+        assert_eq!(jumpy, (96, Pos::new(100, 0)));
+        let (smooth, jumpy) = both(&[PageDown, PageUp, PageUp]);
+        assert_eq!(smooth, (0, Pos::new(0, 0)));
+        assert_eq!(jumpy, (0, Pos::new(0, 0)));
+    }
+
+    #[test]
+    fn jumpy_scrolling_recenters_instead_of_scrolling_a_line_like_nano() {
+        use Action::*;
+        let down = [Down; 12];
+        assert_eq!(scrolled_after(false, &down), (3, Pos::new(12, 0)));
+        assert_eq!(scrolled_after(true, &down), (5, Pos::new(12, 0)));
+        let mut up = vec![LastLine];
+        up.extend([Up; 12]);
+        assert_eq!(scrolled_after(false, &up), (88, Pos::new(88, 0)));
+        assert_eq!(scrolled_after(true, &up), (83, Pos::new(88, 0)));
     }
 }

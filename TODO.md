@@ -22,7 +22,6 @@ here.
 - [ ] `softwrap` — toggle flips the flag, nothing wraps
 - [ ] `stateflags`
 - [ ] `bookstyle`
-- [ ] `jumpyscrolling`
 - [ ] `emptyline`
 - [ ] `rawsequences`
 - [ ] `atblanks`
