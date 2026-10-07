@@ -191,6 +191,10 @@ pub struct Buffer {
     /// has already been shown for this buffer, so it's a one-time heads-up
     /// rather than repeated on every render.
     pub highlighting_size_warning_shown: bool,
+    /// The lines carrying an anchor (nano's per-line `has_anchor`), as
+    /// sorted 0-based line indices. `shift_anchors` keeps them in step
+    /// with every edit, undo and redo.
+    pub anchors: Vec<usize>,
 }
 
 impl Buffer {
@@ -217,6 +221,7 @@ impl Buffer {
             content_version: 0,
             highlight_cache: std::cell::RefCell::new(None),
             highlighting_size_warning_shown: false,
+            anchors: Vec::new(),
         }
     }
 
@@ -290,14 +295,67 @@ impl Buffer {
         Pos::new(line, pos.col.min(line_len))
     }
 
+    /// Whether `line` carries an anchor.
+    pub fn has_anchor(&self, line: usize) -> bool {
+        self.anchors.binary_search(&line).is_ok()
+    }
+
+    /// Place an anchor on `line`, or remove the one it has (the flip in
+    /// nano's `put_or_lift_anchor`). Returns whether it has one now.
+    pub fn toggle_anchor(&mut self, line: usize) -> bool {
+        match self.anchors.binary_search(&line) {
+            Ok(i) => {
+                self.anchors.remove(i);
+                false
+            }
+            Err(i) => {
+                self.anchors.insert(i, line);
+                true
+            }
+        }
+    }
+
+    /// Keep the anchors in step with lines `first..=last` having just
+    /// been replaced by `count` lines -- by an edit, an undo or a redo.
+    /// An anchor on any of the replaced lines lands on `first`: nano's
+    /// cut gives the anchor of a cut line to the line that takes its
+    /// place, and joining two lines keeps either one's anchor. The other
+    /// new lines get none (a paste never brings anchors along, and a
+    /// line split by Enter keeps its anchor on the upper half), and the
+    /// anchors below shift with their lines.
+    fn shift_anchors(&mut self, first: usize, last: usize, count: usize) {
+        let mut result = Vec::with_capacity(self.anchors.len());
+        let mut had = false;
+        for &line in &self.anchors {
+            if line < first {
+                result.push(line);
+            } else if line <= last {
+                had = true;
+            } else {
+                if had {
+                    result.push(first);
+                    had = false;
+                }
+                result.push(line + first + count - last - 1);
+            }
+        }
+        if had {
+            result.push(first);
+        }
+        self.anchors = result;
+    }
+
     /// Replace `[start,end)` with `text`, recording an undo entry. Returns
     /// the new cursor position (end of the inserted text).
     fn replace_range(&mut self, start: Pos, end: Pos, text: &str, cursor_after: Pos) {
         let start_c = self.char_idx(start);
         let end_c = self.char_idx(end);
         let removed: String = self.rope.slice(start_c..end_c).to_string();
+        let first = self.rope.char_to_line(start_c);
+        let last = self.rope.char_to_line(end_c);
         self.rope.remove(start_c..end_c);
         self.rope.insert(start_c, text);
+        self.shift_anchors(first, last, text.matches('\n').count() + 1);
         self.undo_stack.push(Edit {
             start_char: start_c,
             removed,
@@ -452,9 +510,15 @@ impl Buffer {
             return false;
         };
         let inserted_len = edit.inserted.chars().count();
+        let first = self.rope.char_to_line(edit.start_char);
         self.rope
             .remove(edit.start_char..edit.start_char + inserted_len);
         self.rope.insert(edit.start_char, &edit.removed);
+        self.shift_anchors(
+            first,
+            first + edit.inserted.matches('\n').count(),
+            edit.removed.matches('\n').count() + 1,
+        );
         self.cursor = edit.cursor_before;
         self.redo_stack.push(edit);
         self.modified = !self.undo_stack.is_empty();
@@ -468,9 +532,15 @@ impl Buffer {
             return false;
         };
         let removed_len = edit.removed.chars().count();
+        let first = self.rope.char_to_line(edit.start_char);
         self.rope
             .remove(edit.start_char..edit.start_char + removed_len);
         self.rope.insert(edit.start_char, &edit.inserted);
+        self.shift_anchors(
+            first,
+            first + edit.removed.matches('\n').count(),
+            edit.inserted.matches('\n').count() + 1,
+        );
         self.cursor = edit.cursor_after;
         self.undo_stack.push(edit.clone());
         self.modified = true;

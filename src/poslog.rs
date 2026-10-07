@@ -6,9 +6,9 @@
 //!
 //! Each line is `[ANCHORS]PATH LINE COLUMN`: the full path, the 1-based
 //! line, and the 1-based display column, most recently closed file first,
-//! at most 200 of them. ANCHORS is nano's list of anchored line numbers
-//! (`"3 17 "`); tico has no anchors, so it keeps whatever nano wrote there
-//! rather than dropping it. A newline in a path is stored as a NUL.
+//! at most 200 of them. ANCHORS is the list of the file's anchored line
+//! numbers, 1-based, each followed by a space (`"3 17 "`, nano's
+//! `stringify_anchors`). A newline in a path is stored as a NUL.
 
 use std::path::PathBuf;
 
@@ -87,28 +87,29 @@ impl PositionLog {
     }
 
     /// Where the cursor was last left in the file whose full path is
-    /// `fullpath`: its 1-based line and display column.
-    pub fn lookup(&mut self, fullpath: &str) -> Option<(usize, usize)> {
+    /// `fullpath`: its 1-based line and display column, and the 1-based
+    /// numbers of the lines that had anchors.
+    pub fn lookup(&mut self, fullpath: &str) -> Option<(usize, usize, Vec<usize>)> {
         self.reload_if_changed();
         self.entries
             .iter()
             .find(|e| e.filename == fullpath)
-            .map(|e| (e.line, e.column))
+            .map(|e| (e.line, e.column, parse_anchors(&e.anchors)))
     }
 
     /// Record that the file at `fullpath` was left at `line`, `column`
-    /// (both 1-based, the column a display column), moving it to the top
-    /// of the list, and write the list out.
-    pub fn update(&mut self, fullpath: &str, line: usize, column: usize) {
+    /// (both 1-based, the column a display column) with anchors on the
+    /// 1-based lines `anchors`, moving it to the top of the list, and
+    /// write the list out.
+    pub fn update(&mut self, fullpath: &str, line: usize, column: usize, anchors: &[usize]) {
         self.reload_if_changed();
-        let anchors = match self.entries.iter().position(|e| e.filename == fullpath) {
-            Some(i) => self.entries.remove(i).anchors,
-            None => String::new(),
-        };
+        if let Some(i) = self.entries.iter().position(|e| e.filename == fullpath) {
+            self.entries.remove(i);
+        }
         self.entries.insert(
             0,
             Entry {
-                anchors,
+                anchors: anchors.iter().map(|n| format!("{n} ")).collect(),
                 filename: fullpath.to_string(),
                 line,
                 column,
@@ -158,6 +159,16 @@ fn parse_entry(line: &str) -> Option<Entry> {
     })
 }
 
+/// The line numbers in an entry's ANCHORS prefix, as nano's
+/// `restore_anchors` reads them: each number up to its following space.
+fn parse_anchors(anchors: &str) -> Vec<usize> {
+    anchors
+        .split(' ')
+        .filter(|s| !s.is_empty())
+        .map(atoi)
+        .collect()
+}
+
 fn atoi(s: &str) -> usize {
     let digits: String = s
         .trim_start()
@@ -186,25 +197,26 @@ mod tests {
         )
         .unwrap();
         let mut log = PositionLog::at(path.clone()).unwrap();
-        assert_eq!(log.lookup("/a/one.txt"), Some((12, 5)));
-        assert_eq!(log.lookup("/a/two words.txt"), Some((1, 9)));
+        assert_eq!(log.lookup("/a/one.txt"), Some((12, 5, vec![])));
+        assert_eq!(log.lookup("/a/two words.txt"), Some((1, 9, vec![3, 17])));
         assert_eq!(log.lookup("/a/after"), None, "nano stops at a blank line");
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn update_moves_the_file_to_the_top_and_keeps_its_anchors() {
+    fn update_moves_the_file_to_the_top_and_writes_its_anchors() {
         let path = temp_log("update");
         std::fs::write(&path, "/a/one 1 1\n3 /a/two 2 2\n").unwrap();
         let mut log = PositionLog::at(path.clone()).unwrap();
-        log.update("/a/two", 7, 4);
-        log.update("/a/new\nline", 1, 2);
+        log.update("/a/two", 7, 4, &[3, 17]);
+        log.update("/a/new\nline", 1, 2, &[]);
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            b"/a/new\0line 1 2\n3 /a/two 7 4\n/a/one 1 1\n"
+            b"/a/new\0line 1 2\n3 17 /a/two 7 4\n/a/one 1 1\n"
         );
         let mut again = PositionLog::at(path.clone()).unwrap();
-        assert_eq!(again.lookup("/a/new\nline"), Some((1, 2)));
+        assert_eq!(again.lookup("/a/new\nline"), Some((1, 2, vec![])));
+        assert_eq!(again.lookup("/a/two"), Some((7, 4, vec![3, 17])));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -219,7 +231,7 @@ mod tests {
         let path = temp_log("cap");
         let mut log = PositionLog::at(path.clone()).unwrap();
         for i in 0..205 {
-            log.update(&format!("/f{i}"), 1, 1);
+            log.update(&format!("/f{i}"), 1, 1, &[]);
         }
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 200);
@@ -240,7 +252,7 @@ mod tests {
             .unwrap()
             .set_modified(later)
             .unwrap();
-        assert_eq!(log.lookup("/a/x"), Some((9, 9)));
+        assert_eq!(log.lookup("/a/x"), Some((9, 9, vec![])));
         std::fs::remove_file(&path).ok();
     }
 }

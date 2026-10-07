@@ -10,7 +10,6 @@ here.
 
 ## Bound keys that report "not yet implemented"
 
-- [ ] Anchors: set, previous, next (`M-Ins` / `M-"`, `M-PgUp`, `M-PgDn` / `M-'`)
 - [ ] Macros: record and replay (`M-:` / `M-;`)
 
 ## Options parsed but never consulted

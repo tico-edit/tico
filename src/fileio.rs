@@ -749,6 +749,7 @@ pub fn reload(
     buffer.modified = false;
     buffer.undo_stack.clear();
     buffer.redo_stack.clear();
+    buffer.anchors.clear();
     buffer.disk_state = stat_disk_state(&path);
     let max_line = buffer.line_count().saturating_sub(1);
     buffer.cursor.line = cursor.line.min(max_line);

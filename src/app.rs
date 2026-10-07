@@ -732,6 +732,59 @@ impl Editor {
         self.set_status_mild("No matching bracket");
     }
 
+    /// `M-Ins`/`M-"`: nano's `put_or_lift_anchor` -- place an anchor on
+    /// the cursor's line, or remove the one it has. Reported on the status
+    /// bar only when neither the line-number margin nor the minibar is
+    /// there to show the mark (nano's `!LINE_NUMBERS && (!MINIBAR ||
+    /// ZERO)`).
+    fn put_or_lift_anchor(&mut self) {
+        let line = self.buf().cursor.line;
+        let placed = self.buf_mut().toggle_anchor(line);
+        if !self.options.linenumbers && (!self.options.minibar || self.options.zero) {
+            self.set_status(if placed {
+                "Placed anchor"
+            } else {
+                "Removed anchor"
+            });
+        }
+    }
+
+    /// `M-PgUp` / `M-PgDn`, `M-'`: nano's `to_prev_anchor`/`to_next_anchor`
+    /// -- to the nearest anchored line before (or after) the cursor's,
+    /// wrapping around at the buffer's ends; the cursor goes to column 0,
+    /// centered when that is off-screen (nano's `go_to_and_confirm`), with
+    /// "Jumped to anchor" unless the line-number margin shows it. With no
+    /// other anchor to go to, says whether the cursor's own line has the
+    /// only one or there are none at all.
+    fn jump_to_anchor(&mut self, forward: bool) {
+        let buf = self.buf();
+        let current = buf.cursor.line;
+        let target = if forward {
+            buf.anchors
+                .iter()
+                .find(|&&l| l > current)
+                .or(buf.anchors.first())
+        } else {
+            buf.anchors
+                .iter()
+                .rev()
+                .find(|&&l| l < current)
+                .or(buf.anchors.last())
+        }
+        .copied();
+        match target {
+            Some(line) if line != current => {
+                self.buf_mut().cursor = Pos::new(line, 0);
+                self.scroll_to_cursor_centered();
+                if !self.options.linenumbers {
+                    self.set_status("Jumped to anchor");
+                }
+            }
+            Some(_) => self.set_status("This is the only anchor"),
+            None => self.set_status_mild("There are no anchors"),
+        }
+    }
+
     /// Whether `c` forms part of a word for `^]` completion: nano's
     /// `is_word_char(c, FALSE)` -- alphanumeric, or listed in `wordchars`.
     /// Unlike word movement, an underscore counts only via `wordchars`.
@@ -876,7 +929,8 @@ impl Editor {
     }
 
     /// `set positionlog`, on closing a named buffer: remember where its
-    /// cursor was (nano's `update_poshistory` from `close_and_go`).
+    /// cursor was, and which lines had anchors (nano's `update_poshistory`
+    /// from `close_and_go`).
     fn record_position(&mut self) {
         let buf = &self.buffers[self.current];
         let Some(fullpath) = buf.path.as_deref().and_then(crate::fileio::full_path) else {
@@ -886,13 +940,14 @@ impl Editor {
         let tabsize = self.options.tabsize as usize;
         let column = crate::buffer::display_width(&text, buf.cursor.col, tabsize) + 1;
         let line = buf.cursor.line + 1;
+        let anchors: Vec<usize> = buf.anchors.iter().map(|l| l + 1).collect();
         if let Some(log) = self.positions.as_mut() {
-            log.update(&fullpath.to_string_lossy(), line, column);
+            log.update(&fullpath.to_string_lossy(), line, column, &anchors);
         }
     }
 
     /// `set positionlog`, on opening a file into the current buffer: put
-    /// the cursor back where it was last left (nano's
+    /// the anchors and the cursor back where they were last left (nano's
     /// `restore_cursor_position_if_any`), placing the viewport as for a
     /// `+LINE` given on the command line. Returns whether it did.
     pub fn restore_position(&mut self) -> bool {
@@ -904,7 +959,7 @@ impl Editor {
         else {
             return false;
         };
-        let Some((line, column)) = self
+        let Some((line, column, anchors)) = self
             .positions
             .as_mut()
             .and_then(|log| log.lookup(&fullpath.to_string_lossy()))
@@ -913,6 +968,16 @@ impl Editor {
         };
         let tabsize = self.options.tabsize as usize;
         let buf = self.buf_mut();
+        // nano's `restore_anchors`: a number past the end of the file
+        // anchors nothing.
+        let lines = buf.line_count();
+        buf.anchors = anchors
+            .into_iter()
+            .filter(|&n| n >= 1 && n <= lines)
+            .map(|n| n - 1)
+            .collect();
+        buf.anchors.sort_unstable();
+        buf.anchors.dedup();
         // nano's `goto_line_and_column`: clamped to the file, and the
         // column a display column.
         buf.cursor.line = line.max(1).min(buf.line_count()) - 1;
@@ -1082,7 +1147,9 @@ impl Editor {
             TopRow => self.move_top_row(),
             BottomRow => self.move_bottom_row(),
             FindBracket => self.find_bracket(),
-            Anchor | PrevAnchor | NextAnchor => self.set_status("anchors: not yet implemented"),
+            Anchor => self.put_or_lift_anchor(),
+            PrevAnchor => self.jump_to_anchor(false),
+            NextAnchor => self.jump_to_anchor(true),
             PrevBuf => self.switch_buffer(-1),
             NextBuf => self.switch_buffer(1),
             Verbatim => {
@@ -1592,7 +1659,9 @@ impl Editor {
 
     /// Replace whatever `tool_input_text` returned with `new_text`,
     /// matching nano's `replace_buffer` (used by `treat()` for the
-    /// alt-speller and the formatter).
+    /// alt-speller and the formatter). Replacing the whole text leaves
+    /// no anchor behind: the cut would have gathered them all onto the
+    /// first line, which nano's `treat` then wipes.
     pub(crate) fn replace_tool_input(&mut self, new_text: &str) {
         let range = self.selection_range();
         let start = match range {
@@ -1605,6 +1674,7 @@ impl Editor {
                 let last_col = self.buf().line(last_line).chars().count();
                 self.buf_mut()
                     .delete_range(Pos::new(0, 0), Pos::new(last_line, last_col));
+                self.buf_mut().anchors.clear();
                 Pos::new(0, 0)
             }
         };
@@ -1661,7 +1731,13 @@ impl Editor {
             }
             let was_line = self.buf().cursor.line;
             let new_text = join_lines(&result);
+            // nano's `justify_text` wipes the anchor the first line ends
+            // up with unless the first line itself had one.
+            let first_line_anchored = self.buf().has_anchor(0);
             self.replace_tool_input(&new_text);
+            if first_line_anchored {
+                self.buf_mut().anchors = vec![0];
+            }
             let target = was_line.min(self.buf().line_count().saturating_sub(1));
             self.buf_mut().cursor = Pos::new(target, 0);
             self.scroll_to_cursor();
@@ -5081,6 +5157,185 @@ mod tests {
         // final newline, and that is where next stops.
         ed.execute(Action::NextBlock);
         assert_eq!(ed.buf().cursor, Pos::new(4, 0));
+    }
+
+    /// nano's `put_or_lift_anchor`: `M-Ins` toggles an anchor on the
+    /// cursor's line, saying so unless the line-number margin or the
+    /// minibar shows the mark instead.
+    #[test]
+    fn anchor_is_placed_and_lifted_with_a_message_unless_shown_in_the_margin() {
+        let mut ed = test_editor("a\nb\nc\n");
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.execute(Action::Anchor);
+        assert_eq!(ed.buf().anchors, vec![1]);
+        assert_eq!(ed.status.as_deref(), Some("Placed anchor"));
+        ed.execute(Action::Anchor);
+        assert_eq!(ed.buf().anchors, Vec::<usize>::new());
+        assert_eq!(ed.status.as_deref(), Some("Removed anchor"));
+
+        ed.options.linenumbers = true;
+        ed.status = None;
+        ed.execute(Action::Anchor);
+        assert!(ed.buf().has_anchor(1));
+        assert_eq!(ed.status, None, "the margin's dagger says it");
+
+        ed.options.linenumbers = false;
+        ed.options.minibar = true;
+        ed.execute(Action::Anchor);
+        assert!(!ed.buf().has_anchor(1));
+        assert_eq!(ed.status, None, "so does the minibar's");
+        ed.options.zero = true;
+        ed.execute(Action::Anchor);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("Placed anchor"),
+            "unless `zero` hides the minibar"
+        );
+    }
+
+    /// nano's `to_prev_anchor`/`to_next_anchor`: to the nearest anchor in
+    /// that direction, wrapping around the ends of the buffer, landing in
+    /// column 0; and what they say when there is nowhere to go.
+    #[test]
+    fn anchor_jumps_wrap_around_and_report_when_there_is_nothing_to_jump_to() {
+        let mut ed = test_editor("l0\nl1\nl2\nl3\nl4\nl5\n");
+        ed.execute(Action::NextAnchor);
+        assert_eq!(ed.status.as_deref(), Some("There are no anchors"));
+        assert_eq!(ed.status_level, StatusLevel::Mild);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 0));
+
+        ed.buf_mut().cursor = Pos::new(1, 1);
+        ed.execute(Action::Anchor);
+        ed.execute(Action::NextAnchor);
+        assert_eq!(ed.status.as_deref(), Some("This is the only anchor"));
+        assert_eq!(ed.buf().cursor, Pos::new(1, 1));
+
+        ed.buf_mut().cursor = Pos::new(4, 0);
+        ed.execute(Action::Anchor);
+        ed.buf_mut().cursor = Pos::new(2, 1);
+        ed.execute(Action::NextAnchor);
+        assert_eq!(ed.buf().cursor, Pos::new(4, 0));
+        assert_eq!(ed.status.as_deref(), Some("Jumped to anchor"));
+        ed.execute(Action::NextAnchor);
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0), "wraps around the bottom");
+        ed.execute(Action::PrevAnchor);
+        assert_eq!(ed.buf().cursor, Pos::new(4, 0), "wraps around the top");
+        ed.buf_mut().cursor = Pos::new(3, 1);
+        ed.execute(Action::PrevAnchor);
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0));
+
+        // With line numbers on, the margin's dagger says it all.
+        ed.options.linenumbers = true;
+        ed.status = None;
+        ed.execute(Action::NextAnchor);
+        assert_eq!(ed.buf().cursor, Pos::new(4, 0));
+        assert_eq!(ed.status, None);
+    }
+
+    /// Anchors ride along with their lines through edits the way nano's
+    /// per-line flag does: lines inserted above shift them down, a split
+    /// keeps the anchor on the upper half, joining two lines keeps either
+    /// one's, a cut line's anchor goes to the line that takes its place,
+    /// pasted text brings none along, and undo/redo put things back.
+    #[test]
+    fn anchors_follow_their_lines_through_edits_and_undo() {
+        let mut ed = test_editor("one\ntwo\nthree\nfour\n");
+        ed.buf_mut().cursor = Pos::new(2, 0);
+        ed.execute(Action::Anchor);
+        assert_eq!(ed.buf().anchors, vec![2]);
+
+        // Enter at the end of line 0 pushes the anchored line down, and
+        // undoing that brings it back.
+        ed.buf_mut().cursor = Pos::new(0, 3);
+        ed.execute(Action::Enter);
+        assert_eq!(ed.buf().anchors, vec![3]);
+        ed.execute(Action::Undo);
+        assert_eq!(ed.buf().anchors, vec![2]);
+
+        // Splitting the anchored line keeps the anchor on the upper half;
+        // joining the halves again keeps it.
+        ed.buf_mut().cursor = Pos::new(2, 3);
+        ed.execute(Action::Enter);
+        assert_eq!(ed.buf().line(2), "thr");
+        assert_eq!(ed.buf().anchors, vec![2]);
+        ed.execute(Action::Backspace);
+        assert_eq!(ed.buf().line(2), "three");
+        assert_eq!(ed.buf().anchors, vec![2]);
+
+        // Cutting the anchored line hands its anchor to the next line,
+        // which moves up into its place; undo restores the cut line with
+        // its anchor and takes the inherited one away again.
+        ed.buf_mut().cursor = Pos::new(2, 0);
+        ed.execute(Action::Cut);
+        assert_eq!(ed.buf().line(2), "four");
+        assert_eq!(ed.buf().anchors, vec![2]);
+        ed.execute(Action::Undo);
+        assert_eq!(ed.buf().line(2), "three");
+        assert_eq!(ed.buf().anchors, vec![2]);
+        ed.execute(Action::Redo);
+        assert_eq!(ed.buf().line(2), "four");
+        assert_eq!(ed.buf().anchors, vec![2]);
+
+        // Pasting the cut line back in above brings no anchor with it.
+        ed.buf_mut().cursor = Pos::new(0, 0);
+        ed.execute(Action::Paste);
+        assert_eq!(ed.buf().line(0), "three");
+        assert_eq!(ed.buf().anchors, vec![3]);
+
+        // Joining the anchored line onto the line above keeps the anchor
+        // on the merged line.
+        ed.buf_mut().cursor = Pos::new(3, 0);
+        ed.execute(Action::Backspace);
+        assert_eq!(ed.buf().line(2), "twofour");
+        assert_eq!(ed.buf().anchors, vec![2]);
+
+        // A cut region spanning two anchored lines leaves one anchor, on
+        // the line the region collapses into.
+        ed.buf_mut().cursor = Pos::new(0, 0);
+        ed.execute(Action::Anchor);
+        assert_eq!(ed.buf().anchors, vec![0, 2]);
+        ed.buf_mut().mark = Some(Pos::new(0, 1));
+        ed.buf_mut().cursor = Pos::new(2, 3);
+        ed.execute(Action::Cut);
+        assert_eq!(ed.buf().line(0), "tfour");
+        assert_eq!(ed.buf().anchors, vec![0]);
+    }
+
+    /// `set positionlog` keeps a file's anchors between sessions, in
+    /// nano's own format (their 1-based line numbers ahead of the path).
+    #[test]
+    fn anchors_are_restored_from_and_recorded_to_the_position_log() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let file = dir.join(format!("tico_anchor_poslog_{pid}.txt"));
+        std::fs::write(&file, "a\nb\nc\nd\n").unwrap();
+        let logpath = dir.join(format!("tico_anchor_poslog_{pid}.log"));
+        let _ = std::fs::remove_file(&logpath);
+        let fullpath = crate::fileio::full_path(&file)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut log = crate::poslog::PositionLog::at(logpath.clone()).unwrap();
+        log.update(&fullpath, 2, 1, &[1, 3, 99]);
+
+        let mut ed = test_editor("a\nb\nc\nd\n");
+        ed.buf_mut().path = Some(file.clone());
+        ed.positions = Some(log);
+        assert!(ed.restore_position());
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0));
+        assert_eq!(
+            ed.buf().anchors,
+            vec![0, 2],
+            "a number past the end of the file anchors nothing"
+        );
+
+        ed.buf_mut().cursor = Pos::new(3, 0);
+        ed.execute(Action::Anchor);
+        ed.close_current_buffer();
+        let text = std::fs::read_to_string(&logpath).unwrap();
+        assert_eq!(text, format!("1 3 4 {fullpath} 4 1\n"));
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_file(&logpath).ok();
     }
 
     /// A block jump that lands off-screen centers the cursor, as nano's
