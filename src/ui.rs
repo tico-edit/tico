@@ -6381,9 +6381,11 @@ mod tests {
         press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(ed.mode, Mode::Browser));
         assert_eq!(ed.browser.as_ref().unwrap().list.dir, dir.join("sub"));
+        // In the OS's own wording, which differs on Windows.
+        let why = crate::browser::strerror(&std::fs::read_dir(dir.join("nowhere")).unwrap_err());
         assert_eq!(
             ed.status.as_deref(),
-            Some("Cannot open directory: No such file or directory")
+            Some(format!("Cannot open directory: {why}").as_str())
         );
         assert_eq!(ed.status_level, crate::app::StatusLevel::Alert);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -6486,6 +6488,8 @@ mod tests {
         assert_eq!(prompt.label, "File to insert [from ./]");
     }
 
+    // Runs `sh` syntax and Unix tools under `$SHELL`/`/bin/sh`.
+    #[cfg(unix)]
     #[test]
     fn execute_command_inserts_output_at_cursor() {
         let mut ed = test_editor("ab");
@@ -6496,6 +6500,7 @@ mod tests {
         assert_eq!(ed.history.execute, vec!["echo -n hello".to_string()]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn execute_command_new_buffer_opens_a_separate_buffer() {
         let mut ed = test_editor("original");
@@ -6525,6 +6530,7 @@ mod tests {
         assert_eq!((prompt.input.as_str(), prompt.cursor), ("wc", 1));
     }
 
+    #[cfg(unix)]
     #[test]
     fn piped_command_filters_the_whole_buffer_as_one_undo_step() {
         let mut ed = test_editor("one\ntwo\nthree\n");
@@ -6539,6 +6545,7 @@ mod tests {
         assert_eq!(ed.buf().to_string(), "one\ntwo\nthree\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn piped_command_filters_just_the_marked_region() {
         let mut ed = test_editor("one\ntwo\nthree\n");
@@ -6550,6 +6557,7 @@ mod tests {
         assert_eq!(ed.buf().cursor, Pos::new(2, 0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn piped_command_output_gets_a_magic_line_at_the_end_of_the_buffer() {
         let mut ed = test_editor("one\n");
@@ -6557,16 +6565,25 @@ mod tests {
         assert_eq!(ed.buf().to_string(), "x\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn piped_command_that_ignores_its_input_still_succeeds() {
         // Far more than a pipe holds, so the write always breaks the pipe
         // once the command has exited without reading it.
         let mut ed = test_editor(&"abcdefghij\n".repeat(200_000));
         submit_execute_command(&mut ed, "|printf x", false);
-        assert_eq!(ed.buf().to_string(), "x\n");
+        // Not assert_eq!: on failure that would print all 2.2MB of input.
+        let text = ed.buf().to_string();
+        assert!(
+            text == "x\n",
+            "expected \"x\\n\", got {} bytes starting {:?}",
+            text.len(),
+            text.chars().take(40).collect::<String>()
+        );
         assert_ne!(ed.status.as_deref(), Some("Piping failed"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn piped_command_with_new_buffer_leaves_the_original_alone() {
         let mut ed = test_editor("one\ntwo\n");
@@ -6576,6 +6593,7 @@ mod tests {
         assert_eq!(ed.buf().to_string().trim(), "2");
     }
 
+    #[cfg(unix)]
     #[test]
     fn failing_piped_command_restores_the_buffer() {
         let mut ed = test_editor("one\ntwo\n");
@@ -6585,6 +6603,7 @@ mod tests {
         assert_eq!(ed.status.as_deref(), Some("Error: ---"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn failing_command_reports_the_shells_complaint() {
         let mut ed = test_editor("");
@@ -6624,6 +6643,7 @@ mod tests {
         assert_eq!(ed.status.as_deref(), Some("Cancelled"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn double_bar_lets_stdout_through_but_still_captures_stderr() {
         let mut ed = test_editor("abc\n");

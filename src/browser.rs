@@ -466,7 +466,7 @@ pub fn full_dir_path(path: &Path) -> std::io::Result<PathBuf> {
 
 /// `canonicalize` on Windows hands back a `\\?\C:\...` verbatim path;
 /// show (and keep) the ordinary form when there is one.
-fn simplify_verbatim(path: PathBuf) -> PathBuf {
+pub(crate) fn simplify_verbatim(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         let s = path.to_string_lossy();
@@ -495,10 +495,10 @@ pub fn start_dir(answer: &str) -> Result<PathBuf, String> {
     std::env::current_dir().map_err(|_| "The working directory has disappeared".to_string())
 }
 
-/// `path` up to (not including) its last `/`; the whole of it when there
-/// is none.
+/// `path` up to (not including) its last separator (`/`, or on Windows
+/// also `\`); the whole of it when there is none.
 fn strip_last_component(path: &str) -> &str {
-    match path.rfind('/') {
+    match path.rfind(std::path::is_separator) {
         Some(i) => &path[..i],
         None => path,
     }

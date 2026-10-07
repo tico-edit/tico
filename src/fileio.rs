@@ -203,7 +203,7 @@ pub fn changed_on_disk_since(known: &DiskState, path: &Path) -> bool {
 /// resolved. Used to tell whether a Write Out name is the buffer's own.
 pub fn full_path(path: &Path) -> Option<std::path::PathBuf> {
     let path = std::path::PathBuf::from(expand_leading_tilde(&path.to_string_lossy()));
-    if let Ok(target) = std::fs::canonicalize(&path) {
+    if let Ok(target) = crate::browser::full_dir_path(&path) {
         return Some(target);
     }
     let name = path.file_name()?;
@@ -211,7 +211,7 @@ pub fn full_path(path: &Path) -> Option<std::path::PathBuf> {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     };
-    Some(std::fs::canonicalize(dir).ok()?.join(name))
+    Some(crate::browser::full_dir_path(dir).ok()?.join(name))
 }
 
 /// A human-readable summary of a freshly loaded file's size, matching
@@ -434,8 +434,8 @@ pub fn resolve_directory(dir: &str) -> Option<String> {
         return None;
     }
     let mut s = full.to_string_lossy().into_owned();
-    if !s.ends_with('/') {
-        s.push('/');
+    if !s.ends_with(std::path::MAIN_SEPARATOR) {
+        s.push(std::path::MAIN_SEPARATOR);
     }
     Some(s)
 }
@@ -459,19 +459,35 @@ fn next_free_name(name: &str, suffix: &str) -> Option<String> {
 /// Where `make_backup_of` first tries to put the backup of `realname`:
 /// without a backup directory, `realname~` alongside it; with one (`dir`,
 /// as `resolve_directory` left it), a numbered name in that directory
-/// built from the file's full path with each `/` turned into `!`.
+/// built from the file's full path with each `/` turned into `!` (see
+/// `backupdir_mangle`).
 fn backup_name(realname: &Path, dir: Option<&str>) -> Option<String> {
     let Some(dir) = dir else {
         return Some(format!("{}~", realname.display()));
     };
     let thename = match full_path(realname) {
-        Some(full) => full.to_string_lossy().replace('/', "!"),
+        Some(full) => backupdir_mangle(&full.to_string_lossy()),
         None => realname
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
     };
     next_free_name(&format!("{dir}{thename}"), "~")
+}
+
+/// A full path flattened into one file name for `set backupdir`: nano
+/// turns each `/` into `!`. On Windows the `\` separators and the drive's
+/// `:` (which would otherwise name an NTFS alternate data stream) go the
+/// same way, so `C:\dir\f.txt` becomes `C!!dir!f.txt`.
+pub(crate) fn backupdir_mangle(full: &str) -> String {
+    #[cfg(windows)]
+    {
+        full.replace(['/', '\\', ':'], "!")
+    }
+    #[cfg(not(windows))]
+    {
+        full.replace('/', "!")
+    }
 }
 
 /// Whether writing to `realname` makes a backup first (the test at the
@@ -1004,7 +1020,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tico_test_backupdir_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let resolved = resolve_directory(&dir.to_string_lossy()).unwrap();
-        assert!(resolved.ends_with('/'), "{resolved}");
+        assert!(resolved.ends_with(std::path::MAIN_SEPARATOR), "{resolved}");
         assert!(Path::new(&resolved).is_absolute());
         let file = dir.join("plain");
         std::fs::write(&file, "x").unwrap();
