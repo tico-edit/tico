@@ -3801,7 +3801,7 @@ mod tests {
         ed.positions = crate::poslog::PositionLog::at(log.clone());
         ed.buf_mut().cursor = Pos::new(29, 2);
         ed.close_current_buffer();
-        let full = std::fs::canonicalize(&file).unwrap();
+        let full = crate::fileio::full_path(&file).unwrap();
         // The column is a display column: past the tab, on the 'i'.
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),

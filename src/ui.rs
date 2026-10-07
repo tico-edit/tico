@@ -6382,7 +6382,9 @@ mod tests {
         assert!(matches!(ed.mode, Mode::Browser));
         assert_eq!(ed.browser.as_ref().unwrap().list.dir, dir.join("sub"));
         // In the OS's own wording, which differs on Windows.
-        let why = crate::browser::strerror(&std::fs::read_dir(dir.join("nowhere")).unwrap_err());
+        let why = crate::browser::strerror(
+            &crate::browser::full_dir_path(&dir.join("nowhere")).unwrap_err(),
+        );
         assert_eq!(
             ed.status.as_deref(),
             Some(format!("Cannot open directory: {why}").as_str())
