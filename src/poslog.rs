@@ -151,6 +151,13 @@ fn parse_entry(line: &str) -> Option<Entry> {
     let column = atoi(parts.next()?);
     let lineno = atoi(parts.next()?);
     let filename = parts.next()?;
+    // tico 0.1.1 on Windows recorded `\\?\C:\...` verbatim paths; read
+    // them as the plain `C:\...` that full_path now gives, so they still
+    // match (and are written back that way).
+    #[cfg(windows)]
+    let filename = crate::browser::simplify_verbatim(filename.into())
+        .to_string_lossy()
+        .into_owned();
     Some(Entry {
         anchors: anchors.to_string(),
         filename: filename.to_string(),
@@ -200,6 +207,16 @@ mod tests {
         assert_eq!(log.lookup("/a/one.txt"), Some((12, 5, vec![])));
         assert_eq!(log.lookup("/a/two words.txt"), Some((1, 9, vec![3, 17])));
         assert_eq!(log.lookup("/a/after"), None, "nano stops at a blank line");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_paths_from_older_tico_still_match() {
+        let path = temp_log("verbatim");
+        std::fs::write(&path, "\\\\?\\C:\\dir\\f.txt 7 3\n").unwrap();
+        let mut log = PositionLog::at(path.clone()).unwrap();
+        assert_eq!(log.lookup("C:\\dir\\f.txt"), Some((7, 3, vec![])));
         std::fs::remove_file(&path).ok();
     }
 

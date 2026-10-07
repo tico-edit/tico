@@ -3729,15 +3729,12 @@ mod tests {
         ed.execute(Action::WriteOut);
         set_write_method(&mut ed, WriteMethod::Prepend);
         submit_write(&mut ed, &missing.display().to_string());
+        // The OS's own wording for it ("No such file or directory", or
+        // Windows's "The system cannot find the file specified.").
+        let why = crate::browser::strerror(&std::fs::read(&missing).unwrap_err());
         assert_eq!(
             ed.status.as_deref(),
-            Some(
-                format!(
-                    "Error reading {}: No such file or directory",
-                    missing.display()
-                )
-                .as_str()
-            )
+            Some(format!("Error reading {}: {why}", missing.display()).as_str())
         );
         assert!(!missing.exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3804,7 +3801,7 @@ mod tests {
         ed.positions = crate::poslog::PositionLog::at(log.clone());
         ed.buf_mut().cursor = Pos::new(29, 2);
         ed.close_current_buffer();
-        let full = std::fs::canonicalize(&file).unwrap();
+        let full = crate::fileio::full_path(&file).unwrap();
         // The column is a display column: past the tab, on the 'i'.
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
@@ -3951,10 +3948,9 @@ mod tests {
         ed.buf_mut().insert_str("three ");
         ed.execute(Action::SaveFile);
 
-        let mangled = std::fs::canonicalize(&own)
-            .unwrap()
-            .to_string_lossy()
-            .replace('/', "!");
+        let mangled = crate::fileio::backupdir_mangle(
+            &crate::fileio::full_path(&own).unwrap().to_string_lossy(),
+        );
         let first = backups.join(format!("{mangled}~"));
         let second = backups.join(format!("{mangled}~.1"));
         assert_eq!(std::fs::read_to_string(first).unwrap(), "one");

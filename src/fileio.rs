@@ -67,7 +67,7 @@ fn user_home_dir(name: &str) -> Option<std::path::PathBuf> {
     // getpwnam(3) uses a static buffer and isn't thread-safe; getpwnam_r
     // wants a caller-supplied buffer instead. 16KiB comfortably covers any
     // real /etc/passwd (or NSS-backed) entry.
-    let mut buf = vec![0_i8; 16 * 1024];
+    let mut buf: Vec<libc::c_char> = vec![0; 16 * 1024];
     let rc = unsafe {
         libc::getpwnam_r(
             cname.as_ptr(),
@@ -84,9 +84,23 @@ fn user_home_dir(name: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(dir.to_str().ok()?))
 }
 
+/// Windows has no user database to query by name, so only `~` followed by
+/// the current user's own name (`%USERNAME%`, compared case-insensitively
+/// as Windows does) expands, to the same directory as a bare `~`. Other
+/// users' names are left as-is rather than guessed at.
 #[cfg(not(unix))]
-fn user_home_dir(_name: &str) -> Option<std::path::PathBuf> {
-    None
+fn user_home_dir(name: &str) -> Option<std::path::PathBuf> {
+    let me = current_username()?;
+    if name.eq_ignore_ascii_case(&me) {
+        dirs::home_dir()
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn current_username() -> Option<String> {
+    std::env::var("USERNAME").ok().filter(|s| !s.is_empty())
 }
 
 /// All usernames on the system, for `~user<Tab>` completion at the `^R`
@@ -122,9 +136,11 @@ pub fn list_usernames() -> Vec<String> {
     names
 }
 
+/// Just the current user on Windows, the only name `~user` expands for
+/// there (see the non-Unix `user_home_dir`).
 #[cfg(not(unix))]
 pub fn list_usernames() -> Vec<String> {
-    Vec::new()
+    current_username().into_iter().collect()
 }
 
 fn hash_content(s: &str) -> u64 {
@@ -187,7 +203,7 @@ pub fn changed_on_disk_since(known: &DiskState, path: &Path) -> bool {
 /// resolved. Used to tell whether a Write Out name is the buffer's own.
 pub fn full_path(path: &Path) -> Option<std::path::PathBuf> {
     let path = std::path::PathBuf::from(expand_leading_tilde(&path.to_string_lossy()));
-    if let Ok(target) = std::fs::canonicalize(&path) {
+    if let Ok(target) = crate::browser::full_dir_path(&path) {
         return Some(target);
     }
     let name = path.file_name()?;
@@ -195,7 +211,7 @@ pub fn full_path(path: &Path) -> Option<std::path::PathBuf> {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     };
-    Some(std::fs::canonicalize(dir).ok()?.join(name))
+    Some(crate::browser::full_dir_path(dir).ok()?.join(name))
 }
 
 /// A human-readable summary of a freshly loaded file's size, matching
@@ -418,8 +434,8 @@ pub fn resolve_directory(dir: &str) -> Option<String> {
         return None;
     }
     let mut s = full.to_string_lossy().into_owned();
-    if !s.ends_with('/') {
-        s.push('/');
+    if !s.ends_with(std::path::MAIN_SEPARATOR) {
+        s.push(std::path::MAIN_SEPARATOR);
     }
     Some(s)
 }
@@ -443,19 +459,35 @@ fn next_free_name(name: &str, suffix: &str) -> Option<String> {
 /// Where `make_backup_of` first tries to put the backup of `realname`:
 /// without a backup directory, `realname~` alongside it; with one (`dir`,
 /// as `resolve_directory` left it), a numbered name in that directory
-/// built from the file's full path with each `/` turned into `!`.
+/// built from the file's full path with each `/` turned into `!` (see
+/// `backupdir_mangle`).
 fn backup_name(realname: &Path, dir: Option<&str>) -> Option<String> {
     let Some(dir) = dir else {
         return Some(format!("{}~", realname.display()));
     };
     let thename = match full_path(realname) {
-        Some(full) => full.to_string_lossy().replace('/', "!"),
+        Some(full) => backupdir_mangle(&full.to_string_lossy()),
         None => realname
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
     };
     next_free_name(&format!("{dir}{thename}"), "~")
+}
+
+/// A full path flattened into one file name for `set backupdir`: nano
+/// turns each `/` into `!`. On Windows the `\` separators and the drive's
+/// `:` (which would otherwise name an NTFS alternate data stream) go the
+/// same way, so `C:\dir\f.txt` becomes `C!!dir!f.txt`.
+pub(crate) fn backupdir_mangle(full: &str) -> String {
+    #[cfg(windows)]
+    {
+        full.replace(['/', '\\', ':'], "!")
+    }
+    #[cfg(not(windows))]
+    {
+        full.replace('/', "!")
+    }
 }
 
 /// Whether writing to `realname` makes a backup first (the test at the
@@ -988,7 +1020,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tico_test_backupdir_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let resolved = resolve_directory(&dir.to_string_lossy()).unwrap();
-        assert!(resolved.ends_with('/'), "{resolved}");
+        assert!(resolved.ends_with(std::path::MAIN_SEPARATOR), "{resolved}");
         assert!(Path::new(&resolved).is_absolute());
         let file = dir.join("plain");
         std::fs::write(&file, "x").unwrap();
@@ -1177,21 +1209,68 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tilde_expansion_for_current_user_by_name() {
-        // getpwnam_r should resolve our own username to the same home
-        // directory dirs::home_dir() reports.
-        let Ok(user) = std::env::var("USER") else {
-            return; // not set in this environment; skip rather than fail
+        // getpwnam_r should resolve our own username to our passwd entry's
+        // home directory. Take both from the passwd database (by uid)
+        // rather than $USER/$HOME, which needn't agree with it -- e.g. in
+        // a `cross` container $USER is the host user, absent from the
+        // container's /etc/passwd, and $HOME is the container's.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf: Vec<libc::c_char> = vec![0; 16 * 1024];
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
         };
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(
-            expand_leading_tilde(&format!("~{user}")),
-            home.display().to_string()
-        );
+        if rc != 0 || result.is_null() {
+            return; // no passwd entry for our uid; skip rather than fail
+        }
+        let (user, home) = unsafe {
+            (
+                std::ffi::CStr::from_ptr(pwd.pw_name)
+                    .to_string_lossy()
+                    .into_owned(),
+                std::ffi::CStr::from_ptr(pwd.pw_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        assert_eq!(expand_leading_tilde(&format!("~{user}")), home);
         assert_eq!(
             expand_leading_tilde(&format!("~{user}/x")),
-            format!("{}/x", home.display())
+            format!("{home}/x")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tilde_expansion_for_current_user_by_name() {
+        // Windows: only our own name expands (case-insensitively), to the
+        // same directory as a bare `~`; anyone else's is left alone.
+        let Ok(user) = std::env::var("USERNAME") else {
+            return; // not set in this environment; skip rather than fail
+        };
+        let home = dirs::home_dir().unwrap().display().to_string();
+        assert_eq!(expand_leading_tilde(&format!("~{user}")), home);
+        assert_eq!(
+            expand_leading_tilde(&format!("~{user}/x")),
+            format!("{home}/x")
+        );
+        assert_eq!(
+            expand_leading_tilde(&format!("~{}", user.to_uppercase())),
+            home
+        );
+        assert_eq!(
+            expand_leading_tilde("~tico_test_no_such_user_xyz"),
+            "~tico_test_no_such_user_xyz"
+        );
+        assert_eq!(list_usernames(), vec![user]);
     }
 
     #[test]

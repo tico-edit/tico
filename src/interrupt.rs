@@ -28,6 +28,14 @@ impl CommandInterrupt {
     }
 }
 
+/// Nothing to undo off Unix, but callers `drop()` the guard explicitly to
+/// mark where `^C` stops applying; without a `Drop` impl that trips
+/// clippy's `drop_non_drop` there.
+#[cfg(not(unix))]
+impl Drop for CommandInterrupt {
+    fn drop(&mut self) {}
+}
+
 /// The process `^C` would kill right now, if any -- for tests that need
 /// to interrupt a command they started indirectly.
 #[cfg(all(test, unix))]
