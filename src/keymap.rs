@@ -565,7 +565,10 @@ impl Key {
 
     /// Sort key for showing the "primary" binding of an action before its
     /// alternates, roughly matching nano's own convention (Ctrl first, then
-    /// function keys, then Meta).
+    /// function keys, then Meta) -- and, within Ctrl and Meta, a special
+    /// key before a character, the order nano's `shortcut_init` registers
+    /// them in: its help shows `M-◂ (M-,)` for the previous buffer and
+    /// `M-Ins (M-")` for anchors (confirmed against the installed nano).
     pub(crate) fn display_rank(&self) -> (u8, i32) {
         match self {
             Key::Ctrl(c) => (0, *c as i32),
@@ -577,6 +580,16 @@ impl Key {
             | Key::CtrlEnd
             | Key::CtrlDel => (0, 0),
             Key::F(n) => (1, *n as i32),
+            Key::MetaLeft
+            | Key::MetaRight
+            | Key::MetaUp
+            | Key::MetaDown
+            | Key::MetaHome
+            | Key::MetaEnd
+            | Key::MetaPgUp
+            | Key::MetaPgDn
+            | Key::MetaIns
+            | Key::MetaDel => (2, 0),
             Key::Meta(c) => (2, *c as i32),
             Key::ShiftMeta(c) => (3, *c as i32),
             _ => (4, 0),
@@ -883,8 +896,10 @@ impl KeyMap {
         b(K::MetaPgDn, A::NextAnchor);
         b(K::Meta('\''), A::NextAnchor);
         b(K::MetaLeft, A::PrevBuf);
+        b(K::Meta(','), A::PrevBuf);
         b(K::Meta('<'), A::PrevBuf);
         b(K::MetaRight, A::NextBuf);
+        b(K::Meta('.'), A::NextBuf);
         b(K::Meta('>'), A::NextBuf);
         b(K::Meta('V'), A::Verbatim);
         b(K::Ctrl('I'), A::Tab);
@@ -1345,21 +1360,25 @@ mod tests {
     }
 
     #[test]
-    fn buffer_switch_uses_the_shifted_m_less_greater_keys_not_unshifted_comma_period() {
-        // Confirmed against the installed nano: M-, and M-. do NOT switch
-        // buffers there -- only the shifted M-< / M-> (plus the M-Left /
-        // M-Right arrow-key aliases) do.
+    fn buffer_switch_takes_both_the_shifted_and_unshifted_comma_period_keys() {
+        // nano 8.7.1's global.c binds M-, and M-< to the previous buffer
+        // and M-. and M-> to the next, alongside M-Left / M-Right -- and
+        // the installed nano does switch on all of them (issue #39).
         let km = KeyMap::defaults(false);
-        assert_eq!(
-            km.lookup(Menu::Main, Key::Meta('<')),
-            Some(&Binding::Action(Action::PrevBuf))
-        );
-        assert_eq!(
-            km.lookup(Menu::Main, Key::Meta('>')),
-            Some(&Binding::Action(Action::NextBuf))
-        );
-        assert_eq!(km.lookup(Menu::Main, Key::Meta(',')), None);
-        assert_eq!(km.lookup(Menu::Main, Key::Meta('.')), None);
+        for key in [Key::Meta(','), Key::Meta('<'), Key::MetaLeft] {
+            assert_eq!(
+                km.lookup(Menu::Main, key),
+                Some(&Binding::Action(Action::PrevBuf)),
+                "{key:?}"
+            );
+        }
+        for key in [Key::Meta('.'), Key::Meta('>'), Key::MetaRight] {
+            assert_eq!(
+                km.lookup(Menu::Main, key),
+                Some(&Binding::Action(Action::NextBuf)),
+                "{key:?}"
+            );
+        }
     }
 
     #[test]
