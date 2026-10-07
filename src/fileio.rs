@@ -67,7 +67,7 @@ fn user_home_dir(name: &str) -> Option<std::path::PathBuf> {
     // getpwnam(3) uses a static buffer and isn't thread-safe; getpwnam_r
     // wants a caller-supplied buffer instead. 16KiB comfortably covers any
     // real /etc/passwd (or NSS-backed) entry.
-    let mut buf = vec![0_i8; 16 * 1024];
+    let mut buf: Vec<libc::c_char> = vec![0; 16 * 1024];
     let rc = unsafe {
         libc::getpwnam_r(
             cname.as_ptr(),
@@ -84,9 +84,23 @@ fn user_home_dir(name: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(dir.to_str().ok()?))
 }
 
+/// Windows has no user database to query by name, so only `~` followed by
+/// the current user's own name (`%USERNAME%`, compared case-insensitively
+/// as Windows does) expands, to the same directory as a bare `~`. Other
+/// users' names are left as-is rather than guessed at.
 #[cfg(not(unix))]
-fn user_home_dir(_name: &str) -> Option<std::path::PathBuf> {
-    None
+fn user_home_dir(name: &str) -> Option<std::path::PathBuf> {
+    let me = current_username()?;
+    if name.eq_ignore_ascii_case(&me) {
+        dirs::home_dir()
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn current_username() -> Option<String> {
+    std::env::var("USERNAME").ok().filter(|s| !s.is_empty())
 }
 
 /// All usernames on the system, for `~user<Tab>` completion at the `^R`
@@ -122,9 +136,11 @@ pub fn list_usernames() -> Vec<String> {
     names
 }
 
+/// Just the current user on Windows, the only name `~user` expands for
+/// there (see the non-Unix `user_home_dir`).
 #[cfg(not(unix))]
 pub fn list_usernames() -> Vec<String> {
-    Vec::new()
+    current_username().into_iter().collect()
 }
 
 fn hash_content(s: &str) -> u64 {
@@ -1177,21 +1193,68 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tilde_expansion_for_current_user_by_name() {
-        // getpwnam_r should resolve our own username to the same home
-        // directory dirs::home_dir() reports.
-        let Ok(user) = std::env::var("USER") else {
-            return; // not set in this environment; skip rather than fail
+        // getpwnam_r should resolve our own username to our passwd entry's
+        // home directory. Take both from the passwd database (by uid)
+        // rather than $USER/$HOME, which needn't agree with it -- e.g. in
+        // a `cross` container $USER is the host user, absent from the
+        // container's /etc/passwd, and $HOME is the container's.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf: Vec<libc::c_char> = vec![0; 16 * 1024];
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
         };
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(
-            expand_leading_tilde(&format!("~{user}")),
-            home.display().to_string()
-        );
+        if rc != 0 || result.is_null() {
+            return; // no passwd entry for our uid; skip rather than fail
+        }
+        let (user, home) = unsafe {
+            (
+                std::ffi::CStr::from_ptr(pwd.pw_name)
+                    .to_string_lossy()
+                    .into_owned(),
+                std::ffi::CStr::from_ptr(pwd.pw_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        assert_eq!(expand_leading_tilde(&format!("~{user}")), home);
         assert_eq!(
             expand_leading_tilde(&format!("~{user}/x")),
-            format!("{}/x", home.display())
+            format!("{home}/x")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tilde_expansion_for_current_user_by_name() {
+        // Windows: only our own name expands (case-insensitively), to the
+        // same directory as a bare `~`; anyone else's is left alone.
+        let Ok(user) = std::env::var("USERNAME") else {
+            return; // not set in this environment; skip rather than fail
+        };
+        let home = dirs::home_dir().unwrap().display().to_string();
+        assert_eq!(expand_leading_tilde(&format!("~{user}")), home);
+        assert_eq!(
+            expand_leading_tilde(&format!("~{user}/x")),
+            format!("{home}/x")
+        );
+        assert_eq!(
+            expand_leading_tilde(&format!("~{}", user.to_uppercase())),
+            home
+        );
+        assert_eq!(
+            expand_leading_tilde("~tico_test_no_such_user_xyz"),
+            "~tico_test_no_such_user_xyz"
+        );
+        assert_eq!(list_usernames(), vec![user]);
     }
 
     #[test]

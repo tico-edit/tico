@@ -17,3 +17,20 @@ jobs:
   ci:
     uses: uperl/action-rust-ci/.github/workflows/ci.yml@v1
 
+  # aarch64 Linux: catches target-specific breakage (e.g. c_char being u8
+  # rather than i8) that the x86_64 jobs can't see. fmt and clippy are
+  # platform-independent enough that once is plenty.
+  ci-arm64:
+    uses: uperl/action-rust-ci/.github/workflows/ci.yml@v1
+    with:
+      runs-on: ubuntu-24.04-arm
+      run-fmt: false
+      run-clippy: false
+
+  # Windows: catches Windows-only clippy lints and test failures in the
+  # cfg(not(unix)) / cfg(windows) code paths the Linux jobs never compile.
+  ci-windows:
+    uses: uperl/action-rust-ci/.github/workflows/ci.yml@v1
+    with:
+      runs-on: windows-latest
+      run-fmt: false
