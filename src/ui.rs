@@ -104,6 +104,12 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
 
         let mut dirty = false;
 
+        // `set preserve`: the terminal handles ^S/^Q itself, except for a
+        // keystroke being typed verbatim.
+        if editor.options.preserve {
+            crate::flowcontrol::set(editor.verbatim.is_none());
+        }
+
         if event::poll(Duration::from_millis(600))? {
             // A terminal delivers a clipboard paste as a burst of individual
             // synthetic keystrokes, not one chunk (nano has no bracketed-paste
@@ -2415,10 +2421,19 @@ fn run_shell_command(
     let status = child.wait()?;
     drop(interrupt);
     read?;
+    // A command that exits without reading all of its input (`printf x`,
+    // `head -1`) breaks the pipe, which is no failure: nano's sender never
+    // even sees that (it holds the pipe's read end open itself), so it
+    // always succeeds for a buffer that fits in the pipe -- whereas here,
+    // whether the write lost the race with the command's exit would decide.
     let sending = sender.map_or(Ok(()), |handle| {
-        handle
+        match handle
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("sender panicked")))
+        {
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            other => other,
+        }
     });
     // No exit code means a signal ended it (only possible on Unix).
     Ok((
@@ -6439,6 +6454,16 @@ mod tests {
         let mut ed = test_editor("one\n");
         submit_execute_command(&mut ed, "|printf x", false);
         assert_eq!(ed.buf().to_string(), "x\n");
+    }
+
+    #[test]
+    fn piped_command_that_ignores_its_input_still_succeeds() {
+        // Far more than a pipe holds, so the write always breaks the pipe
+        // once the command has exited without reading it.
+        let mut ed = test_editor(&"abcdefghij\n".repeat(200_000));
+        submit_execute_command(&mut ed, "|printf x", false);
+        assert_eq!(ed.buf().to_string(), "x\n");
+        assert_ne!(ed.status.as_deref(), Some("Piping failed"));
     }
 
     #[test]

@@ -102,9 +102,20 @@ fn ticorc_path() -> Option<PathBuf> {
 /// `bind`/`unbind` directives, so those can still override individual
 /// modern-mode bindings — matching nano's own `global_init()`, which bakes
 /// modernbindings into the initial shortcut list before `parse_rcfile()`.
-pub fn load(explicit_rcfile: Option<&str>, ignore_rcfiles: bool, modern: bool) -> LoadedConfig {
+/// `preserve` is `-p`/`--preserve` (but not a nanorc's `set preserve`),
+/// which leaves `^S`/`^Q` out of that same initial list; see
+/// `KeyMap::drop_flow_control_keys`.
+pub fn load(
+    explicit_rcfile: Option<&str>,
+    ignore_rcfiles: bool,
+    modern: bool,
+    preserve: bool,
+) -> LoadedConfig {
     let mut options = Options::default();
     let mut keymap = KeyMap::defaults(modern);
+    if preserve && !modern {
+        keymap.drop_flow_control_keys();
+    }
     let mut warnings = Vec::new();
     let mut startup_problem = None;
 

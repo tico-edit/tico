@@ -89,6 +89,21 @@ On Windows none of this is set up (`src/interrupt.rs` is Unix-only), so
 `^C` cannot cancel a running command there; tico waits until the
 command finishes on its own.
 
+## `set preserve`: no effect on Windows
+
+`preserve` (`-p`) turns the terminal's XON/XOFF flow control back on, so
+`^S` and `^Q` stop and resume output instead of reaching tico, as in
+nano. Windows consoles have no XON/XOFF, so there it only unbinds the
+keys (with `-p`); `^S` and `^Q` still arrive as ordinary keystrokes.
+
+## Piping a large buffer to a command that doesn't read it
+
+When `M-\` (Pipe Text) sends the buffer to a command that exits without
+reading all of it (`printf x`, `head -1`), tico takes the command's output
+like any other. nano does too while the text fits in the pipe (64 KiB on
+Linux). With more text than that, nano hangs until `^C`, then reports
+"Piping failed" and undoes.
+
 ## Help listing order and contents
 
 nano's `^G` help lists a menu's functions in its fixed registration

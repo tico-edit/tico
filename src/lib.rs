@@ -9,6 +9,7 @@ pub mod buffer;
 pub mod cli;
 pub mod config;
 pub mod fileio;
+pub mod flowcontrol;
 pub mod help;
 pub mod history;
 pub mod interrupt;

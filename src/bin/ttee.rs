@@ -111,7 +111,7 @@ fn main() {
         ignore_sigint();
     }
 
-    let loaded = tico::config::load(cli.rcfile.as_deref(), cli.ignorercfiles, false);
+    let loaded = tico::config::load(cli.rcfile.as_deref(), cli.ignorercfiles, false, false);
     let mut options = loaded.options;
     if let Some(v) = &cli.syntax {
         options.syntax_name = Some(v.clone());

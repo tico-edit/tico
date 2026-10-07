@@ -770,6 +770,22 @@ impl KeyMap {
         km
     }
 
+    /// `-p`/`--preserve`: leave out the default bindings of `^S` and `^Q`,
+    /// which the terminal then takes as XOFF/XON -- nano's `shortcut_init`
+    /// skips exactly these four when `PRESERVE` is set. (nano builds its
+    /// shortcuts before reading any nanorc, so only the command-line flag
+    /// does this; a nanorc's `set preserve` turns flow control back on but
+    /// leaves the keys bound, and a `bind` there can still claim them.)
+    pub fn drop_flow_control_keys(&mut self) {
+        use Key as K;
+        self.unbind(Menu::Main, K::Ctrl('S'));
+        for menu in [Menu::Main, Menu::Browser, Menu::Help] {
+            self.unbind(menu, K::Ctrl('Q'));
+        }
+        self.unbind(Menu::WriteOut, K::Ctrl('Q'));
+        self.unbind(Menu::Execute, K::Ctrl('S'));
+    }
+
     fn install_main_defaults(&mut self) {
         use Action as A;
         use Key as K;
@@ -1012,9 +1028,9 @@ impl KeyMap {
 
         self.bind(Menu::Execute, K::Ctrl('M'), Binding::Action(A::Execute));
         self.bind(Menu::Execute, K::Ctrl('G'), Binding::Action(A::Help));
-        // nano binds both ^S and ^T to the speller here (^S only when not
-        // `set preserve`, which tico doesn't implement, so unconditionally)
-        // — ^S sorts first and is what the shortcut bar shows.
+        // nano binds both ^S and ^T to the speller here (^S only without
+        // `-p`; see `drop_flow_control_keys`) — ^S sorts first and is what
+        // the shortcut bar shows.
         self.bind(Menu::Execute, K::Ctrl('S'), Binding::Action(A::Speller));
         self.bind(Menu::Execute, K::Ctrl('T'), Binding::Action(A::Speller));
         self.bind(Menu::Execute, K::Ctrl('Y'), Binding::Action(A::Linter));
@@ -1344,5 +1360,31 @@ mod tests {
         );
         assert_eq!(km.lookup(Menu::Main, Key::Meta(',')), None);
         assert_eq!(km.lookup(Menu::Main, Key::Meta('.')), None);
+    }
+
+    #[test]
+    fn preserve_drops_only_nanos_flow_control_bindings() {
+        let mut km = KeyMap::defaults(false);
+        km.drop_flow_control_keys();
+        for (menu, key) in [
+            (Menu::Main, Key::Ctrl('S')),
+            (Menu::Main, Key::Ctrl('Q')),
+            (Menu::Browser, Key::Ctrl('Q')),
+            (Menu::Help, Key::Ctrl('Q')),
+            (Menu::WriteOut, Key::Ctrl('Q')),
+            (Menu::Execute, Key::Ctrl('S')),
+        ] {
+            assert_eq!(km.lookup_menu_only(menu, key), None, "{menu:?} {key:?}");
+        }
+        // The other keys for the same functions stay.
+        let action = |menu, key| km.lookup_menu_only(menu, key).cloned();
+        assert_eq!(
+            action(Menu::Main, Key::Ctrl('B')),
+            Some(Binding::Action(Action::WhereWas))
+        );
+        assert_eq!(
+            action(Menu::Execute, Key::Ctrl('T')),
+            Some(Binding::Action(Action::Speller))
+        );
     }
 }
