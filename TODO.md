@@ -35,4 +35,3 @@ here.
 - [ ] `zap` (the setting: Backspace/Delete erase the marked region)
 - [ ] `colonparsing`
 - [ ] `rebinddelete`
-- [ ] `preserve`

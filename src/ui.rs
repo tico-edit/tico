@@ -104,6 +104,12 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
 
         let mut dirty = false;
 
+        // `set preserve`: the terminal handles ^S/^Q itself, except for a
+        // keystroke being typed verbatim.
+        if editor.options.preserve {
+            crate::flowcontrol::set(editor.verbatim.is_none());
+        }
+
         if event::poll(Duration::from_millis(600))? {
             // A terminal delivers a clipboard paste as a burst of individual
             // synthetic keystrokes, not one chunk (nano has no bracketed-paste

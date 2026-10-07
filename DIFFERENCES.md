@@ -89,6 +89,13 @@ On Windows none of this is set up (`src/interrupt.rs` is Unix-only), so
 `^C` cannot cancel a running command there; tico waits until the
 command finishes on its own.
 
+## `set preserve`: no effect on Windows
+
+`preserve` (`-p`) turns the terminal's XON/XOFF flow control back on, so
+`^S` and `^Q` stop and resume output instead of reaching tico, as in
+nano. Windows consoles have no XON/XOFF, so there it only unbinds the
+keys (with `-p`); `^S` and `^Q` still arrive as ordinary keystrokes.
+
 ## Help listing order and contents
 
 nano's `^G` help lists a menu's functions in its fixed registration

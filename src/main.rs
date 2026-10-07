@@ -12,9 +12,18 @@ fn main() -> anyhow::Result<()> {
     }
     let ignore_rcfiles = cli.ignorercfiles;
     let explicit_rcfile = cli.rcfile.as_deref();
-    let loaded = config::load(explicit_rcfile, ignore_rcfiles, cli.modernbindings);
+    let loaded = config::load(
+        explicit_rcfile,
+        ignore_rcfiles,
+        cli.modernbindings,
+        cli.preserve,
+    );
     let mut options = loaded.options;
     cli.apply(&mut options);
+    // nano: "When --modernbindings is used, ^Q and ^S need to be functional."
+    if cli.modernbindings {
+        options.preserve = false;
+    }
 
     // After config + CLI, so the summary reflects what an editing session
     // started with these same flags would actually use.
