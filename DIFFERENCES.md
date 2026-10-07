@@ -126,12 +126,15 @@ used with them. Do not remove Mac format to track newer nano; when the
 installed nano no longer has it, this becomes an intentional difference
 rather than a bug.
 
-## `set noconvert`: how kept carriage returns display
+## Verbatim input (`M-V`): special keys are re-encoded
 
-With conversion off, nano keeps a DOS or Mac file's CRs as content and
-shows each one as `^M`. tico keeps the bytes too, and writes them back
-unchanged, but its text store treats a CR as a line break: a CRLF file's
-CRs are invisible at the ends of their lines rather than shown as `^M`,
-and an old Mac file (bare CRs) displays as separate lines instead of one
-long line with `^M` markers. The default, converting on read, behaves as
-nano does.
+nano reads the raw bytes a keystroke sends and inserts those. tico's
+terminal layer hands it decoded keys instead, so for a key that sends an
+escape sequence (arrows, Home/End, Insert/Delete, PageUp/PageDown, F-keys,
+Shift-Tab) tico inserts the sequence an xterm-style terminal sends for that
+key in normal cursor mode -- `^[[A` for Up, `^[[1;5A` for Ctrl+Up,
+`^[[15~` for F5. That matches nano wherever the terminal agrees with
+xterm, but not where it doesn't: under tmux or screen, for example, Home
+sends `^[[1~`, which nano inserts and tico renders as `^[[H`. Plain
+characters, control codes, Tab, Enter, Backspace, Esc and Alt-combinations
+come out exactly as in nano, as does Unicode input by hex code.

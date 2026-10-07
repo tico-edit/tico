@@ -928,6 +928,21 @@ impl KeyMap {
         // that prompted double-checking all of these); history recall
         // (^P/^N) is shared much more broadly, across every prompt that
         // remembers previous entries.
+        // nano's `MMOST`: `M-V` works at every prompt that takes typing.
+        for &menu in &[
+            Menu::Search,
+            Menu::Replace,
+            Menu::ReplaceWith,
+            Menu::GotoLine,
+            Menu::WriteOut,
+            Menu::Insert,
+            Menu::Execute,
+            Menu::WhereIsFile,
+            Menu::GotoDir,
+            Menu::Spell,
+        ] {
+            self.bind(menu, K::Meta('V'), Binding::Action(A::Verbatim));
+        }
         self.bind(Menu::Search, K::Ctrl('M'), Binding::Action(A::WhereIs));
         self.bind(Menu::Search, K::Ctrl('R'), Binding::Action(A::FlipReplace));
         self.bind(Menu::Search, K::Ctrl('T'), Binding::Action(A::FlipGoto));

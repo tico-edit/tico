@@ -293,6 +293,15 @@ pub fn minibar_linecount_note(count: usize, format: crate::buffer::LineFormat) -
     }
 }
 
+/// A pending `M-V` (nano's `do_verbatim_input`): the next keystroke is
+/// taken as is rather than as a command. `unicode` is the value and digit
+/// count so far of a hexadecimal code being typed instead (nano's
+/// `assemble_unicode`), which a first keystroke that is a hex digit starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerbatimInput {
+    pub unicode: Option<(u32, u8)>,
+}
+
 #[derive(Default)]
 pub struct SearchState {
     pub last_pattern: Option<String>,
@@ -401,6 +410,9 @@ pub struct Editor {
     pub minibar_note: Option<String>,
     /// The open file browser, if any (see `Mode::Browser`).
     pub browser: Option<BrowserSession>,
+    /// Set by `M-V` (in the edit window or at a prompt) until the next
+    /// keystroke has been taken verbatim -- see `ui::handle_verbatim_key`.
+    pub verbatim: Option<VerbatimInput>,
 }
 
 impl Editor {
@@ -464,6 +476,7 @@ impl Editor {
             file_completions: None,
             minibar_note: None,
             browser: None,
+            verbatim: None,
         }
     }
 
@@ -1063,7 +1076,10 @@ impl Editor {
             Anchor | PrevAnchor | NextAnchor => self.set_status("anchors: not yet implemented"),
             PrevBuf => self.switch_buffer(-1),
             NextBuf => self.switch_buffer(1),
-            Verbatim => self.set_status("verbatim input: not yet implemented"),
+            Verbatim => {
+                self.verbatim = Some(VerbatimInput::default());
+                self.set_status("Verbatim Input");
+            }
             RecordMacro | RunMacro => self.set_status("macros: not yet implemented"),
             Refresh => self.full_refresh_pending = true,
             SuggestSuspend => self.suggest_ctrl_t_ctrl_z(),
@@ -1266,6 +1282,26 @@ impl Editor {
         } else {
             self.buf_mut().insert_char(c);
         }
+    }
+
+    /// Put what a verbatim keystroke produced into the text at the cursor
+    /// (nano's `inject`): as is, so a Tab stays a Tab under `tabstospaces`
+    /// and nothing is auto-indented. A 0x0A byte is a NUL in nano's line
+    /// data, so a ^J that came along (after an Esc) goes in as one.
+    pub fn insert_verbatim(&mut self, text: &str) {
+        self.cycling_aim = 0;
+        self.completion = None;
+        for c in text.chars() {
+            self.buf_mut().insert_char(if c == '\n' { '\0' } else { c });
+        }
+        // Typing drops a Shift-selection, as any edit does (see
+        // `ui::handle_editing_key`, which this keystroke bypasses).
+        if self.buf().softmark {
+            self.buf_mut().mark = None;
+            self.buf_mut().softmark = false;
+        }
+        self.maybe_update_lock_modified_flag();
+        self.scroll_to_cursor();
     }
 
     fn do_enter(&mut self) {
@@ -2960,6 +2996,7 @@ fn action_changes_something(action: Action) -> bool {
             | Formatter
             | Complete
             | Replace
+            | Verbatim
     )
 }
 
@@ -3152,7 +3189,7 @@ fn find_in_lines(
     let rotated = order[start_idx..].iter().chain(order[..start_idx].iter());
 
     for &line_idx in rotated {
-        let raw = lines[line_idx].trim_end_matches(['\n', '\r']);
+        let raw = lines[line_idx].trim_end_matches('\n');
         let mut cols = matches_at(raw, pattern);
         if !backwards {
             cols.retain(|&(c, _)| line_idx != from.line || c > from.col);
@@ -5359,11 +5396,31 @@ mod tests {
     #[test]
     fn genuinely_inert_actions_report_plainly_instead_of_doing_nothing() {
         let mut ed = test_editor("hello");
+        ed.execute(Action::RecordMacro);
+        assert_eq!(ed.status.as_deref(), Some("macros: not yet implemented"));
+    }
+
+    #[test]
+    fn verbatim_input_waits_for_a_keystroke_and_inserts_it_as_is() {
+        let mut ed = test_editor("ab");
+        ed.options.tabstospaces = true;
         ed.execute(Action::Verbatim);
-        assert_eq!(
-            ed.status.as_deref(),
-            Some("verbatim input: not yet implemented")
-        );
+        assert_eq!(ed.verbatim, Some(VerbatimInput::default()));
+        assert_eq!(ed.status.as_deref(), Some("Verbatim Input"));
+        ed.verbatim = None;
+        ed.buf_mut().cursor = Pos::new(0, 1);
+        ed.insert_verbatim("\t\r\x1b\n");
+        assert_eq!(ed.buf().line(0), "a\t\r\x1b\0b");
+        assert_eq!(ed.buf().line_count(), 1);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 5));
+    }
+
+    #[test]
+    fn verbatim_input_is_refused_in_view_mode() {
+        let mut ed = test_editor("ab");
+        ed.options.view = true;
+        ed.execute(Action::Verbatim);
+        assert_eq!(ed.verbatim, None);
     }
 
     // `set minibar`
