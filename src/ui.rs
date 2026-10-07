@@ -346,6 +346,14 @@ fn maybe_check_external_change(editor: &mut Editor) -> bool {
 
 fn handle_key(editor: &mut Editor, key: KeyEvent) {
     editor.begin_keystroke();
+    // nano's `get_kbinput`: while a macro is being recorded, every
+    // keystroke read -- at a prompt as much as in the edit window -- goes
+    // onto the tape, and `milestone` marks where this one begins so that
+    // `M-:`/`M-;` can snip themselves off it again.
+    editor.macros.milestone = editor.macros.keys.len();
+    if editor.macros.recording {
+        editor.macros.keys.push(key);
+    }
     if editor.verbatim.is_some() {
         handle_verbatim_key(editor, key);
     } else {
@@ -353,6 +361,25 @@ fn handle_key(editor: &mut Editor, key: KeyEvent) {
     }
     editor.ensure_magic_line();
     editor.end_keystroke();
+    if std::mem::take(&mut editor.macros.run_pending) {
+        replay_macro(editor);
+    }
+}
+
+/// `M-;`: nano's `run_macro` puts the recorded key codes back into its
+/// input queue, to be read again after the current keystroke. Here the
+/// recorded key events go through `handle_key` one by one, as if typed
+/// again, until the tape runs out or the editor quits.
+fn replay_macro(editor: &mut Editor) {
+    let keys = editor.macros.keys.clone();
+    editor.macros.replaying = true;
+    for key in keys {
+        if matches!(editor.mode, Mode::Quit) {
+            break;
+        }
+        handle_key(editor, key);
+    }
+    editor.macros.replaying = false;
 }
 
 fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
@@ -6032,6 +6059,64 @@ mod tests {
 
     fn press(ed: &mut Editor, code: KeyCode, modifiers: KeyModifiers) {
         handle_key(ed, KeyEvent::new(code, modifiers));
+    }
+
+    /// nano's macros: `M-:` takes down the keystrokes that follow -- typed
+    /// text and commands alike -- up to the `M-:` that stops it, which is
+    /// no part of the tape; `M-;` then plays them back as if typed again,
+    /// as often as asked.
+    #[test]
+    fn a_recorded_macro_replays_typing_and_commands() {
+        let mut ed = test_editor("alpha\nbeta\ngamma\n");
+        press(&mut ed, KeyCode::Char(':'), KeyModifiers::ALT);
+        assert!(ed.macros.recording);
+        type_text(&mut ed, "> ");
+        press(&mut ed, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut ed, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Char(':'), KeyModifiers::ALT);
+        assert!(!ed.macros.recording);
+        assert_eq!(ed.status.as_deref(), Some("Stopped recording"));
+        assert_eq!(ed.macros.keys.len(), 4, "the stopping M-: is snipped");
+        assert_eq!(ed.buf().line(0), "> alpha");
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0));
+
+        press(&mut ed, KeyCode::Char(';'), KeyModifiers::ALT);
+        assert_eq!(ed.buf().line(1), "> beta");
+        assert_eq!(ed.buf().cursor, Pos::new(2, 0));
+        press(&mut ed, KeyCode::Char(';'), KeyModifiers::ALT);
+        assert_eq!(ed.buf().line(2), "> gamma");
+        assert_eq!(ed.buf().cursor, Pos::new(3, 0));
+        assert!(!ed.macros.replaying);
+        assert_eq!(ed.macros.keys.len(), 4, "replaying records nothing");
+    }
+
+    /// Keystrokes at a prompt are recorded too, so a macro can run a
+    /// search; and `M-;` pressed during a recording is refused and left
+    /// off the tape.
+    #[test]
+    fn a_macro_can_drive_a_prompt_and_cannot_run_while_recording() {
+        let mut ed = test_editor("x1\nx2\nx3\nx4\n");
+        press(&mut ed, KeyCode::Char(':'), KeyModifiers::ALT);
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(matches!(ed.mode, Mode::Prompt(_)));
+        type_text(&mut ed, "x");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0));
+        press(&mut ed, KeyCode::Char(';'), KeyModifiers::ALT);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("Cannot run macro while recording")
+        );
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0), "nothing was replayed");
+        press(&mut ed, KeyCode::Char(':'), KeyModifiers::ALT);
+        assert_eq!(ed.macros.keys.len(), 3, "^W, x, Enter -- and no M-;");
+
+        press(&mut ed, KeyCode::Char(';'), KeyModifiers::ALT);
+        assert_eq!(ed.buf().cursor, Pos::new(2, 0));
+        assert!(matches!(ed.mode, Mode::Editing));
+        press(&mut ed, KeyCode::Char(';'), KeyModifiers::ALT);
+        assert_eq!(ed.buf().cursor, Pos::new(3, 0));
     }
 
     fn type_text(ed: &mut Editor, text: &str) {

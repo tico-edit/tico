@@ -302,6 +302,28 @@ pub struct VerbatimInput {
     pub unicode: Option<(u32, u8)>,
 }
 
+/// nano's macro recorder (`src/winio.c`): the keystrokes taken down since
+/// `M-:` started recording, for `M-;` to play back. They are kept as the
+/// terminal layer's own key events, because replaying means feeding them
+/// back into the very input path they first came through (nano
+/// `put_back`s the raw key codes it read); `ui::handle_key` is what records
+/// and replays them, at a prompt as much as in the edit window.
+#[derive(Debug, Default)]
+pub struct MacroRecorder {
+    pub recording: bool,
+    pub keys: Vec<crossterm::event::KeyEvent>,
+    /// Where in `keys` the keystroke being handled began (nano's
+    /// `milestone`), so the keystroke that stops a recording, or asks for
+    /// a replay during one, can be snipped off the tape again.
+    pub milestone: usize,
+    /// Set by `M-;`: `ui::handle_key` replays the tape once the keystroke
+    /// that asked for it has been fully handled, just as nano reads its
+    /// put-back keys only after it is done with the current one.
+    pub run_pending: bool,
+    /// Whether the keystrokes being handled come from a replay.
+    pub replaying: bool,
+}
+
 #[derive(Default)]
 pub struct SearchState {
     pub last_pattern: Option<String>,
@@ -413,6 +435,8 @@ pub struct Editor {
     /// Set by `M-V` (in the edit window or at a prompt) until the next
     /// keystroke has been taken verbatim -- see `ui::handle_verbatim_key`.
     pub verbatim: Option<VerbatimInput>,
+    /// `M-:`/`M-;`: the macro being recorded or last recorded.
+    pub macros: MacroRecorder,
 }
 
 impl Editor {
@@ -477,6 +501,7 @@ impl Editor {
             minibar_note: None,
             browser: None,
             verbatim: None,
+            macros: MacroRecorder::default(),
         }
     }
 
@@ -730,6 +755,37 @@ impl Editor {
             }
         }
         self.set_status_mild("No matching bracket");
+    }
+
+    /// `M-:`: nano's `record_macro`. Starts taking down keystrokes on a
+    /// fresh tape, or stops -- snipping off the keystroke that stopped it,
+    /// so that a replay never ends up stopping a recording.
+    fn record_macro(&mut self) {
+        self.macros.recording = !self.macros.recording;
+        if self.macros.recording {
+            self.macros.keys.clear();
+            self.set_status("Recording a macro...");
+        } else {
+            let milestone = self.macros.milestone;
+            self.macros.keys.truncate(milestone);
+            self.set_status("Stopped recording");
+        }
+    }
+
+    /// `M-;`: nano's `run_macro`. Asks `ui::handle_key` to replay the tape
+    /// once this keystroke is done with -- refused while recording (and
+    /// then snipped off the tape itself) or with nothing recorded; a
+    /// replay cannot start another.
+    fn run_macro(&mut self) {
+        if self.macros.recording {
+            let milestone = self.macros.milestone;
+            self.macros.keys.truncate(milestone);
+            self.set_status_mild("Cannot run macro while recording");
+        } else if self.macros.keys.is_empty() {
+            self.set_status_mild("Macro is empty");
+        } else if !self.macros.replaying {
+            self.macros.run_pending = true;
+        }
     }
 
     /// `M-Ins`/`M-"`: nano's `put_or_lift_anchor` -- place an anchor on
@@ -1156,7 +1212,8 @@ impl Editor {
                 self.verbatim = Some(VerbatimInput::default());
                 self.set_status("Verbatim Input");
             }
-            RecordMacro | RunMacro => self.set_status("macros: not yet implemented"),
+            RecordMacro => self.record_macro(),
+            RunMacro => self.run_macro(),
             Refresh => self.full_refresh_pending = true,
             SuggestSuspend => self.suggest_ctrl_t_ctrl_z(),
             Execute => self.begin_execute(),
@@ -5850,11 +5907,30 @@ mod tests {
         assert_eq!(ed.status.as_deref(), Some("No further matches"));
     }
 
+    /// nano's `record_macro`/`run_macro` bookkeeping and messages; the
+    /// recording and replaying of keystrokes themselves live in `ui.rs`.
     #[test]
-    fn genuinely_inert_actions_report_plainly_instead_of_doing_nothing() {
+    fn macro_recording_toggles_and_refuses_what_nano_refuses() {
         let mut ed = test_editor("hello");
+        ed.execute(Action::RunMacro);
+        assert_eq!(ed.status.as_deref(), Some("Macro is empty"));
+        assert_eq!(ed.status_level, StatusLevel::Mild);
+        assert!(!ed.macros.run_pending);
+
         ed.execute(Action::RecordMacro);
-        assert_eq!(ed.status.as_deref(), Some("macros: not yet implemented"));
+        assert!(ed.macros.recording);
+        assert_eq!(ed.status.as_deref(), Some("Recording a macro..."));
+        ed.execute(Action::RunMacro);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("Cannot run macro while recording")
+        );
+        assert!(ed.macros.recording);
+        assert!(!ed.macros.run_pending);
+
+        ed.execute(Action::RecordMacro);
+        assert!(!ed.macros.recording);
+        assert_eq!(ed.status.as_deref(), Some("Stopped recording"));
     }
 
     #[test]
