@@ -29,6 +29,9 @@ here.
 
 ### Editing
 
+- [ ] `breaklonglines` — the `M-L` toggle flips the flag; typing never
+      hard-wraps
+- [ ] `nowrap` (nano's legacy alias for `unset breaklonglines`)
 - [ ] `wordchars` / `wordbounds` (word completion honors `wordchars`;
       word movement and deletion consult neither)
 - [ ] `zap` (the setting: Backspace/Delete erase the marked region)

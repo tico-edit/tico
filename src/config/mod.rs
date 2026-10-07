@@ -9,7 +9,7 @@ pub mod ticorc;
 
 use crate::keymap::KeyMap;
 use crate::options::Options;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct LoadedConfig {
     pub options: Options,
@@ -65,14 +65,29 @@ fn system_nanorc_path() -> Option<PathBuf> {
 }
 
 fn user_nanorc_paths() -> Vec<PathBuf> {
+    nanorc_search_order(
+        dirs::home_dir().as_deref(),
+        std::env::var_os("XDG_CONFIG_HOME")
+            .as_deref()
+            .map(Path::new),
+    )
+}
+
+/// Where nano 8.7.1's `do_rcfiles` looks for the user's nanorc, in order
+/// (the first one that exists is the only one read): `~/.nanorc`, then
+/// `$XDG_CONFIG_HOME/nano/nanorc` when that variable is set, then
+/// `~/.config/nano/nanorc` -- the last checked even with
+/// `$XDG_CONFIG_HOME` pointing elsewhere.
+fn nanorc_search_order(home: Option<&Path>, xdg_config_home: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            paths.push(PathBuf::from(xdg).join("nano/nanorc"));
-        } else {
-            paths.push(home.join(".config/nano/nanorc"));
-        }
+    if let Some(home) = home {
         paths.push(home.join(".nanorc"));
+    }
+    if let Some(xdg) = xdg_config_home {
+        paths.push(xdg.join("nano/nanorc"));
+    }
+    if let Some(home) = home {
+        paths.push(home.join(".config/nano/nanorc"));
     }
     paths
 }
@@ -88,8 +103,7 @@ fn ticorc_path() -> Option<PathBuf> {
 }
 
 /// Load configuration: system nanorc, then the first user nanorc found
-/// (`~/.nanorc`, `$XDG_CONFIG_HOME/nano/nanorc`, `~/.config/nano/nanorc`,
-/// whichever is found first, matching nano's own search order), then
+/// (see `nanorc_search_order`), then
 /// `~/.ticorc` (which takes precedence over nanorc on conflicting settings).
 ///
 /// If `explicit_rcfile` is `Some`, only that single file is read (mirrors
@@ -186,6 +200,30 @@ pub fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_nanorc_is_searched_for_in_nanos_order() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            nanorc_search_order(Some(home), Some(Path::new("/xdg"))),
+            [
+                PathBuf::from("/home/me/.nanorc"),
+                PathBuf::from("/xdg/nano/nanorc"),
+                PathBuf::from("/home/me/.config/nano/nanorc"),
+            ]
+        );
+        assert_eq!(
+            nanorc_search_order(Some(home), None),
+            [
+                PathBuf::from("/home/me/.nanorc"),
+                PathBuf::from("/home/me/.config/nano/nanorc"),
+            ]
+        );
+        assert_eq!(
+            nanorc_search_order(None, Some(Path::new("/xdg"))),
+            [PathBuf::from("/xdg/nano/nanorc")]
+        );
+    }
 
     #[test]
     fn warnings_are_reworded_like_nanos_and_the_first_file_is_the_problem() {
