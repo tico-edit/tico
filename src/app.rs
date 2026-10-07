@@ -1079,9 +1079,8 @@ impl Editor {
             EndPara => self.move_para_end(),
             PrevBlock => self.move_prev_block(),
             NextBlock => self.move_next_block(),
-            TopRow | BottomRow => {
-                self.set_status("top/bottom row: not yet implemented");
-            }
+            TopRow => self.move_top_row(),
+            BottomRow => self.move_bottom_row(),
             FindBracket => self.find_bracket(),
             Anchor | PrevAnchor | NextAnchor => self.set_status("anchors: not yet implemented"),
             PrevBuf => self.switch_buffer(-1),
@@ -2044,6 +2043,29 @@ impl Editor {
         };
         buf.goto_line_aiming_at(line, goal);
         buf.top_line = line.saturating_sub(row);
+    }
+
+    /// nano's `to_top_row` (`M-Home`): put the cursor on the line in the
+    /// viewport's first row, aiming for its current goal column
+    /// (`placewewant`), which stays the goal afterwards. The viewport
+    /// itself doesn't move.
+    fn move_top_row(&mut self) {
+        let buf = self.buf_mut();
+        let goal = buf.goal_column();
+        buf.goto_line_aiming_at(buf.top_line, goal);
+    }
+
+    /// nano's `to_bottom_row` (`M-End`): put the cursor on the line in the
+    /// viewport's last row -- or on the buffer's last line when the text
+    /// ends before that row -- aiming for its current goal column, which
+    /// stays the goal afterwards. The viewport itself doesn't move.
+    fn move_bottom_row(&mut self) {
+        let rows = self.text_rows();
+        let buf = self.buf_mut();
+        let goal = buf.goal_column();
+        let last = buf.line_count().saturating_sub(1);
+        let line = (buf.top_line + rows.saturating_sub(1)).min(last);
+        buf.goto_line_aiming_at(line, goal);
     }
 
     fn scroll_view(&mut self, delta: isize) {
@@ -5703,6 +5725,40 @@ mod tests {
         let (smooth, jumpy) = both(&[PageDown, PageUp, PageUp]);
         assert_eq!(smooth, (0, Pos::new(0, 0)));
         assert_eq!(jumpy, (0, Pos::new(0, 0)));
+    }
+
+    /// nano's `to_top_row`/`to_bottom_row` (`M-Home`/`M-End`): the cursor
+    /// goes to the viewport's first or last row without the viewport
+    /// moving, keeps aiming for its goal column, and lands on the last
+    /// line when the buffer ends above the bottom row. Expectations
+    /// captured from the installed nano 8.7.1 in tmux.
+    #[test]
+    fn top_and_bottom_row_move_within_the_viewport_like_nano() {
+        use Action::*;
+        let mut keys = vec![Down, Down, Down, Right, Right, Right, Right, Right, Right];
+        keys.push(BottomRow);
+        assert_eq!(scrolled_after(false, &keys), (0, Pos::new(9, 6)));
+        keys.push(Down);
+        assert_eq!(scrolled_after(false, &keys), (1, Pos::new(10, 6)));
+        keys.push(TopRow);
+        assert_eq!(scrolled_after(false, &keys), (1, Pos::new(1, 6)));
+
+        // At the end of the file the bottom row is the (empty) magic line;
+        // the goal column survives landing there.
+        let mut keys = vec![LastLine, TopRow];
+        assert_eq!(scrolled_after(false, &keys), (91, Pos::new(91, 0)));
+        keys.extend([Right, Right, Right, BottomRow]);
+        assert_eq!(scrolled_after(false, &keys), (91, Pos::new(100, 0)));
+        keys.push(Up);
+        assert_eq!(scrolled_after(false, &keys), (91, Pos::new(99, 3)));
+
+        // A buffer shorter than the screen: bottom row is its last line.
+        let mut ed = test_editor("a\nbb\nccc\n");
+        ed.screen_rows = 14;
+        keystroke(&mut ed, BottomRow);
+        assert_eq!((ed.buf().top_line, ed.buf().cursor), (0, Pos::new(3, 0)));
+        keystroke(&mut ed, TopRow);
+        assert_eq!((ed.buf().top_line, ed.buf().cursor), (0, Pos::new(0, 0)));
     }
 
     #[test]

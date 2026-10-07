@@ -10,7 +10,6 @@ here.
 
 ## Bound keys that report "not yet implemented"
 
-- [ ] Top/bottom row of screen (`M-Home` / `M-End`)
 - [ ] Anchors: set, previous, next (`M-Ins` / `M-"`, `M-PgUp`, `M-PgDn` / `M-'`)
 - [ ] Macros: record and replay (`M-:` / `M-;`)
 
