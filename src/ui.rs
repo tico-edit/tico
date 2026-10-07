@@ -1792,6 +1792,10 @@ fn handle_diff_key(
                 editor.buf_mut().rope = ropey::Rope::from_str(&text);
                 editor.buf_mut().invalidate_highlight_cache();
                 editor.buf_mut().modified = true;
+                // Anchors stay on their line numbers through the merge,
+                // minus any now past the end of the text.
+                let lines = editor.buf().line_count();
+                editor.buf_mut().anchors.retain(|&l| l < lines);
                 if let Some(path) = editor.buf().path.clone() {
                     editor.buf_mut().disk_state = crate::fileio::stat_disk_state(&path);
                 }
@@ -4099,7 +4103,8 @@ fn render_status_line(
 /// `minibar_note` (right after a load/save/buffer-switch) or, when
 /// multiple buffers are open, an `[i/n]` counter; under `set
 /// constantshow`, the cursor's `line,column` and the code of the character
-/// under it; and the cursor's percentage into the file, right-aligned.
+/// under it; a `†` when the cursor's line has an anchor; and the cursor's
+/// percentage into the file, right-aligned.
 /// Each piece only appears when nano's own width test says it fits.
 /// Colored with `minicolor` (falling back to the title bar's own colors,
 /// same as `promptcolor`).
@@ -4151,6 +4156,12 @@ fn render_minibar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Res
     }
     if constantshow && namewidth + tallywidth + 28 < cols {
         line.put(cols - 23, &minibar_char_codes(buf));
+    }
+
+    // nano's dagger, just left of the percentage, when the cursor's line
+    // has an anchor.
+    if buf.has_anchor(buf.cursor.line) && namewidth + 7 < cols {
+        line.put(cols - 5 - padding, "†");
     }
 
     if namewidth + 6 < cols {
@@ -4807,9 +4818,14 @@ fn render_buffer(
 
         if is_real_line {
             if gutter > 0 {
-                let prefix = format!("{:>width$} ", line_idx + 1, width = gutter - 1);
-                styles.extend(prefix.chars().map(|_| Some(number_style)));
-                rendered.push_str(&prefix);
+                let number = format!("{:>width$}", line_idx + 1, width = gutter - 1);
+                styles.extend(number.chars().map(|_| Some(number_style)));
+                rendered.push_str(&number);
+                // nano's `draw_row`: after the number, outside the
+                // line-number color, a dagger marks an anchored line and
+                // a blank separates any other from its text.
+                rendered.push(if buf.has_anchor(line_idx) { '†' } else { ' ' });
+                styles.push(None);
             }
             let raw = buf.line(line_idx);
             gutter_chars = rendered.chars().count();
