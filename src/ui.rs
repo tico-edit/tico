@@ -126,6 +126,12 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
                         dirty = true;
                     }
                     Event::Resize(cols, rows) => {
+                        // nano gives up on a pending `M-V` when the window
+                        // is resized, wiping its "Verbatim Input" feedback.
+                        if editor.verbatim.take().is_some() && matches!(editor.mode, Mode::Editing)
+                        {
+                            editor.status = None;
+                        }
                         editor.screen_cols = cols as usize;
                         editor.screen_rows = rows as usize;
                         execute!(io::stdout(), Clear(ClearType::All))?;
@@ -141,7 +147,7 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
                     break;
                 }
             }
-        } else if matches!(editor.mode, Mode::Editing) {
+        } else if matches!(editor.mode, Mode::Editing) && editor.verbatim.is_none() {
             let watched_path = if editor.buf().ignore_external_changes {
                 None
             } else {
@@ -334,7 +340,11 @@ fn maybe_check_external_change(editor: &mut Editor) -> bool {
 
 fn handle_key(editor: &mut Editor, key: KeyEvent) {
     editor.begin_keystroke();
-    dispatch_key(editor, key);
+    if editor.verbatim.is_some() {
+        handle_verbatim_key(editor, key);
+    } else {
+        dispatch_key(editor, key);
+    }
     editor.ensure_magic_line();
     editor.end_keystroke();
 }
@@ -1065,6 +1075,14 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
         return false;
     }
     match action {
+        // nano's `do_statusbar_verbatim_input`: the next keystroke goes
+        // into the answer as is (not at a name-locked Write Out prompt).
+        Action::Verbatim => {
+            if !write_name_locked(editor, prompt) {
+                editor.verbatim = Some(Default::default());
+            }
+            false
+        }
         // `^G` opens the help screen for whichever prompt is currently up
         // (Search and Replace get their own text — see help.rs); closing
         // it (via handle_help_key) returns here to the same prompt.
@@ -2833,6 +2851,178 @@ fn handle_linter_choice(editor: &mut Editor, prompt: Prompt, key: KeyEvent) {
 // Crossterm key normalization
 // ---------------------------------------------------------------------
 
+/// A keystroke while `M-V` is pending -- nano's `get_verbatim_kbinput`
+/// and `parse_verbatim_kbinput`. A first keystroke that is a hexadecimal
+/// digit starts a Unicode code of up to six digits, ended early by Space or
+/// Enter (`assemble_unicode`, which shows "Unicode Input: ..." while it's
+/// being typed in the edit window only); anything else goes in as the bytes
+/// the terminal sent for it. What can't be inserted is "Invalid code" in the
+/// edit window, a beep at a prompt.
+fn handle_verbatim_key(editor: &mut Editor, key: KeyEvent) {
+    let Some(mut pending) = editor.verbatim.take() else {
+        return;
+    };
+    let at_prompt = matches!(editor.mode, Mode::Prompt(_));
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let hex = match key.code {
+        KeyCode::Char(c) if plain => c.to_digit(16),
+        _ => None,
+    };
+    // `None` while a Unicode code is still being typed.
+    let outcome: Option<Option<String>> = match (pending.unicode, hex) {
+        (None, Some(digit)) => {
+            pending.unicode = Some((digit, 1));
+            None
+        }
+        (None, None) => match verbatim_text(key) {
+            Some(text) => Some(Some(text)),
+            // Nothing a terminal would send (e.g. a bare modifier key):
+            // keep waiting.
+            None => {
+                editor.verbatim = Some(pending);
+                return;
+            }
+        },
+        (Some((value, digits)), Some(digit)) => {
+            let value = (value << 4) | digit;
+            if digits + 1 == 6 {
+                Some(char::from_u32(value).map(String::from))
+            } else {
+                pending.unicode = Some((value, digits + 1));
+                None
+            }
+        }
+        (Some((value, _)), None)
+            if plain && matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) =>
+        {
+            Some(char::from_u32(value).map(String::from))
+        }
+        (Some(_), None) => Some(None),
+    };
+    let Some(text) = outcome else {
+        if let Some((value, digits)) = pending.unicode
+            && !at_prompt
+        {
+            let partial = format!("{value:0width$X}", width = digits as usize);
+            editor.set_status(format!("Unicode Input: {partial:>6}"));
+        }
+        editor.verbatim = Some(pending);
+        return;
+    };
+    // A 0x0A byte means NUL in the edit window (so a typed ^J is refused
+    // there), and the answer at a prompt can't hold a NUL.
+    let refused = if at_prompt { '\0' } else { '\n' };
+    let text = text.filter(|t| !t.starts_with(refused));
+    match (&mut editor.mode, text) {
+        (Mode::Prompt(prompt), Some(text)) => {
+            let idx = prompt
+                .input
+                .char_indices()
+                .nth(prompt.cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(prompt.input.len());
+            prompt.input.insert_str(idx, &text);
+            prompt.cursor += text.chars().count();
+            prompt.history_pos = None;
+            prompt.saved_input = None;
+        }
+        (Mode::Prompt(_), None) => editor.bell_pending = true,
+        (_, Some(text)) => {
+            editor.status = None;
+            editor.insert_verbatim(&text);
+        }
+        (_, None) => editor.set_status_mild("Invalid code"),
+    }
+}
+
+/// What the terminal sent for `key`, as text: crossterm hands over decoded
+/// keys rather than nano's raw bytes, so this re-encodes them the way an
+/// xterm-style terminal does (cursor keys in normal mode, `CSI 1;m X` and
+/// `CSI n;m ~` for modified ones, Esc in front of an Alt'd key). `None`
+/// for a key no terminal byte sequence corresponds to.
+fn verbatim_text(key: KeyEvent) -> Option<String> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let m = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    let csi = |last: char| {
+        if m == 1 {
+            format!("\x1b[{last}")
+        } else {
+            format!("\x1b[1;{m}{last}")
+        }
+    };
+    let tilde = |n: u8| {
+        if m == 1 {
+            format!("\x1b[{n}~")
+        } else {
+            format!("\x1b[{n};{m}~")
+        }
+    };
+    let text = match key.code {
+        KeyCode::Up => csi('A'),
+        KeyCode::Down => csi('B'),
+        KeyCode::Right => csi('C'),
+        KeyCode::Left => csi('D'),
+        KeyCode::Home => csi('H'),
+        KeyCode::End => csi('F'),
+        KeyCode::Insert => tilde(2),
+        KeyCode::Delete => tilde(3),
+        KeyCode::PageUp => tilde(5),
+        KeyCode::PageDown => tilde(6),
+        KeyCode::F(n @ 1..=4) if m == 1 => format!("\x1bO{}", (b'O' + n) as char),
+        KeyCode::F(n @ 1..=4) => csi((b'O' + n) as char),
+        KeyCode::F(n) => tilde(match n {
+            5 => 15,
+            6 => 17,
+            7 => 18,
+            8 => 19,
+            9 => 20,
+            10 => 21,
+            11 => 23,
+            12 => 24,
+            _ => return None,
+        }),
+        KeyCode::BackTab => "\x1b[Z".to_string(),
+        _ => {
+            let base = match key.code {
+                KeyCode::Enter => '\r',
+                KeyCode::Tab => '\t',
+                KeyCode::Backspace => '\x7f',
+                KeyCode::Esc => '\x1b',
+                KeyCode::Char(c) if ctrl => control_code(c),
+                KeyCode::Char(c) => c,
+                _ => return None,
+            };
+            return Some(if alt {
+                format!("\x1b{base}")
+            } else {
+                base.to_string()
+            });
+        }
+    };
+    Some(text)
+}
+
+/// The control code Ctrl+`c` sends -- with crossterm's own spelling of the
+/// ones that aren't Ctrl+letter (`Char(' ')` for NUL, `'4'..'7'` for
+/// 0x1C-0x1F; see `normalize_key`).
+fn control_code(c: char) -> char {
+    match c {
+        ' ' | '@' | '2' => '\0',
+        'a'..='z' | 'A'..='Z' => (c.to_ascii_lowercase() as u8 - b'a' + 1) as char,
+        '[' | '3' => '\x1b',
+        '\\' | '4' => '\x1c',
+        ']' | '5' => '\x1d',
+        '^' | '6' => '\x1e',
+        '_' | '/' | '7' => '\x1f',
+        '?' | '8' => '\x7f',
+        other => other,
+    }
+}
+
 fn normalize_key(key: KeyEvent) -> Option<TKey> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -3657,7 +3847,8 @@ fn finish_cursor(editor: &Editor, out: &mut impl Write, text_start_row: u16) -> 
         let col = if prompt.menu == Menu::YesNo {
             prompt.label.chars().count()
         } else {
-            prompt.label.chars().count() + 2 + prompt.cursor
+            let typed: String = prompt.input.chars().take(prompt.cursor).collect();
+            prompt.label.chars().count() + 2 + caret_notation(&typed).chars().count()
         };
         queue!(
             out,
@@ -5149,6 +5340,11 @@ fn expand_tabs_with_styles(
             out.push(whitespace.map_or(' ', |(_, space)| space));
             out_styles.push(k);
             w += 1;
+        } else if let Some(rep) = crate::buffer::control_rep(c) {
+            out.push('^');
+            out.push(rep);
+            out_styles.extend([k, k]);
+            w += 2;
         } else {
             out.push(c);
             out_styles.push(k);
@@ -5164,11 +5360,27 @@ fn expand_tabs_with_styles(
 /// exempt).
 fn prompt_input_for_display(editor: &Editor, input: &str) -> String {
     if !editor.options.whitespacedisplay {
-        return input.to_string();
+        return caret_notation(input);
     }
     let styles = vec![None; input.chars().count()];
     let tabsize = editor.options.tabsize as usize;
     expand_tabs_with_styles(input, &styles, tabsize, Some(editor.options.whitespace)).0
+}
+
+/// `text` with each control character in its `^X` form (as typed at a
+/// prompt with `M-V`), the way nano's `display_string` shows it.
+fn caret_notation(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match crate::buffer::control_rep(c) {
+            Some(rep) => {
+                out.push('^');
+                out.push(rep);
+            }
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 /// Highlight `body` (already-split lines of a unified diff) with the
@@ -7372,5 +7584,95 @@ mod tests {
         assert_eq!(normalize_key(ev), Some(TKey::Ctrl('G')));
         let ev = synthetic_key_event_for_label("M-U").unwrap();
         assert_eq!(normalize_key(ev), Some(TKey::Meta('U')));
+    }
+
+    fn alt_v(ed: &mut Editor) {
+        press(ed, KeyCode::Char('v'), KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn verbatim_input_inserts_control_keys_as_their_bytes() {
+        let mut ed = test_editor("");
+        ed.options.tabstospaces = true;
+        for (code, mods) in [
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Char('l'), KeyModifiers::CONTROL),
+            (KeyCode::Char(' '), KeyModifiers::CONTROL),
+            (KeyCode::Char('x'), KeyModifiers::ALT),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('g'), KeyModifiers::NONE),
+        ] {
+            alt_v(&mut ed);
+            assert_eq!(ed.status.as_deref(), Some("Verbatim Input"));
+            press(&mut ed, code, mods);
+            assert_eq!(ed.verbatim, None);
+            assert_eq!(ed.status, None);
+        }
+        assert_eq!(ed.buf().line(0), "\t\r\x0c\0\x1bx\x1b[A\x1bg");
+        assert_eq!(ed.buf().line_count(), 2);
+    }
+
+    #[test]
+    fn verbatim_input_takes_a_hexadecimal_unicode_code() {
+        let mut ed = test_editor("");
+        alt_v(&mut ed);
+        type_text(&mut ed, "e9");
+        assert_eq!(ed.status.as_deref(), Some("Unicode Input:     E9"));
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        alt_v(&mut ed);
+        type_text(&mut ed, "01f600");
+        alt_v(&mut ed);
+        type_text(&mut ed, "41 ");
+        assert_eq!(ed.buf().line(0), "\u{e9}\u{1f600}A");
+        assert_eq!(ed.verbatim, None);
+    }
+
+    #[test]
+    fn verbatim_input_refuses_invalid_codes() {
+        let mut ed = test_editor("");
+        // Past U+10FFFF, a surrogate, a non-hex keystroke mid-code, ^J.
+        for typed in ["110000", "d800 ", "4x"] {
+            alt_v(&mut ed);
+            type_text(&mut ed, typed);
+            assert_eq!(ed.status.as_deref(), Some("Invalid code"), "{typed}");
+            assert_eq!(ed.verbatim, None);
+        }
+        alt_v(&mut ed);
+        press(&mut ed, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(ed.status.as_deref(), Some("Invalid code"));
+        assert_eq!(ed.buf().to_string(), "");
+    }
+
+    #[test]
+    fn verbatim_input_works_at_a_prompt() {
+        let mut ed = test_editor("");
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "a");
+        alt_v(&mut ed);
+        press(&mut ed, KeyCode::Tab, KeyModifiers::NONE);
+        alt_v(&mut ed);
+        type_text(&mut ed, "263a ");
+        // A NUL can't go into an answer: beep, nothing inserted.
+        alt_v(&mut ed);
+        press(&mut ed, KeyCode::Char(' '), KeyModifiers::CONTROL);
+        assert!(ed.bell_pending);
+        let Mode::Prompt(prompt) = &ed.mode else {
+            panic!("prompt closed");
+        };
+        assert_eq!(prompt.input, "a\t\u{263a}");
+        assert_eq!(prompt.cursor, 3);
+        assert_eq!(ed.status, None);
+    }
+
+    #[test]
+    fn control_characters_show_in_caret_notation() {
+        assert_eq!(caret_notation("a\x01\x1b\x7f\u{80}\u{9f}"), "a^A^[^?^`^=");
+        let (shown, _) = expand_tabs_with_styles("\0x", &[None, None], 8, None);
+        assert_eq!(shown, "^@x");
+        assert_eq!(crate::buffer::display_width("\x0cx", 2, 8), 3);
+        assert_eq!(crate::buffer::char_col_for_display("\x0cx", 1, 8), 0);
+        assert_eq!(crate::buffer::char_col_for_display("\x0cx", 2, 8), 1);
     }
 }

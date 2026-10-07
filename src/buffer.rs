@@ -17,6 +17,31 @@ impl Pos {
     }
 }
 
+/// nano's `control_mbrep`: the character shown after a `^` for a control
+/// character in the text -- `^@`..`^_` for C0 codes, `^?` for DEL, and
+/// for the C1 codes U+0080..U+009F, `^``..`^~` with U+009F as `^=`.
+/// `None` for anything else, a tab included (that expands to spaces).
+pub fn control_rep(c: char) -> Option<char> {
+    match c as u32 {
+        0x09 => None,
+        n @ 0x00..=0x1F => char::from_u32(n + 0x40),
+        0x7F => Some('?'),
+        0x9F => Some('='),
+        n @ 0x80..=0x9E => char::from_u32(n - 0x20),
+        _ => None,
+    }
+}
+
+/// Columns a (non-tab) character takes on screen: two for a control
+/// character's `^X` form, otherwise its Unicode width.
+pub fn char_width(c: char) -> usize {
+    if control_rep(c).is_some() {
+        2
+    } else {
+        unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)
+    }
+}
+
 /// Display width (in columns, with tabs expanded) of `line` up to (but not
 /// including) its `up_to_col`'th character. Shared by rendering (tab
 /// expansion, spotlight positioning) and horizontal-scroll math, both of
@@ -30,7 +55,7 @@ pub fn display_width(line: &str, up_to_col: usize, tabsize: usize) -> usize {
         if c == '\t' {
             w += tabsize - (w % tabsize);
         } else {
-            w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            w += char_width(c);
         }
     }
     w
@@ -46,7 +71,7 @@ pub fn char_col_for_display(line: &str, target_col: usize, tabsize: usize) -> us
         let cw = if c == '\t' {
             tabsize - (w % tabsize)
         } else {
-            unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)
+            char_width(c)
         };
         if w + cw > target_col {
             return i;
@@ -241,7 +266,7 @@ impl Buffer {
             return String::new();
         }
         let s = self.rope.line(idx).to_string();
-        s.trim_end_matches(['\n', '\r']).to_string()
+        s.trim_end_matches('\n').to_string()
     }
 
     /// Byte offset of the start of line `idx` within the buffer's full

@@ -269,6 +269,11 @@ fn shortcut_lines(menu: Menu, keymap: &KeyMap, restricted: bool) -> Vec<String> 
             if *action == Action::Enter && menu != Menu::Main {
                 continue;
             }
+            // `M-V` works at the prompts too, but nano lists it only in
+            // the main menu's help.
+            if *action == Action::Verbatim && menu != Menu::Main {
+                continue;
+            }
             if restricted && crate::keymap::hidden_when_restricted(menu, *action) {
                 continue;
             }
