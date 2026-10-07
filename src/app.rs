@@ -1077,8 +1077,10 @@ impl Editor {
             ScrollDown => self.scroll_view(1),
             BeginPara => self.move_para_begin(),
             EndPara => self.move_para_end(),
-            PrevBlock | NextBlock | TopRow | BottomRow => {
-                self.set_status("block navigation: not yet implemented");
+            PrevBlock => self.move_prev_block(),
+            NextBlock => self.move_next_block(),
+            TopRow | BottomRow => {
+                self.set_status("top/bottom row: not yet implemented");
             }
             FindBracket => self.find_bracket(),
             Anchor | PrevAnchor | NextAnchor => self.set_status("anchors: not yet implemented"),
@@ -1939,6 +1941,65 @@ impl Editor {
             Pos::new(line, lines[line].len())
         };
         self.buf_mut().cursor = cursor;
+        self.scroll_to_cursor_centered();
+    }
+
+    /// nano's `white_string`: a line that is empty or holds nothing but
+    /// blanks (`is_blank_char`, i.e. space, tab and Unicode's other
+    /// horizontal spaces -- not the no-break ones) and stray `\r`s.
+    fn line_is_white(&self, idx: usize) -> bool {
+        fn is_blank(c: char) -> bool {
+            matches!(c, ' ' | '\t' | '\r')
+                || (c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}'))
+        }
+        self.buf().line(idx).chars().all(is_blank)
+    }
+
+    /// nano's `to_prev_block` (`^Up`, `M-7`): to the first line of the
+    /// block of text the cursor is in, or of the previous block when
+    /// already on (or on a blank line after) one -- a block being a run of
+    /// non-blank lines, with no regard for `quotestr` unlike the paragraph
+    /// moves. Walks back past any text to the blank line before it, then
+    /// steps forward one onto the block's first line; with no blank line
+    /// before the block it stops on the buffer's first line. The cursor
+    /// goes to column 0, and nano redraws with CENTERING.
+    pub fn move_prev_block(&mut self) {
+        let mut line = self.buf().cursor.line;
+        let (mut is_text, mut seen_text) = (false, false);
+        // Skip backward until the first blank line after some non-blank
+        // line(s).
+        while line > 0 && (!seen_text || is_text) {
+            line -= 1;
+            is_text = !self.line_is_white(line);
+            seen_text = seen_text || is_text;
+        }
+        // Step forward one line again if we passed text but this line is
+        // blank.
+        if seen_text && line + 1 < self.buf().line_count() && self.line_is_white(line) {
+            line += 1;
+        }
+        self.buf_mut().cursor = Pos::new(line, 0);
+        self.scroll_to_cursor_centered();
+    }
+
+    /// nano's `to_next_block` (`^Down`, `M-8`): to the first line of the
+    /// next block of text -- the first non-blank line after some blank
+    /// line(s) -- or, when there is no further block, to the buffer's
+    /// last line. The cursor goes to column 0, and nano redraws with
+    /// CENTERING.
+    pub fn move_next_block(&mut self) {
+        let last = self.buf().line_count().saturating_sub(1);
+        let mut line = self.buf().cursor.line.min(last);
+        let mut is_white = self.line_is_white(line);
+        let mut seen_white = is_white;
+        // Skip forward until the first non-blank line after some blank
+        // line(s).
+        while line < last && (!seen_white || is_white) {
+            line += 1;
+            is_white = self.line_is_white(line);
+            seen_white = seen_white || is_white;
+        }
+        self.buf_mut().cursor = Pos::new(line, 0);
         self.scroll_to_cursor_centered();
     }
 
@@ -4931,6 +4992,88 @@ mod tests {
         );
         ed.execute(Action::EndPara);
         assert_eq!(ed.buf().cursor, Pos::new(3, 0));
+    }
+
+    /// nano's `to_prev_block`/`to_next_block` (`^Up`/`^Down`, `M-7`/`M-8`),
+    /// per its `src/move.c`: a block is a run of non-blank lines. Next
+    /// goes to the first line of the following block (from inside a block
+    /// or from the blank lines before it), and to the last line when no
+    /// block follows. Prev goes to the current block's first line, then
+    /// the previous block's; from blank lines, to the start of the block
+    /// before them; and to line 0 when nothing but text (or nothing but
+    /// blanks) precedes. Both put the cursor in column 0.
+    #[test]
+    fn block_moves_like_nano() {
+        let text = "one a\none b\none c\n \t\ntwo a\ntwo b\n\n\nthree a\nthree b";
+        let mut ed = test_editor(text);
+
+        // Next: block by block, landing on each block's first line, and
+        // on the last line (not past it) when there is no next block.
+        ed.buf_mut().cursor = Pos::new(0, 3);
+        ed.execute(Action::NextBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(4, 0));
+        ed.execute(Action::NextBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(8, 0));
+        ed.execute(Action::NextBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(9, 0));
+        ed.execute(Action::NextBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(9, 0));
+        // From a blank line: to the next non-blank one.
+        ed.buf_mut().cursor = Pos::new(6, 0);
+        ed.execute(Action::NextBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(8, 0));
+
+        // Prev: to the block's first line, then the previous block's,
+        // stopping at the first line.
+        ed.buf_mut().cursor = Pos::new(5, 3);
+        ed.execute(Action::PrevBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(4, 0));
+        ed.execute(Action::PrevBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 0));
+        ed.execute(Action::PrevBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 0));
+        // From blank lines, to the start of the block before them.
+        ed.buf_mut().cursor = Pos::new(7, 0);
+        ed.execute(Action::PrevBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(4, 0));
+        // From the last line, to its block's first line.
+        ed.buf_mut().cursor = Pos::new(9, 5);
+        ed.execute(Action::PrevBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(8, 0));
+    }
+
+    /// Leading blank lines: prev from the first block's first line walks
+    /// back to line 0 (no text was passed, so no stepping forward); next
+    /// from those blank lines lands on the first block.
+    #[test]
+    fn block_moves_at_a_buffer_with_leading_blank_lines() {
+        let mut ed = test_editor("\n\nfoo\nbar\n");
+        ed.buf_mut().cursor = Pos::new(3, 1);
+        ed.execute(Action::PrevBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(2, 0));
+        ed.execute(Action::PrevBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 0));
+        ed.execute(Action::NextBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(2, 0));
+        // Past the last block there is only the empty line after the
+        // final newline, and that is where next stops.
+        ed.execute(Action::NextBlock);
+        assert_eq!(ed.buf().cursor, Pos::new(4, 0));
+    }
+
+    /// A block jump that lands off-screen centers the cursor, as nano's
+    /// `edit_redraw(..., CENTERING)` does for these moves.
+    #[test]
+    fn block_move_centers_offscreen_landing() {
+        let text = (0..60).map(|i| format!("line{i}\n")).collect::<String>();
+        let mut ed = test_editor(&text);
+        ed.screen_rows = 24;
+        ed.buf_mut().cursor = Pos::new(0, 0);
+        ed.buf_mut().top_line = 0;
+        ed.execute(Action::NextBlock);
+        let rows = ed.text_rows();
+        assert_eq!(ed.buf().cursor, Pos::new(60, 0));
+        assert_eq!(ed.buf().top_line, 60 - rows / 2);
     }
 
     /// A paragraph jump that lands off-screen centers the cursor, as

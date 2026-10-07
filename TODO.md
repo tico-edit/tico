@@ -10,7 +10,6 @@ here.
 
 ## Bound keys that report "not yet implemented"
 
-- [ ] Block navigation: previous/next block (`^Up` / `^Down`, `M-7` / `M-8`)
 - [ ] Top/bottom row of screen (`M-Home` / `M-End`)
 - [ ] Anchors: set, previous, next (`M-Ins` / `M-"`, `M-PgUp`, `M-PgDn` / `M-'`)
 - [ ] Macros: record and replay (`M-:` / `M-;`)
