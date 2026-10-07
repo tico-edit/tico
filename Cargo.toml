@@ -1,6 +1,6 @@
 [package]
 name = "tico"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Yet Another Text Editor"
 repository = "https://github.com/tico-edit/tico"
@@ -136,4 +136,5 @@ assets = [
     ["LICENSE", "usr/share/doc/tico/LICENSE", "644"],
     ["LICENSE-MPL-2.0", "usr/share/doc/tico/LICENSE-MPL-2.0", "644"],
 ]
+
 
