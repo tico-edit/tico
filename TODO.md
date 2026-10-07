@@ -8,10 +8,6 @@ Syntax highlighting is intentionally *not* nano-compatible; see
 `DIFFERENCES.md`. Nothing about nanorc `color`/`syntax` directives belongs
 here.
 
-## Bound keys that report "not yet implemented"
-
-- [ ] Macros: record and replay (`M-:` / `M-;`)
-
 ## Options parsed but never consulted
 
 ### Display
