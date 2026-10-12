@@ -619,7 +619,31 @@ impl Editor {
         digits + 1
     }
 
+    /// Width of `set indicator`'s scrollbar column: 1, unless the option
+    /// is off or the screen too small for it (nano's own `sidebar` guard).
+    pub fn sidebar_width(&self) -> usize {
+        usize::from(self.options.indicator && self.screen_cols > 9 && self.screen_rows > 5)
+    }
+
+    /// Where lines wrap while `set softwrap` is on (`None` when it's off):
+    /// at the width of the text area, between the line numbers and the
+    /// scrollbar (nano's `editwincols`).
+    pub fn softwrap(&self) -> Option<crate::softwrap::Wrap> {
+        self.options.softwrap.then(|| crate::softwrap::Wrap {
+            width: self
+                .screen_cols
+                .saturating_sub(self.gutter_width() + self.sidebar_width())
+                .max(1),
+            tabsize: (self.options.tabsize as usize).max(1),
+            atblanks: self.options.atblanks,
+        })
+    }
+
     pub fn scroll_to_cursor(&mut self) {
+        if let Some(w) = self.softwrap() {
+            self.wrapped_scroll_to_cursor(&w, self.options.jumpyscrolling);
+            return;
+        }
         // nano's `edit_redraw`/`edit_refresh` bring an off-screen cursor
         // back by centering it, rather than flowing, under
         // `jumpyscrolling` -- which is also what makes Up/Down past an
@@ -678,6 +702,10 @@ impl Editor {
     /// cursor movement (arrows, page up/down, ...) keeps the minimal-scroll
     /// behavior of plain `scroll_to_cursor`, unless `jumpyscrolling`.
     pub fn scroll_to_cursor_centered(&mut self) {
+        if let Some(w) = self.softwrap() {
+            self.wrapped_scroll_to_cursor(&w, true);
+            return;
+        }
         let rows = self.text_rows();
         let buf = self.buf_mut();
         if buf.cursor.line < buf.top_line || buf.cursor.line >= buf.top_line + rows {
@@ -692,6 +720,10 @@ impl Editor {
     /// `^_ 15` from the top of a long file scrolls line 15 to mid-screen).
     pub fn center_cursor_line(&mut self) {
         let rows = self.text_rows();
+        if let Some(w) = self.softwrap() {
+            self.wrapped_adjust_viewport(&w, rows / 2);
+            return;
+        }
         let buf = self.buf_mut();
         buf.top_line = buf.cursor.line.saturating_sub(rows / 2);
         self.scroll_horizontal_to_cursor();
@@ -955,9 +987,13 @@ impl Editor {
             0 => self.center_cursor_line(),
             aim => {
                 let goal = if aim == 1 { 0 } else { rows.saturating_sub(1) };
-                let buf = self.buf_mut();
-                buf.top_line = buf.cursor.line.saturating_sub(goal);
-                self.scroll_horizontal_to_cursor();
+                if let Some(w) = self.softwrap() {
+                    self.wrapped_adjust_viewport(&w, goal);
+                } else {
+                    let buf = self.buf_mut();
+                    buf.top_line = buf.cursor.line.saturating_sub(goal);
+                    self.scroll_horizontal_to_cursor();
+                }
             }
         }
         self.cycling_aim = (self.cycling_aim + 1) % 3;
@@ -974,6 +1010,21 @@ impl Editor {
     pub fn place_viewport_for_cli_goto(&mut self) {
         let rows = self.text_rows();
         let jumpy = self.options.jumpyscrolling;
+        if let Some(w) = self.softwrap() {
+            let col = self.cursor_display_col();
+            let buf = self.buf();
+            let mut line = buf.cursor.line;
+            let mut edge = w.leftedge_for(&buf.line(line), col);
+            let rows_from_tail =
+                rows / 2 - w.go_forward_chunks(buf, rows / 2, &mut line, &mut edge);
+            let goal = if rows_from_tail < rows / 2 && !jumpy {
+                rows - 1 - rows_from_tail
+            } else {
+                rows / 2
+            };
+            self.wrapped_adjust_viewport(&w, goal);
+            return;
+        }
         let buf = self.buf_mut();
         let rows_from_tail = buf.line_count().saturating_sub(1) - buf.cursor.line;
         buf.top_line = if rows_from_tail < rows / 2 && !jumpy {
@@ -1160,6 +1211,15 @@ impl Editor {
             }
             Left => self.buf_mut().move_left(),
             Right => self.buf_mut().move_right(),
+            Up | Down | Home | End if self.options.softwrap => {
+                let w = self.softwrap().expect("softwrap is on");
+                match action {
+                    Up => _ = self.wrapped_vertical(&w, 1, false),
+                    Down => _ = self.wrapped_vertical(&w, 1, true),
+                    Home => self.wrapped_home(&w),
+                    _ => self.wrapped_end(&w),
+                }
+            }
             Up => self.buf_mut().move_up(),
             Down => self.buf_mut().move_down(),
             Home => self.buf_mut().move_home(),
@@ -1258,6 +1318,9 @@ impl Editor {
             }
             SoftWrap => {
                 self.options.softwrap = !self.options.softwrap;
+                if !self.options.softwrap {
+                    self.buf_mut().first_col = 0;
+                }
                 self.set_status(if self.options.softwrap {
                     "Soft wrapping of overlong lines enabled"
                 } else {
@@ -2150,6 +2213,10 @@ impl Editor {
     /// (as Pico does). Without that many lines left, go to the first line
     /// (its start) or the last one (its end) instead.
     fn page(&mut self, forward: bool) {
+        if let Some(w) = self.softwrap() {
+            self.wrapped_page(&w, forward);
+            return;
+        }
         let rows = self.text_rows();
         let mustmove = if rows < 3 { 1 } else { rows - 2 };
         let jumpy = self.options.jumpyscrolling;
@@ -2183,6 +2250,10 @@ impl Editor {
     /// (`placewewant`), which stays the goal afterwards. The viewport
     /// itself doesn't move.
     fn move_top_row(&mut self) {
+        if let Some(w) = self.softwrap() {
+            self.wrapped_to_edge_row(&w, false);
+            return;
+        }
         let buf = self.buf_mut();
         let goal = buf.goal_column();
         buf.goto_line_aiming_at(buf.top_line, goal);
@@ -2193,6 +2264,10 @@ impl Editor {
     /// ends before that row -- aiming for its current goal column, which
     /// stays the goal afterwards. The viewport itself doesn't move.
     fn move_bottom_row(&mut self) {
+        if let Some(w) = self.softwrap() {
+            self.wrapped_to_edge_row(&w, true);
+            return;
+        }
         let rows = self.text_rows();
         let buf = self.buf_mut();
         let goal = buf.goal_column();
@@ -2202,6 +2277,10 @@ impl Editor {
     }
 
     fn scroll_view(&mut self, delta: isize) {
+        if let Some(w) = self.softwrap() {
+            self.wrapped_scroll(&w, delta > 0);
+            return;
+        }
         let buf = self.buf_mut();
         if delta < 0 {
             buf.top_line = buf.top_line.saturating_sub((-delta) as usize);
