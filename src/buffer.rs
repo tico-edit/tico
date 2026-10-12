@@ -162,16 +162,15 @@ pub struct Buffer {
     /// not the whole viewport.
     pub left_col: usize,
     pub language: Option<&'static crate::syntax::LanguageDef>,
-    /// Remembered column for consecutive up/down movement through shorter
-    /// lines (nano's `placewewant`), together with where the cursor was
-    /// left by that movement. It only applies while the cursor is still
-    /// there: any other way of moving it -- a jump, a search, a click, an
-    /// edit -- makes the next Up/Down start from the cursor's own column,
-    /// as in nano, without every such site having to clear it.
-    goal_col: Option<(usize, Pos)>,
-    /// Under `softwrap`, Up/Down/Page aim for a display column instead
-    /// (nano's `placewewant` proper), held the same way as `goal_col`.
-    pub wrap_goal: Option<(usize, Pos)>,
+    /// Remembered display column for consecutive up/down movement through
+    /// shorter lines (nano's `placewewant`), together with where the
+    /// cursor was left by that movement. It only applies while the cursor
+    /// is still there: any other way of moving it -- a jump, a search, a
+    /// click, an edit -- makes the next Up/Down start from the cursor's
+    /// own column, as in nano, without every such site having to clear it.
+    /// A display column (tabs expanded, wide characters counting two), not
+    /// a character count, so it lines up across lines of wide text.
+    pub goal_col: Option<(usize, Pos)>,
     /// Path of this buffer's vim-style lock file (`set locking`), if one is
     /// currently held.
     pub lock_filename: Option<PathBuf>,
@@ -225,7 +224,6 @@ impl Buffer {
             left_col: 0,
             language: None,
             goal_col: None,
-            wrap_goal: None,
             lock_filename: None,
             lock_modified_written: false,
             ignore_external_changes: false,
@@ -298,12 +296,6 @@ impl Buffer {
             .rope
             .line_to_char(pos.line.min(self.rope.len_lines().saturating_sub(1)));
         line_start + pos.col
-    }
-
-    fn clamp_pos(&self, pos: Pos) -> Pos {
-        let line = pos.line.min(self.rope.len_lines().saturating_sub(1));
-        let line_len = self.line(line).chars().count();
-        Pos::new(line, pos.col.min(line_len))
     }
 
     /// Whether `line` carries an anchor.
@@ -581,37 +573,39 @@ impl Buffer {
         }
     }
 
-    /// The column Up/Down should aim for: the remembered one if the cursor
-    /// is still where the last vertical move left it, else its own.
-    pub fn goal_column(&self) -> usize {
+    /// The display column Up/Down should aim for: the remembered one if
+    /// the cursor is still where the last vertical move left it, else its
+    /// own (nano's `placewewant`).
+    pub fn goal_column(&self, tabsize: usize) -> usize {
         match self.goal_col {
             Some((goal, at)) if at == self.cursor => goal,
-            _ => self.cursor.col,
+            _ => display_width(&self.line(self.cursor.line), self.cursor.col, tabsize),
         }
     }
 
-    /// Put the cursor on `line` as near to column `goal` as that line
-    /// allows, and keep aiming for `goal` on following Up/Down moves --
-    /// nano's Go To Line, which sets `placewewant` to the requested column
-    /// even when the line is too short to reach it.
-    pub fn goto_line_aiming_at(&mut self, line: usize, goal: usize) {
-        self.cursor = self.clamp_pos(Pos::new(line, goal));
+    /// Put the cursor on `line` at display column `goal`, or as near as
+    /// that line allows (on the character covering it, as nano's
+    /// `actual_x`), and keep aiming for `goal` on following Up/Down moves
+    /// -- nano's Go To Line, which sets `placewewant` to the requested
+    /// column even when the line is too short to reach it.
+    pub fn goto_line_aiming_at(&mut self, line: usize, goal: usize, tabsize: usize) {
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        let col = char_col_for_display(&self.line(line), goal, tabsize);
+        self.cursor = Pos::new(line, col);
         self.goal_col = Some((goal, self.cursor));
     }
 
-    pub fn move_up(&mut self) {
+    pub fn move_up(&mut self, tabsize: usize) {
         if self.cursor.line > 0 {
-            let goal = self.goal_column();
-            self.cursor = self.clamp_pos(Pos::new(self.cursor.line - 1, goal));
-            self.goal_col = Some((goal, self.cursor));
+            let goal = self.goal_column(tabsize);
+            self.goto_line_aiming_at(self.cursor.line - 1, goal, tabsize);
         }
     }
 
-    pub fn move_down(&mut self) {
+    pub fn move_down(&mut self, tabsize: usize) {
         if self.cursor.line + 1 < self.rope.len_lines() {
-            let goal = self.goal_column();
-            self.cursor = self.clamp_pos(Pos::new(self.cursor.line + 1, goal));
-            self.goal_col = Some((goal, self.cursor));
+            let goal = self.goal_column(tabsize);
+            self.goto_line_aiming_at(self.cursor.line + 1, goal, tabsize);
         }
     }
 
@@ -671,23 +665,23 @@ mod tests {
         // line, M-\ to the top, then Down twice stays in column 0.
         let mut b = Buffer::from_text("abcdefgh\nab\nabcdefgh\nabcdefgh\n", None);
         b.cursor = Pos::new(0, 6);
-        b.move_down();
+        b.move_down(8);
         assert_eq!(b.cursor, Pos::new(1, 2));
-        b.move_down();
+        b.move_down(8);
         assert_eq!(b.cursor, Pos::new(2, 6), "still aiming for column 6");
         b.cursor = Pos::new(0, 0);
-        b.move_down();
-        b.move_down();
+        b.move_down(8);
+        b.move_down(8);
         assert_eq!(b.cursor, Pos::new(2, 0));
     }
 
     #[test]
     fn goto_line_keeps_aiming_at_its_column() {
         let mut b = Buffer::from_text("abcdefgh\nab\nabcdefgh\n", None);
-        b.goto_line_aiming_at(1, 6);
+        b.goto_line_aiming_at(1, 6, 8);
         assert_eq!(b.cursor, Pos::new(1, 2));
-        assert_eq!(b.goal_column(), 6);
-        b.move_down();
+        assert_eq!(b.goal_column(8), 6);
+        b.move_down(8);
         assert_eq!(b.cursor, Pos::new(2, 6));
     }
 
@@ -798,12 +792,28 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_aim_for_a_display_column() {
+        // Confirmed against the installed nano 8.7.1: from column 6 of a
+        // line of two-column characters, Down lands on column 6 of the
+        // ASCII line below, and then Down again back on a tab stop.
+        let mut b = Buffer::from_text("日本語日本\nabcdefgh\n\tx\n", None);
+        b.cursor = Pos::new(0, 3);
+        b.move_down(8);
+        assert_eq!(b.cursor, Pos::new(1, 6));
+        b.move_down(8);
+        assert_eq!(b.cursor, Pos::new(2, 0), "inside the tab: on the tab");
+        b.move_up(8);
+        b.move_up(8);
+        assert_eq!(b.cursor, Pos::new(0, 3), "still aiming for column 6");
+    }
+
+    #[test]
     fn move_up_down_clamps_column() {
         let mut b = Buffer::from_text("longline\nhi", None);
         b.cursor = Pos::new(0, 8);
-        b.move_down();
+        b.move_down(8);
         assert_eq!(b.cursor, Pos::new(1, 2));
-        b.move_up();
+        b.move_up(8);
         assert_eq!(b.cursor, Pos::new(0, 8));
     }
 

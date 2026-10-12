@@ -1982,24 +1982,16 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                     (line - 1).max(0)
                 };
                 // No column (or 0) keeps the column the cursor was aiming
-                // for, as nano's `goto_line_and_column` does. A given one
-                // is a display column, which a goal past the line's end
-                // keeps aiming beyond it.
+                // for, as nano's `goto_line_and_column` does; a given one is
+                // a display column, as is the goal.
+                let tabsize = editor.options.tabsize as usize;
                 let col = match col_s.trim().parse::<i64>() {
-                    Ok(c) if c > 0 => {
-                        let wanted = c as usize - 1;
-                        let line = (target_line as usize).min(total.max(1) as usize - 1);
-                        let text = editor.buf().line(line);
-                        let tabsize = editor.options.tabsize as usize;
-                        let width = crate::buffer::display_width(&text, usize::MAX, tabsize);
-                        crate::buffer::char_col_for_display(&text, wanted, tabsize)
-                            + wanted.saturating_sub(width)
-                    }
-                    _ => editor.buf().goal_column(),
+                    Ok(c) if c > 0 => c as usize - 1,
+                    _ => editor.buf().goal_column(tabsize),
                 };
                 editor
                     .buf_mut()
-                    .goto_line_aiming_at(target_line as usize, col);
+                    .goto_line_aiming_at(target_line as usize, col, tabsize);
                 editor.center_cursor_line();
             }
         }

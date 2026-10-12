@@ -244,14 +244,6 @@ impl Editor {
         )
     }
 
-    /// nano's `placewewant`: the display column Up/Down aim for.
-    fn wrap_placewewant(&self) -> usize {
-        match self.buf().wrap_goal {
-            Some((goal, at)) if at == self.buf().cursor => goal,
-            _ => self.cursor_display_col(),
-        }
-    }
-
     /// The viewport row the cursor is on (nano's `cursor_row`, as
     /// `place_the_cursor` computes it) -- negative when it's above the
     /// viewport, and possibly `>= text_rows()` when below.
@@ -327,7 +319,7 @@ impl Editor {
         let width = w.width.max(1);
         let shim = width * (1 + w.tabsize / width);
         let edge = w.leftedge_for(&buf.line(buf.cursor.line), self.cursor_display_col());
-        let target = (self.wrap_placewewant() + shim - edge) % width;
+        let target = (self.buf().goal_column(w.tabsize) + shim - edge) % width;
         (edge, target)
     }
 
@@ -372,7 +364,7 @@ impl Editor {
         }
         let buf = self.buf_mut();
         buf.cursor = Pos::new(line, x);
-        buf.wrap_goal = Some((edge + target, buf.cursor));
+        buf.goal_col = Some((edge + target, buf.cursor));
     }
 
     /// Up/Down by `nrows` chunks; false (nothing moved) at either end.
@@ -443,10 +435,10 @@ impl Editor {
         let buf = self.buf_mut();
         if buf.cursor.col == left_x {
             buf.move_home();
-            buf.wrap_goal = None;
+            buf.goal_col = None;
         } else {
             buf.cursor.col = left_x;
-            buf.wrap_goal = Some((chunk_edge, buf.cursor));
+            buf.goal_col = Some((chunk_edge, buf.cursor));
         }
     }
 
@@ -464,10 +456,10 @@ impl Editor {
         let buf = self.buf_mut();
         if buf.cursor.col == right_x {
             buf.move_end();
-            buf.wrap_goal = None;
+            buf.goal_col = None;
         } else {
             buf.cursor.col = right_x;
-            buf.wrap_goal = Some((rightedge, buf.cursor));
+            buf.goal_col = Some((rightedge, buf.cursor));
         }
     }
 

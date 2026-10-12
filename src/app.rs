@@ -1215,8 +1215,14 @@ impl Editor {
                     _ => self.wrapped_end(&w),
                 }
             }
-            Up => self.buf_mut().move_up(),
-            Down => self.buf_mut().move_down(),
+            Up => {
+                let tabsize = self.options.tabsize as usize;
+                self.buf_mut().move_up(tabsize);
+            }
+            Down => {
+                let tabsize = self.options.tabsize as usize;
+                self.buf_mut().move_down(tabsize);
+            }
             Home => self.buf_mut().move_home(),
             End => self.buf_mut().move_end(),
             PrevWord => self.move_prev_word(),
@@ -2215,13 +2221,14 @@ impl Editor {
         let rows = self.text_rows();
         let mustmove = if rows < 3 { 1 } else { rows - 2 };
         let jumpy = self.options.jumpyscrolling;
+        let tabsize = self.options.tabsize as usize;
         let buf = self.buf_mut();
         let last = buf.line_count().saturating_sub(1);
         let (from, goal, row) = if jumpy {
             (buf.top_line, 0, 0)
         } else {
             let row = buf.cursor.line.saturating_sub(buf.top_line);
-            (buf.cursor.line, buf.goal_column(), row)
+            (buf.cursor.line, buf.goal_column(tabsize), row)
         };
         if !forward && from < mustmove {
             buf.cursor = Pos::new(0, 0);
@@ -2236,7 +2243,7 @@ impl Editor {
         } else {
             from - mustmove
         };
-        buf.goto_line_aiming_at(line, goal);
+        buf.goto_line_aiming_at(line, goal, tabsize);
         buf.top_line = line.saturating_sub(row);
     }
 
@@ -2249,9 +2256,10 @@ impl Editor {
             self.wrapped_to_edge_row(&w, false);
             return;
         }
+        let tabsize = self.options.tabsize as usize;
         let buf = self.buf_mut();
-        let goal = buf.goal_column();
-        buf.goto_line_aiming_at(buf.top_line, goal);
+        let goal = buf.goal_column(tabsize);
+        buf.goto_line_aiming_at(buf.top_line, goal, tabsize);
     }
 
     /// nano's `to_bottom_row` (`M-End`): put the cursor on the line in the
@@ -2264,11 +2272,12 @@ impl Editor {
             return;
         }
         let rows = self.text_rows();
+        let tabsize = self.options.tabsize as usize;
         let buf = self.buf_mut();
-        let goal = buf.goal_column();
+        let goal = buf.goal_column(tabsize);
         let last = buf.line_count().saturating_sub(1);
         let line = (buf.top_line + rows.saturating_sub(1)).min(last);
-        buf.goto_line_aiming_at(line, goal);
+        buf.goto_line_aiming_at(line, goal, tabsize);
     }
 
     fn scroll_view(&mut self, delta: isize) {
