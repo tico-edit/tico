@@ -664,33 +664,28 @@ impl Editor {
 
     /// Horizontal counterpart of `scroll_to_cursor`, for lines too long to
     /// fit the screen (relevant only when `softwrap` is off, since a
-    /// soft-wrapped line never needs sideways scrolling). Adjusts
-    /// `buf.left_col` — the display-column offset applied when rendering
-    /// just the cursor's current line — using the same "cushion" scheme
-    /// nano uses when not soft-wrapping (its `united_sidescroll`, see
-    /// `get_page_start()` in nano's src/utils.c): scrolling only kicks in
-    /// within a few columns of either edge, and then jumps just enough to
-    /// restore that margin, rather than moving one column at a time.
+    /// soft-wrapped line never needs sideways scrolling). Sets
+    /// `buf.left_col` -- the display column at the left edge when
+    /// rendering just the cursor's current line -- by nano 8.7.1's
+    /// `get_page_start()` (src/utils.c): stateless, the line goes by
+    /// "pages" of `editwincols - 8` columns, each overlapping the last by
+    /// six, so where the view lands depends only on the cursor's column,
+    /// not on how it got there. (Newer nano's `united_sidescroll` scrolls
+    /// with a cushion instead; 8.7.1 has none.)
     fn scroll_horizontal_to_cursor(&mut self) {
-        const CUSHION: usize = 3;
         let tabsize = self.options.tabsize as usize;
-        let width = self.screen_cols.saturating_sub(self.gutter_width());
+        let width = self
+            .screen_cols
+            .saturating_sub(self.gutter_width() + self.sidebar_width());
         let buf = self.buf_mut();
-        let cursor_col =
+        let column =
             crate::buffer::display_width(&buf.line(buf.cursor.line), buf.cursor.col, tabsize);
-        let left = buf.left_col;
-        buf.left_col = if width <= 2 * CUSHION + 1 {
-            // Too narrow for a cushioned scroll; just keep the cursor in
-            // view.
-            cursor_col.saturating_sub(width.saturating_sub(1))
-        } else if cursor_col < CUSHION {
+        buf.left_col = if column == 0 || column + 2 < width {
             0
-        } else if cursor_col < left + CUSHION {
-            cursor_col - CUSHION
-        } else if cursor_col > left + width - CUSHION - 1 {
-            cursor_col + CUSHION + 1 - width
+        } else if width > 8 {
+            column - 6 - (column - 6) % (width - 8)
         } else {
-            left
+            column - width.saturating_sub(2)
         };
     }
 

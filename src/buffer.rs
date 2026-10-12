@@ -156,8 +156,10 @@ pub struct Buffer {
     pub first_col: usize,
     /// Horizontal scroll offset (in display columns) applied when rendering
     /// the cursor's current line, when it's too long to fit the screen and
-    /// `softwrap` is off. Other lines always render from column 0 — nano
-    /// scrolls only the current line sideways, not the whole viewport.
+    /// `softwrap` is off: the column shown at the text area's left edge,
+    /// under the `<` marker (nano's `get_page_start`). Other lines always
+    /// render from column 0 — nano scrolls only the current line sideways,
+    /// not the whole viewport.
     pub left_col: usize,
     pub language: Option<&'static crate::syntax::LanguageDef>,
     /// Remembered column for consecutive up/down movement through shorter

@@ -128,8 +128,15 @@ fn main() -> anyhow::Result<()> {
             if let Some(line) = fa.line {
                 let target = (line.max(1) as usize) - 1;
                 buf.cursor.line = target.min(buf.line_count().saturating_sub(1));
+                // nano's `goto_line_and_column`: the column is a display
+                // column, not a character count.
                 if let Some(col) = fa.column {
-                    buf.cursor.col = (col.max(1) as usize) - 1;
+                    let text = buf.line(buf.cursor.line);
+                    buf.cursor.col = tico::buffer::char_col_for_display(
+                        &text,
+                        (col.max(1) as usize) - 1,
+                        editor.options.tabsize as usize,
+                    );
                 }
             }
             // The status message reflects whichever buffer ends up focused

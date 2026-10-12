@@ -1982,9 +1982,19 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                     (line - 1).max(0)
                 };
                 // No column (or 0) keeps the column the cursor was aiming
-                // for, as nano's `goto_line_and_column` does.
+                // for, as nano's `goto_line_and_column` does. A given one
+                // is a display column, which a goal past the line's end
+                // keeps aiming beyond it.
                 let col = match col_s.trim().parse::<i64>() {
-                    Ok(c) if c > 0 => c as usize - 1,
+                    Ok(c) if c > 0 => {
+                        let wanted = c as usize - 1;
+                        let line = (target_line as usize).min(total.max(1) as usize - 1);
+                        let text = editor.buf().line(line);
+                        let tabsize = editor.options.tabsize as usize;
+                        let width = crate::buffer::display_width(&text, usize::MAX, tabsize);
+                        crate::buffer::char_col_for_display(&text, wanted, tabsize)
+                            + wanted.saturating_sub(width)
+                    }
                     _ => editor.buf().goal_column(),
                 };
                 editor
@@ -3940,10 +3950,8 @@ fn finish_cursor(editor: &Editor, out: &mut impl Write, text_start_row: u16) -> 
             editor.options.tabsize as usize,
         );
         // `left_col` is only ever nonzero for the cursor's own line (see
-        // `render_buffer`), and a `<` marker takes up one column whenever
-        // it's scrolled, shifting everything after it right by one.
-        let show_left = buf.left_col > 0;
-        let col = gutter + if show_left { 1 } else { 0 } + cursor_col.saturating_sub(buf.left_col);
+        // `render_buffer`), where it's the column at the left edge.
+        let col = gutter + cursor_col.saturating_sub(buf.left_col);
         queue!(
             out,
             MoveTo(
@@ -4984,14 +4992,13 @@ fn render_buffer(
             } else {
                 0
             };
+            // As in nano's `update_line`, the `<` and `>` markers take the
+            // place of the first and last columns of the window.
             let content_width = cols.saturating_sub(gutter_chars + sidebar);
             let show_left = left > 0;
-            let mut capacity = content_width.saturating_sub(if show_left { 1 } else { 0 });
-            let show_right = left + capacity < text_total;
-            if show_right {
-                capacity = capacity.saturating_sub(1);
-            }
-            let right = left + capacity;
+            let show_right = left + content_width < text_total;
+            let right = (left + content_width).saturating_sub(usize::from(show_right));
+            let left = (left + usize::from(show_left)).min(right);
 
             let mut chars: Vec<char> = full_chars[..gutter_chars].to_vec();
             let mut windowed_styles: Vec<Option<Style>> = styles[..gutter_chars].to_vec();
@@ -5045,9 +5052,15 @@ fn render_buffer(
             // end-of-buffer's own blank rows), in which case `chars`/`styles`
             // are extended with a plain space to carry it, matching nano's own
             // fallback of painting a space there.
+            // A marker covers the stripe in nano too (it's drawn last).
+            let window_left = left - usize::from(show_left);
             let stripe_idx = stripe_col
-                .and_then(|col| stripe_content_offset(col, left, content_width))
+                .and_then(|col| stripe_content_offset(col, window_left, content_width))
+                .filter(|&offset| {
+                    !(show_left && offset == 0 || show_right && offset + 1 == content_width)
+                })
                 .map(|offset| {
+                    let offset = offset - usize::from(show_left);
                     if offset < used {
                         marker_shift + shown_cols.partition_point(|&c| c <= left + offset) - 1
                     } else {
@@ -7774,7 +7787,7 @@ mod tests {
     fn a_wide_character_cut_by_the_left_marker_shows_its_right_half() {
         let mut ed = test_editor("ab日本語日本語日本語日\n");
         ed.screen_cols = 10;
-        ed.buf_mut().left_col = 3;
+        ed.buf_mut().left_col = 2;
         let mut out = Vec::new();
         render_buffer(&ed, &mut out, 0, 1).unwrap();
         assert_eq!(plain_row(&out), "<]本語日[>");
