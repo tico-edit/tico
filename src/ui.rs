@@ -4966,8 +4966,19 @@ fn render_buffer(
             // whole viewport — confirmed against the installed nano). A `<`
             // marker appears once scrolled; a `>` marker appears whenever the
             // line's text still overflows the available width, on any line.
+            // All of this is in display columns, not characters, so that
+            // wide characters count double; one cut by either edge shows
+            // as nano's `]` (its right half) or `[` (its left half).
             let full_chars: Vec<char> = rendered.chars().collect();
-            let text_total = full_chars.len().saturating_sub(gutter_chars);
+            let text = &full_chars[gutter_chars.min(full_chars.len())..];
+            let mut starts = Vec::with_capacity(text.len() + 1);
+            let mut col = 0;
+            for &c in text {
+                starts.push(col);
+                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            }
+            starts.push(col);
+            let text_total = col;
             let left = if is_real_line && line_idx == buf.cursor.line {
                 buf.left_col.min(text_total)
             } else {
@@ -4980,34 +4991,52 @@ fn render_buffer(
             if show_right {
                 capacity = capacity.saturating_sub(1);
             }
-            let vis_start = gutter_chars + left;
-            let vis_end = (vis_start + capacity).min(full_chars.len());
+            let right = left + capacity;
 
             let mut chars: Vec<char> = full_chars[..gutter_chars].to_vec();
+            let mut windowed_styles: Vec<Option<Style>> = styles[..gutter_chars].to_vec();
+            // nano draws both markers in `hilite_attribute`.
             if show_left {
                 chars.push('<');
-            }
-            chars.extend_from_slice(&full_chars[vis_start..vis_end]);
-            if show_right {
-                chars.push('>');
-            }
-            // nano draws both markers in `hilite_attribute`.
-            let mut windowed_styles: Vec<Option<Style>> = styles[..gutter_chars].to_vec();
-            if show_left {
                 windowed_styles.push(Some(hilite_style(editor)));
             }
-            windowed_styles.extend_from_slice(&styles[vis_start..vis_end]);
+            let marker_shift = chars.len();
+            // The display column each shown character stands for, to place
+            // the search/selection highlights.
+            let mut shown_cols = Vec::new();
+            for (k, &c) in text.iter().enumerate() {
+                let (start, end) = (starts[k], starts[k + 1]);
+                if end <= left || start >= right {
+                    continue;
+                }
+                let shown = if start < left {
+                    ']'
+                } else if end > right {
+                    '['
+                } else {
+                    c
+                };
+                chars.push(shown);
+                windowed_styles.push(styles[gutter_chars + k]);
+                shown_cols.push(start.max(left));
+            }
+            let text_cells = chars.len() - marker_shift;
+            let used = starts[text.len()].min(right).saturating_sub(left);
             if show_right {
+                chars.push('>');
                 windowed_styles.push(Some(hilite_style(editor)));
             }
             let styles = windowed_styles;
-            let marker_shift = gutter_chars + if show_left { 1 } else { 0 };
-            let clamp_to_view = |(s, e): (usize, usize)| {
-                let clamp = |x: usize| marker_shift + x.clamp(vis_start, vis_end) - vis_start;
-                (clamp(s), clamp(e))
+            // `highlight`/`selected` are display columns past the gutter.
+            let to_view = |(s, e): (usize, usize)| {
+                let at = |x: usize| {
+                    let column = x.saturating_sub(gutter_chars);
+                    marker_shift + shown_cols.partition_point(|&c| c < column)
+                };
+                (at(s), at(e))
             };
-            let highlight = highlight.map(clamp_to_view);
-            let selected = selected.map(clamp_to_view);
+            let highlight = highlight.map(to_view);
+            let selected = selected.map(to_view);
 
             // The stripe recolors whatever's already at its column, so it
             // scrolls along with the line -- hidden once scrolled past it
@@ -5018,7 +5047,13 @@ fn render_buffer(
             // fallback of painting a space there.
             let stripe_idx = stripe_col
                 .and_then(|col| stripe_content_offset(col, left, content_width))
-                .map(|offset| marker_shift + offset);
+                .map(|offset| {
+                    if offset < used {
+                        marker_shift + shown_cols.partition_point(|&c| c <= left + offset) - 1
+                    } else {
+                        marker_shift + text_cells + (offset - used)
+                    }
+                });
             (chars, styles, highlight, selected, stripe_idx)
         };
         if let Some(idx) = stripe_idx
@@ -7701,6 +7736,48 @@ mod tests {
             text.contains("\x1b[7m \x1b[0m"),
             "expected a reverse-video space past the end of the line: {text:?}"
         );
+    }
+
+    /// The visible text of one rendered row, escape sequences removed.
+    fn plain_row(out: &[u8]) -> String {
+        let text = String::from_utf8_lossy(out);
+        let mut plain = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        plain
+    }
+
+    #[test]
+    fn an_overlong_line_of_wide_characters_gets_the_more_marker() {
+        // Ten two-column characters on a 10-column screen: four fit
+        // before the `>` column, and the fifth, cut by it, shows as `[`
+        // -- nano's `display_string`.
+        let mut ed = test_editor("日本語日本語日本語日\n");
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.screen_cols = 10;
+        let mut out = Vec::new();
+        render_buffer(&ed, &mut out, 0, 1).unwrap();
+        assert_eq!(plain_row(&out), "日本語日[>");
+    }
+
+    #[test]
+    fn a_wide_character_cut_by_the_left_marker_shows_its_right_half() {
+        let mut ed = test_editor("ab日本語日本語日本語日\n");
+        ed.screen_cols = 10;
+        ed.buf_mut().left_col = 3;
+        let mut out = Vec::new();
+        render_buffer(&ed, &mut out, 0, 1).unwrap();
+        assert_eq!(plain_row(&out), "<]本語日[>");
     }
 
     #[test]
