@@ -1939,7 +1939,10 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                 text
             };
             editor.mode = Mode::Editing;
+            // Nothing typed and nothing to reuse: nano's `search_init`
+            // treats that as a cancel.
             if text.is_empty() {
+                editor.set_status("Cancelled");
                 return;
             }
             editor.history.add_search(&text);
@@ -1954,6 +1957,7 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
             };
             if text.is_empty() {
                 editor.mode = Mode::Editing;
+                editor.set_status("Cancelled");
                 return;
             }
             editor.history.add_search(&text);
@@ -1982,14 +1986,16 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                     (line - 1).max(0)
                 };
                 // No column (or 0) keeps the column the cursor was aiming
-                // for, as nano's `goto_line_and_column` does.
+                // for, as nano's `goto_line_and_column` does; a given one is
+                // a display column, as is the goal.
+                let tabsize = editor.options.tabsize as usize;
                 let col = match col_s.trim().parse::<i64>() {
                     Ok(c) if c > 0 => c as usize - 1,
-                    _ => editor.buf().goal_column(),
+                    _ => editor.buf().goal_column(tabsize),
                 };
                 editor
                     .buf_mut()
-                    .goto_line_aiming_at(target_line as usize, col);
+                    .goto_line_aiming_at(target_line as usize, col, tabsize);
                 editor.center_cursor_line();
             }
         }
@@ -3940,10 +3946,8 @@ fn finish_cursor(editor: &Editor, out: &mut impl Write, text_start_row: u16) -> 
             editor.options.tabsize as usize,
         );
         // `left_col` is only ever nonzero for the cursor's own line (see
-        // `render_buffer`), and a `<` marker takes up one column whenever
-        // it's scrolled, shifting everything after it right by one.
-        let show_left = buf.left_col > 0;
-        let col = gutter + if show_left { 1 } else { 0 } + cursor_col.saturating_sub(buf.left_col);
+        // `render_buffer`), where it's the column at the left edge.
+        let col = gutter + cursor_col.saturating_sub(buf.left_col);
         queue!(
             out,
             MoveTo(
@@ -4167,10 +4171,12 @@ fn render_minibar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Res
     let constantshow = editor.options.constantshow;
     let mut line = MinibarLine::new(cols);
 
+    // nano first cuts the name to the screen's width, keeping its start
+    // (`display_string(filename, 0, COLS)`), and measures that.
     let thename = buf
         .path
         .as_ref()
-        .map(|p| p.display().to_string())
+        .map(|p| head_of_width(&p.display().to_string(), cols))
         .unwrap_or_else(|| "(nameless)".to_string());
     let namewidth = thename.width();
     let text = buf.line(buf.cursor.line);
@@ -4182,6 +4188,8 @@ fn render_minibar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Res
 
     if cols > 4 {
         if namewidth > cols - 2 {
+            // ...then shows the last `cols - 5` columns of what's left,
+            // so a very long path loses its first few columns, not its end.
             line.put(0, "...");
             line.add(&tail_of_width(&thename, cols - 5));
         } else {
@@ -4253,6 +4261,17 @@ fn minibar_char_codes(buf: &crate::buffer::Buffer) -> String {
 
 /// The last `width` columns' worth of `s` (nano's `display_string(name,
 /// namewidth - COLS + 5, COLS - 5, ...)` for a too-long minibar name).
+/// The longest start of `s` that fits in `width` columns.
+fn head_of_width(s: &str, width: usize) -> String {
+    let mut taken = 0;
+    s.chars()
+        .take_while(|&c| {
+            taken += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            taken <= width
+        })
+        .collect()
+}
+
 fn tail_of_width(s: &str, width: usize) -> String {
     let mut taken = 0;
     let mut tail: Vec<char> = Vec::new();
@@ -4984,14 +5003,13 @@ fn render_buffer(
             } else {
                 0
             };
+            // As in nano's `update_line`, the `<` and `>` markers take the
+            // place of the first and last columns of the window.
             let content_width = cols.saturating_sub(gutter_chars + sidebar);
             let show_left = left > 0;
-            let mut capacity = content_width.saturating_sub(if show_left { 1 } else { 0 });
-            let show_right = left + capacity < text_total;
-            if show_right {
-                capacity = capacity.saturating_sub(1);
-            }
-            let right = left + capacity;
+            let show_right = left + content_width < text_total;
+            let right = (left + content_width).saturating_sub(usize::from(show_right));
+            let left = (left + usize::from(show_left)).min(right);
 
             let mut chars: Vec<char> = full_chars[..gutter_chars].to_vec();
             let mut windowed_styles: Vec<Option<Style>> = styles[..gutter_chars].to_vec();
@@ -5045,9 +5063,15 @@ fn render_buffer(
             // end-of-buffer's own blank rows), in which case `chars`/`styles`
             // are extended with a plain space to carry it, matching nano's own
             // fallback of painting a space there.
+            // A marker covers the stripe in nano too (it's drawn last).
+            let window_left = left - usize::from(show_left);
             let stripe_idx = stripe_col
-                .and_then(|col| stripe_content_offset(col, left, content_width))
+                .and_then(|col| stripe_content_offset(col, window_left, content_width))
+                .filter(|&offset| {
+                    !(show_left && offset == 0 || show_right && offset + 1 == content_width)
+                })
                 .map(|offset| {
+                    let offset = offset - usize::from(show_left);
                     if offset < used {
                         marker_shift + shown_cols.partition_point(|&c| c <= left + offset) - 1
                     } else {
@@ -6161,6 +6185,12 @@ mod tests {
         assert!(minibar_text(&ed, 50).starts_with("  (nameless) *"));
         ed.buf_mut().path = Some(format!("/{}", "d".repeat(60)).into());
         assert_eq!(minibar_text(&ed, 50), format!("...{} *", "d".repeat(45)));
+        // Confirmed against the installed nano 8.7.1: the name is first cut
+        // to the screen's width, keeping its start, and then loses its
+        // first five columns to the "...".
+        let name = format!("/{}", "abcdefghij".repeat(6));
+        ed.buf_mut().path = Some(name.clone().into());
+        assert_eq!(minibar_text(&ed, 50), format!("...{} *", &name[5..50]));
     }
 
     #[test]
@@ -6394,6 +6424,38 @@ mod tests {
         for c in text.chars() {
             press(ed, KeyCode::Char(c), KeyModifiers::NONE);
         }
+    }
+
+    #[test]
+    fn a_prompt_wipes_the_message_it_covered() {
+        // Confirmed against the installed nano 8.7.1: after "Read N lines",
+        // ^_ 3 Enter leaves the status bar blank, while ^W ^C reports
+        // "Cancelled".
+        let mut ed = test_editor("a\nb\nc\nd\n");
+        ed.set_status("Read 4 lines");
+        press(&mut ed, KeyCode::Char('_'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "3");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.buf().cursor.line, 2);
+        assert_eq!(ed.status, None);
+
+        ed.set_status("Read 4 lines");
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+    }
+
+    #[test]
+    fn an_empty_search_with_nothing_to_reuse_is_cancelled() {
+        let mut ed = test_editor("abc\n");
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+        press(&mut ed, KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
     }
 
     fn browser_names(ed: &Editor) -> Vec<String> {
@@ -7774,7 +7836,7 @@ mod tests {
     fn a_wide_character_cut_by_the_left_marker_shows_its_right_half() {
         let mut ed = test_editor("ab日本語日本語日本語日\n");
         ed.screen_cols = 10;
-        ed.buf_mut().left_col = 3;
+        ed.buf_mut().left_col = 2;
         let mut out = Vec::new();
         render_buffer(&ed, &mut out, 0, 1).unwrap();
         assert_eq!(plain_row(&out), "<]本語日[>");
