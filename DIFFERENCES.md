@@ -46,13 +46,14 @@ The trade is deliberate: tree-sitter parses the language rather than
 pattern-matching lines, so highlighting is accurate across multi-line
 constructs and heredocs, and any Helix theme works unmodified.
 
-## Title bar: `[x/y]` with multiple buffers, and "View"
+## Title bar: `[x/y]` with multiple buffers
 
 When more than one buffer is open, nano replaces the version text in the
 upper-left corner with the `[current/total]` buffer indicator. tico keeps
 `tico VERSION` on the left and puts `[x/y]` in the upper-right corner
-instead, so neither is lost. `--view`'s "View" marker shares that corner,
-and the two show together when both apply.
+instead, so neither is lost. It follows whatever nano shows there
+("View", "Modified", "Restricted", or `set stateflags`'s letters),
+so both show together when both apply.
 
 ## Suspend: no SIGTSTP/SIGCONT handling
 

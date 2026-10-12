@@ -3961,93 +3961,129 @@ fn finish_cursor(editor: &Editor, out: &mut impl Write, text_start_row: u16) -> 
 }
 
 fn render_title_bar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Result<()> {
-    let version = env!("CARGO_PKG_VERSION");
-    let left = format!("  tico {version}");
-    let name = editor
-        .buf()
+    let s = title_bar_text(editor, cols);
+    queue_bar_segment(out, title_bar_style(editor), &s)
+}
+
+/// The title bar's text, `cols` columns wide: nano's `titlebar(NULL)`.
+/// The version on the left, the file name centered, and on the right the
+/// state word -- "View", "Modified" or "Restricted" -- or, under `set
+/// stateflags`, a `*` after the name and the flag letters (see
+/// `state_flags`) where the word would be. When things don't fit, the
+/// version goes first, then the room kept free for "Modified", then the
+/// side spaces, and only then is the name dottified.
+///
+/// With more than one buffer open, nano shows `[i/n]` in place of the
+/// version; tico keeps the version and puts `[i/n]` after the state word
+/// on the right instead (see DIFFERENCES.md).
+fn title_bar_text(editor: &Editor, cols: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let buf = editor.buf();
+    let upperleft = format!("tico {}", env!("CARGO_PKG_VERSION"));
+    let path = buf
         .path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "New Buffer".to_string());
-    let modified = if editor.buf().modified { " *" } else { "" };
-    let mut center_text = format!("{name}{modified}");
+    let flags = editor.options.stateflags && !editor.options.view;
 
-    // When more than one buffer is open, show "[i/n]" (1-based current
-    // buffer index / total buffer count) in the upper-right corner. Nano
-    // shows this same indicator but replaces its version text with it; we
-    // keep the "tico version" text on the left and add the indicator on
-    // the right instead so neither is lost. `--view`'s "View" (nano's own
-    // right-aligned "state" word) shares that same corner; the two are
-    // independent, so both can show together.
-    let mut indicator = String::new();
-    if editor.options.view {
-        indicator.push_str("View");
-    } else if editor.options.restricted && !editor.buf().modified {
-        // nano's state word: "Restricted" until a modification takes over
-        // (tico marks that with the `*` after the name instead).
-        indicator.push_str("Restricted");
+    let mut pluglen = 0;
+    let mut state = if editor.options.view {
+        "View"
+    } else if flags {
+        "+.xxxxx"
+    } else if buf.modified {
+        "Modified"
+    } else if editor.options.restricted {
+        "Restricted"
+    } else {
+        pluglen = "Modified".len() + 1;
+        ""
     }
+    .to_string();
     if editor.buffers.len() > 1 {
-        if !indicator.is_empty() {
-            indicator.push(' ');
+        if !state.is_empty() {
+            state.push(' ');
         }
-        indicator.push_str(&format!(
+        state.push_str(&format!(
             "[{}/{}]",
             editor.current + 1,
             editor.buffers.len()
         ));
     }
-    let right_w = if indicator.is_empty() {
-        0
+
+    let mut verlen = upperleft.width() + 3;
+    let pathwidth = path.width();
+    let mut pathlen = pathwidth;
+    let mut statelen = state.width() + 2;
+    if statelen > 2 {
+        pathlen += 1;
+    }
+
+    let mut line = MinibarLine::new(cols);
+    let total =
+        |verlen: usize, pluglen: usize, statelen: usize| verlen + pathlen + pluglen + statelen;
+    if total(verlen, pluglen, statelen) <= cols {
+        line.put(2, &upperleft);
     } else {
-        indicator.chars().count() + 2
+        verlen = 2;
+        if total(verlen, pluglen, statelen) > cols {
+            pluglen = 0;
+        }
+        if total(verlen, pluglen, statelen) > cols {
+            verlen = 0;
+            statelen -= 2;
+        }
+    }
+
+    let offset = if verlen > 0 {
+        verlen + cols.saturating_sub(verlen + pluglen + statelen + pathlen) / 2
+    } else {
+        0
     };
-
-    // Reserve space for the left prefix and the right indicator (plus one
-    // column of separation on each side); if the filename doesn't fit,
-    // truncate it, keeping the tail (the most identifying part of a long
-    // path) and prefixing "...".
-    let left_w = left.chars().count();
-    let available = cols.saturating_sub(left_w + right_w + 2);
-    if center_text.chars().count() > available {
-        if available > 3 {
-            let tail: String = center_text
-                .chars()
-                .rev()
-                .take(available - 3)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            center_text = format!("...{tail}");
-        } else {
-            center_text.clear();
-        }
+    line.at = offset;
+    if pathlen + pluglen + statelen <= cols {
+        line.add(&path);
+    } else if 5 + statelen <= cols {
+        line.add("...");
+        // What's left of the name after skipping its first
+        // `3 + pathlen - cols + statelen` columns.
+        let keep = pathwidth.saturating_sub(3 + pathlen + statelen - cols);
+        line.add(&tail_of_width(&path, keep));
     }
 
-    let mut line = vec![' '; cols];
-    for (i, c) in left.chars().enumerate() {
-        if i < cols {
-            line[i] = c;
+    if flags {
+        if buf.modified && cols > 1 {
+            line.add(" *");
         }
-    }
-    let start = (cols.saturating_sub(center_text.chars().count()) / 2).max(left_w + 1);
-    for (i, c) in center_text.chars().enumerate() {
-        if start + i < cols {
-            line[start + i] = c;
+        if statelen < cols {
+            let ranking = state.strip_prefix("+.xxxxx").unwrap_or("");
+            line.put(cols + 2 - statelen, &state_flags(editor));
+            line.add(ranking);
         }
+    } else if statelen > 0 && statelen <= cols {
+        line.put(cols - statelen, &state);
+    } else if statelen > 0 {
+        line.put(0, &state);
     }
-    if !indicator.is_empty() {
-        let ind_start = cols.saturating_sub(indicator.chars().count() + 2);
-        for (i, c) in indicator.chars().enumerate() {
-            let pos = ind_start + i;
-            if pos < cols {
-                line[pos] = c;
-            }
-        }
-    }
-    let s: String = line.into_iter().collect();
-    queue_bar_segment(out, title_bar_style(editor), &s)
+    line.into_string()
+}
+
+/// nano's `show_states_at`: a letter for each of auto-indent, the mark,
+/// hard-wrapping (`breaklonglines`), macro recording and soft-wrapping,
+/// or a space when it's off -- what `set stateflags` shows.
+fn state_flags(editor: &Editor) -> String {
+    let o = &editor.options;
+    [
+        (o.autoindent, 'I'),
+        (editor.buf().mark.is_some(), 'M'),
+        (o.breaklonglines, 'L'),
+        (editor.macros.recording, 'R'),
+        (o.softwrap, 'S'),
+    ]
+    .iter()
+    .map(|&(on, c)| if on { c } else { ' ' })
+    .collect()
 }
 
 /// The resolved style for the title bar, used directly by the title bar
@@ -4160,7 +4196,8 @@ fn render_status_line(
 /// `minibar_note` (right after a load/save/buffer-switch) or, when
 /// multiple buffers are open, an `[i/n]` counter; under `set
 /// constantshow`, the cursor's `line,column` and the code of the character
-/// under it; a `†` when the cursor's line has an anchor; and the cursor's
+/// under it; under `set stateflags`, the flag letters (`state_flags`);
+/// a `†` when the cursor's line has an anchor; and the cursor's
 /// percentage into the file, right-aligned.
 /// Each piece only appears when nano's own width test says it fits.
 /// Colored with `minicolor` (falling back to the title bar's own colors,
@@ -4215,8 +4252,17 @@ fn render_minibar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Res
     if constantshow && namewidth + tallywidth + placewidth + 32 < cols {
         line.put(cols - 27 - placewidth, &location);
     }
+    // nano leaves the flags out when zero-width characters' codes were
+    // shown, since those can run into where the flags go.
+    let mut successor = false;
     if constantshow && namewidth + tallywidth + 28 < cols {
-        line.put(cols - 23, &minibar_char_codes(buf));
+        let codes = minibar_char_codes(buf);
+        successor = codes.contains('|');
+        line.put(cols - 23, &codes);
+    }
+
+    if editor.options.stateflags && !successor && namewidth + tallywidth + 14 + 2 * padding < cols {
+        line.put(cols - 11 - padding, &state_flags(editor));
     }
 
     // nano's dagger, just left of the percentage, when the cursor's line
@@ -6176,6 +6222,84 @@ mod tests {
             shown(&ed, 36),
             format!("  c.txt{}  ----{}100%", " ".repeat(6), " ".repeat(11))
         );
+    }
+
+    fn title_text(ed: &Editor, cols: usize) -> String {
+        let mut out = Vec::new();
+        render_title_bar(ed, &mut out, cols).unwrap();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let plain = regex::Regex::new("\x1b\\[[0-9;]*m").unwrap();
+        plain.replace_all(&text, "").into_owned()
+    }
+
+    #[test]
+    fn the_title_bar_says_modified_on_the_right_like_nano() {
+        // Layouts confirmed against the installed nano 8.7.1 (with its
+        // version text in place of tico's).
+        let mut ed = test_editor("x");
+        ed.buf_mut().path = Some("ex.txt".into());
+        let version = format!("  tico {}", env!("CARGO_PKG_VERSION"));
+        let left = version.len() + 1;
+        // The name is centered as if "Modified" were already there.
+        let centered = left + (80 - (left + 9 + 2 + 6)) / 2;
+        let title = title_text(&ed, 80);
+        assert_eq!(title.find("ex.txt"), Some(centered), "{title}");
+        assert_eq!(title.trim_end().len(), centered + 6, "{title}");
+        ed.buf_mut().modified = true;
+        let title = title_text(&ed, 80);
+        assert_eq!(title.find("ex.txt"), Some(centered), "{title}");
+        assert!(title.ends_with("Modified  "), "{title}");
+        // Too narrow for the version: dottified from the left.
+        ed.buf_mut().path = Some("/a/long/directory/name/ex.txt".into());
+        assert_eq!(title_text(&ed, 30), "...ectory/name/ex.txt Modified");
+    }
+
+    #[test]
+    fn stateflags_show_on_the_title_bar_with_a_star_for_modified() {
+        let mut ed = test_editor("x");
+        ed.buf_mut().path = Some("ex.txt".into());
+        ed.options.stateflags = true;
+        ed.options.restricted = true;
+        assert_eq!(
+            title_text(&ed, 80).split_whitespace().last(),
+            Some("ex.txt")
+        );
+        ed.buf_mut().modified = true;
+        ed.options.autoindent = true;
+        ed.options.softwrap = true;
+        ed.macros.recording = true;
+        let title = title_text(&ed, 80);
+        assert!(title.contains("ex.txt *"), "{title}");
+        assert!(title.ends_with("I  RS  "), "{title}");
+        ed.buf_mut().mark = Some(crate::buffer::Pos::new(0, 0));
+        ed.options.breaklonglines = true;
+        ed.macros.recording = false;
+        assert!(title_text(&ed, 80).ends_with("IML S  "));
+        // Narrow: the side spaces go, and the flags still fit.
+        ed.buf_mut().path = Some("/a/long/directory/name/ex.txt".into());
+        assert_eq!(title_text(&ed, 30), "...rectory/name/ex.txt * IML S");
+        // View mode shows "View" instead.
+        ed.options.view = true;
+        assert!(title_text(&ed, 80).ends_with("View  "));
+    }
+
+    #[test]
+    fn stateflags_show_on_the_minibar() {
+        // Layout confirmed against the installed nano 8.7.1.
+        let mut ed = test_editor(&"Softwrap test file\n".repeat(17));
+        ed.buf_mut().path = Some("ex.txt".into());
+        ed.options.minibar = true;
+        ed.options.stateflags = true;
+        ed.options.constantshow = true;
+        ed.options.autoindent = true;
+        assert_eq!(
+            minibar_text(&ed, 80),
+            format!("  ex.txt{}1,1    U+0053    I        5%  ", " ".repeat(42))
+        );
+        // Toggling a flag the minibar shows says nothing.
+        ed.execute(crate::keymap::Action::SoftWrap);
+        assert_eq!(ed.status, None);
+        assert!(minibar_text(&ed, 80).contains("I   S"));
     }
 
     #[test]
