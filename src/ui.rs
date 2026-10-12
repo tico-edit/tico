@@ -1939,7 +1939,10 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
                 text
             };
             editor.mode = Mode::Editing;
+            // Nothing typed and nothing to reuse: nano's `search_init`
+            // treats that as a cancel.
             if text.is_empty() {
+                editor.set_status("Cancelled");
                 return;
             }
             editor.history.add_search(&text);
@@ -1954,6 +1957,7 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
             };
             if text.is_empty() {
                 editor.mode = Mode::Editing;
+                editor.set_status("Cancelled");
                 return;
             }
             editor.history.add_search(&text);
@@ -6399,6 +6403,38 @@ mod tests {
         for c in text.chars() {
             press(ed, KeyCode::Char(c), KeyModifiers::NONE);
         }
+    }
+
+    #[test]
+    fn a_prompt_wipes_the_message_it_covered() {
+        // Confirmed against the installed nano 8.7.1: after "Read N lines",
+        // ^_ 3 Enter leaves the status bar blank, while ^W ^C reports
+        // "Cancelled".
+        let mut ed = test_editor("a\nb\nc\nd\n");
+        ed.set_status("Read 4 lines");
+        press(&mut ed, KeyCode::Char('_'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "3");
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.buf().cursor.line, 2);
+        assert_eq!(ed.status, None);
+
+        ed.set_status("Read 4 lines");
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+    }
+
+    #[test]
+    fn an_empty_search_with_nothing_to_reuse_is_cancelled() {
+        let mut ed = test_editor("abc\n");
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+        press(&mut ed, KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(ed.mode, Mode::Editing));
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
     }
 
     fn browser_names(ed: &Editor) -> Vec<String> {

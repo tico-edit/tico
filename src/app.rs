@@ -382,6 +382,9 @@ pub struct Editor {
     /// nano's `lastmessage` not being `VACUUM`, which keeps `set
     /// constantshow`'s cursor report from replacing it straight away.
     message_posted: bool,
+    /// Which prompt (if any) was open when the current keystroke began,
+    /// to tell when a keystroke opens a new one.
+    prompt_at_keystroke: Option<std::mem::Discriminant<PromptKind>>,
     /// Set when an Alert-level message was just posted; the UI layer rings
     /// the terminal bell once and clears this, matching nano's beep() in
     /// statusline() for ALERT-importance messages.
@@ -487,6 +490,7 @@ impl Editor {
             status_level: StatusLevel::Normal,
             status_countdown: 0,
             message_posted: false,
+            prompt_at_keystroke: None,
             bell_pending: false,
             brief_warnings: Vec::new(),
             status_after_warnings: None,
@@ -2341,6 +2345,14 @@ impl Editor {
     /// `lastmessage = VACUUM` once a key is read.
     pub fn begin_keystroke(&mut self) {
         self.message_posted = false;
+        self.prompt_at_keystroke = self.open_prompt_kind();
+    }
+
+    fn open_prompt_kind(&self) -> Option<std::mem::Discriminant<PromptKind>> {
+        match &self.mode {
+            Mode::Prompt(prompt) => Some(std::mem::discriminant(&prompt.kind)),
+            _ => None,
+        }
     }
 
     /// Call after handling each keystroke or mouse event -- nano's main
@@ -2349,6 +2361,15 @@ impl Editor {
     /// shows where the cursor is (`report_cursor_position`); neither under
     /// `set zero`.
     pub fn end_keystroke(&mut self) {
+        // A prompt takes over the status bar, and nano's `do_prompt`
+        // forgets whatever message was there (`lastmessage = VACUUM`):
+        // once the prompt is done, the bar is left blank unless something
+        // posted a new message.
+        let prompt = self.open_prompt_kind();
+        if prompt.is_some() && prompt != self.prompt_at_keystroke {
+            self.status = None;
+            self.status_countdown = 0;
+        }
         if self.message_posted
             || self.options.zero
             || self.screen_rows <= 1
