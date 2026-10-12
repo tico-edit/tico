@@ -12,7 +12,6 @@ here.
 
 ### Display
 
-- [ ] `stateflags`
 - [ ] `bookstyle`
 - [ ] `emptyline`
 - [ ] `rawsequences`

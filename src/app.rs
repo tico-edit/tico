@@ -1330,7 +1330,7 @@ impl Editor {
                 if !self.options.softwrap {
                     self.buf_mut().first_col = 0;
                 }
-                self.set_status(if self.options.softwrap {
+                self.set_flag_status(if self.options.softwrap {
                     "Soft wrapping of overlong lines enabled"
                 } else {
                     "Soft wrapping of overlong lines disabled"
@@ -1370,7 +1370,7 @@ impl Editor {
             }
             AutoIndent => {
                 self.options.autoindent = !self.options.autoindent;
-                self.set_status(if self.options.autoindent {
+                self.set_flag_status(if self.options.autoindent {
                     "Auto indent enabled"
                 } else {
                     "Auto indent disabled"
@@ -1386,7 +1386,7 @@ impl Editor {
             }
             BreakLongLines => {
                 self.options.breaklonglines = !self.options.breaklonglines;
-                self.set_status(if self.options.breaklonglines {
+                self.set_flag_status(if self.options.breaklonglines {
                     "Hard wrapping of overlong lines enabled"
                 } else {
                     "Hard wrapping of overlong lines disabled"
@@ -1988,6 +1988,14 @@ impl Editor {
     /// mark (as opposed to the "soft" one Shift+movement sets), which
     /// persists until toggled off again rather than being cleared by the
     /// next plain movement.
+    /// The message for toggling a flag that `set stateflags` shows: nano
+    /// leaves it out when the minibar is there to show the flag's letter.
+    fn set_flag_status(&mut self, msg: &str) {
+        if !(self.options.minibar && !self.options.zero && self.options.stateflags) {
+            self.set_status(msg);
+        }
+    }
+
     fn toggle_mark(&mut self) {
         let cur = self.buf().cursor;
         if self.buf().mark.is_some() {
