@@ -151,10 +151,14 @@ pub struct ReplaceLoopState {
     pub replacement: String,
     pub match_pos: Pos,
     pub match_len: usize,
-    /// Where this replace operation began (the cursor position when it was
-    /// kicked off); once the search wraps around and reaches here again,
-    /// the loop stops rather than repeating forever.
-    pub session_start: Pos,
+    /// Where the cursor was when the replace began (nano's `real_current`
+    /// and `real_current_x`), kept in step with replacements earlier on
+    /// its line: once the search wraps around and reaches here again, the
+    /// loop stops, and here is where the cursor goes back to at the end.
+    pub begin: Pos,
+    /// The viewport (`top_line`, `first_col`) when the replace began,
+    /// likewise restored at the end.
+    pub view: (usize, usize),
     pub wrapped: bool,
     pub count: usize,
     /// When a region was marked at the start of this replace, its end
@@ -2875,11 +2879,22 @@ impl Editor {
         }
     }
 
+    /// nano's `do_research`: search again for the last pattern -- or,
+    /// when nothing was searched for yet in this session, the most recent
+    /// one in the search history.
     fn repeat_search(&mut self, backwards: bool) {
-        let Some(pattern) = self.search.last_pattern.clone() else {
-            self.set_status("No search pattern in memory");
+        let pattern = self
+            .search
+            .last_pattern
+            .clone()
+            .or_else(|| self.history.search.last().cloned());
+        let Some(pattern) = pattern else {
+            self.set_status("No current search pattern");
             return;
         };
+        // nano wipes the status bar first, so an earlier "Search Wrapped"
+        // doesn't linger past the search that didn't wrap.
+        self.status = None;
         self.run_search(&pattern, backwards);
     }
 
@@ -2996,12 +3011,14 @@ impl Editor {
             self.buf_mut().mark = None;
             self.buf_mut().softmark = false;
         }
-        let session_start = region.map(|(start, _)| start).unwrap_or(self.buf().cursor);
+        let begin = self.buf().cursor;
+        let view = (self.buf().top_line, self.buf().first_col);
+        let from = region.map(|(start, _)| start).unwrap_or(begin);
         let region_end = region.map(|(_, end)| end);
         let found = find_next_match_for_replace(
             self.buf(),
-            session_start,
-            session_start,
+            from,
+            begin,
             false,
             region_end,
             &search,
@@ -3019,7 +3036,8 @@ impl Editor {
                         replacement,
                         match_pos: pos,
                         match_len: len,
-                        session_start,
+                        begin,
+                        view,
                         wrapped,
                         count: 0,
                         region_end,
@@ -3050,9 +3068,7 @@ impl Editor {
     /// prompt) or finish the loop.
     pub fn replace_choice(&mut self, mut state: ReplaceLoopState, choice: ReplaceChoice) {
         if matches!(choice, ReplaceChoice::Cancel) {
-            self.mode = Mode::Editing;
-            self.clear_spotlight();
-            self.report_replace_count(state.count);
+            self.finish_replace_loop(&state);
             return;
         }
         let mut do_replace = matches!(choice, ReplaceChoice::Yes | ReplaceChoice::All);
@@ -3071,28 +3087,41 @@ impl Editor {
                 let expanded_len = expanded.chars().count();
                 self.buf_mut().insert_str(&expanded);
                 state.count += 1;
+                let delta = expanded_len as isize - state.match_len as isize;
+                // nano's `real_current_x` upkeep: a replacement before the
+                // starting point on its line shifts it (out of the match,
+                // if it was inside it).
+                if state.match_pos.line == state.begin.line && state.match_pos.col < state.begin.col
+                {
+                    let past = state.begin.col.max(end.col);
+                    state.begin.col = (past as isize + delta).max(0) as usize;
+                }
                 // Keep the region boundary in step with a length change on
                 // its own line, matching nano's own `mark_x` adjustment.
                 if let Some(region_end) = &mut state.region_end
                     && region_end.line == state.match_pos.line
                     && region_end.col >= end.col
                 {
-                    let delta = expanded_len as isize - state.match_len as isize;
                     region_end.col = (region_end.col as isize + delta).max(0) as usize;
                 }
-                Pos::new(state.match_pos.line, state.match_pos.col + expanded_len)
-            } else {
-                // Skip past this match (at least one character, so a
-                // zero-length regex match can't be found again forever).
+                // Carry on just after the replacement -- one further for a
+                // zero-length or start-of-line match, so it isn't found
+                // again.
+                let anchored = self.search.use_regex && state.search.starts_with('^');
+                let skip = usize::from(state.match_len == 0 || anchored);
                 Pos::new(
                     state.match_pos.line,
-                    state.match_pos.col + state.match_len.max(1),
+                    state.match_pos.col + expanded_len + skip,
                 )
+            } else {
+                // nano's `skipone`: on "No", look again from one character
+                // further on, so an overlapping match can still come up.
+                Pos::new(state.match_pos.line, state.match_pos.col + 1)
             };
             let found = find_next_match_for_replace(
                 self.buf(),
                 next_from,
-                state.session_start,
+                state.begin,
                 state.wrapped,
                 state.region_end,
                 &state.search,
@@ -3123,9 +3152,7 @@ impl Editor {
                     return;
                 }
                 Ok(None) => {
-                    self.mode = Mode::Editing;
-                    self.clear_spotlight();
-                    self.report_replace_count(state.count);
+                    self.finish_replace_loop(&state);
                     return;
                 }
                 Err(e) => {
@@ -3138,12 +3165,24 @@ impl Editor {
         }
     }
 
-    fn report_replace_count(&mut self, count: usize) {
-        match count {
-            0 => self.set_status("No replacements made"),
-            1 => self.set_status("Replaced 1 occurrence"),
-            n => self.set_status(format!("Replaced {n} occurrences")),
-        }
+    /// The end of a replace that found at least one match, whether it ran
+    /// out or was cancelled: as nano's `ask_for_and_do_replacements`, put
+    /// the cursor and the viewport back where they were, and say how many
+    /// were replaced -- "Replaced 0 occurrences" too.
+    fn finish_replace_loop(&mut self, state: &ReplaceLoopState) {
+        self.mode = Mode::Editing;
+        self.clear_spotlight();
+        let buf = self.buf_mut();
+        let line = state.begin.line.min(buf.line_count().saturating_sub(1));
+        let col = state.begin.col.min(buf.line(line).chars().count());
+        buf.cursor = Pos::new(line, col);
+        (buf.top_line, buf.first_col) = state.view;
+        self.scroll_to_cursor();
+        self.set_status(if state.count == 1 {
+            "Replaced 1 occurrence".to_string()
+        } else {
+            format!("Replaced {} occurrences", state.count)
+        });
     }
 
     /// Build the literal text to insert for one match: for a regex search,
@@ -3183,22 +3222,29 @@ impl Editor {
         if pattern.is_empty() {
             return;
         }
-        let text = self.buf().to_string();
-        let hay: Vec<&str> = text.split_inclusive('\n').collect();
+        let was = self.buf().cursor;
         let found = find_in_lines(
-            &hay,
-            self.buf().cursor,
+            self.buf(),
+            was,
             pattern,
             backwards,
             self.search.case_sensitive,
             self.search.use_regex,
         );
+        // nano's `go_looking`: back at the very spot where the search
+        // started means there's only the one; otherwise, say so when the
+        // search went around the end of the buffer.
         match found {
-            Some((pos, len)) => {
+            Some((pos, len, wrapped)) => {
                 self.buf_mut().cursor = pos;
                 self.scroll_to_cursor_centered();
                 self.search.last_pattern = Some(pattern.to_string());
                 self.set_spotlight_timed(pos, len);
+                if pos == was {
+                    self.set_status("This is the only occurrence");
+                } else if wrapped {
+                    self.set_status("Search Wrapped");
+                }
             }
             None => self.set_status(format!("\"{pattern}\" not found")),
         }
@@ -3397,7 +3443,7 @@ fn expand_backreferences(template: &str, caps: &regex::Captures) -> String {
 }
 
 /// Find the next match of `pattern` at or after `from`, wrapping around the
-/// buffer once (but not past `session_start`, if already wrapped) —
+/// buffer once (but, once wrapped, only up to just before `begin`) —
 /// matches nano's search wraparound ("came_full_circle") so a replace loop
 /// can't repeat forever. When `region_end` is set (a marked region was
 /// active when the replace began), the search never wraps and stops
@@ -3409,7 +3455,7 @@ fn expand_backreferences(template: &str, caps: &regex::Captures) -> String {
 fn find_next_match_for_replace(
     buf: &Buffer,
     from: Pos,
-    session_start: Pos,
+    begin: Pos,
     already_wrapped: bool,
     region_end: Option<Pos>,
     pattern: &str,
@@ -3458,6 +3504,10 @@ fn find_next_match_for_replace(
     };
 
     let n = buf.line_count();
+    // Once wrapped, a match at or past `begin` means we've come full
+    // circle (nano's `came_full_circle`, with REPLACING's `found_x ==
+    // begin_x` included).
+    let back_at_begin = |pos: Pos| (pos.line, pos.col) >= (begin.line, begin.col);
     for line_idx in from.line..n {
         let raw = buf.line(line_idx);
         for (c, len) in matches_at(&raw) {
@@ -3468,6 +3518,9 @@ fn find_next_match_for_replace(
                 {
                     return Ok(None);
                 }
+                if already_wrapped && back_at_begin(pos) {
+                    return Ok(None);
+                }
                 return Ok(Some((pos, len, already_wrapped)));
             }
         }
@@ -3475,36 +3528,44 @@ fn find_next_match_for_replace(
     if already_wrapped || region_end.is_some() {
         return Ok(None);
     }
-    for line_idx in 0..=session_start.line.min(n.saturating_sub(1)) {
+    for line_idx in 0..=begin.line.min(n.saturating_sub(1)) {
         let raw = buf.line(line_idx);
-        for (c, len) in matches_at(&raw) {
-            if line_idx < session_start.line || c < session_start.col {
-                return Ok(Some((Pos::new(line_idx, c), len, true)));
+        if let Some(&(c, len)) = matches_at(&raw).first() {
+            let pos = Pos::new(line_idx, c);
+            if back_at_begin(pos) {
+                return Ok(None);
             }
+            return Ok(Some((pos, len, true)));
         }
     }
     Ok(None)
 }
 
+/// nano's `findnextstr` for a plain search: the first match after
+/// `from` (before it, `backwards`), going on line by line, around the end
+/// of the buffer and back to the start, until the starting line comes up
+/// again -- where only a match up to `from` itself counts (so the one at
+/// `from` is found last). Returns the match, its length in characters,
+/// and whether the search went around the end.
 fn find_in_lines(
-    lines: &[&str],
+    buf: &Buffer,
     from: Pos,
     pattern: &str,
     backwards: bool,
     case_sensitive: bool,
     use_regex: bool,
-) -> Option<(Pos, usize)> {
+) -> Option<(Pos, usize, bool)> {
     let re = if use_regex {
         let pat = if case_sensitive {
             pattern.to_string()
         } else {
             format!("(?i){pattern}")
         };
-        regex::Regex::new(&pat).ok()
+        Some(regex::Regex::new(&pat).ok()?)
     } else {
         None
     };
-    let matches_at = |line: &str, needle: &str| -> Vec<(usize, usize)> {
+    let matches_at = |line: &str| -> Vec<(usize, usize)> {
         if let Some(re) = &re {
             re.find_iter(line)
                 .map(|m| {
@@ -3516,12 +3577,12 @@ fn find_in_lines(
                 .collect()
         } else if case_sensitive {
             line.char_indices()
-                .filter(|(i, _)| line[*i..].starts_with(needle))
-                .map(|(i, _)| (line[..i].chars().count(), needle.chars().count()))
+                .filter(|(i, _)| line[*i..].starts_with(pattern))
+                .map(|(i, _)| (line[..i].chars().count(), pattern.chars().count()))
                 .collect()
         } else {
             let lower_line = line.to_lowercase();
-            let lower_needle = needle.to_lowercase();
+            let lower_needle = pattern.to_lowercase();
             lower_line
                 .char_indices()
                 .filter(|(i, _)| lower_line[*i..].starts_with(&lower_needle))
@@ -3534,31 +3595,78 @@ fn find_in_lines(
                 .collect()
         }
     };
-
-    let n = lines.len();
-    let order: Vec<usize> = if backwards {
-        (0..n).rev().collect()
-    } else {
-        (0..n).collect()
-    };
-    // Rotate so we start searching from the current line, wrapping around.
-    let start_idx = order.iter().position(|&l| l == from.line).unwrap_or(0);
-    let rotated = order[start_idx..].iter().chain(order[..start_idx].iter());
-
-    for &line_idx in rotated {
-        let raw = lines[line_idx].trim_end_matches('\n');
-        let mut cols = matches_at(raw, pattern);
-        if !backwards {
-            cols.retain(|&(c, _)| line_idx != from.line || c > from.col);
-        } else {
-            cols.reverse();
-            cols.retain(|&(c, _)| line_idx != from.line || c < from.col);
+    let n = buf.line_count();
+    // A match on the magic line (the empty one after a final newline)
+    // doesn't count, as in nano.
+    let magic = |line: usize, text: &str| line + 1 == n && text.is_empty() && n > 1;
+    // The match on `line` whose start lies within `lo..=hi`: the first one
+    // going forward, the last one going backward.
+    let pick = |line: usize, lo: usize, hi: usize| -> Option<(Pos, usize)> {
+        let text = buf.line(line);
+        if magic(line, &text) {
+            return None;
         }
-        if let Some(&(c, len)) = cols.first() {
-            return Some((Pos::new(line_idx, c), len));
+        let mut found = matches_at(&text)
+            .into_iter()
+            .filter(|&(c, _)| c >= lo && c <= hi)
+            .collect::<Vec<_>>()
+            .into_iter();
+        let hit = if backwards {
+            found.next_back()
+        } else {
+            found.next()
+        };
+        hit.map(|(c, len)| (Pos::new(line, c), len))
+    };
+
+    // Start one character past the cursor -- or, with none to skip (at
+    // the start of the line going backward, its end going forward), on
+    // the next line, as nano's `skipone` leaves `found` unset then.
+    let line_len = buf.line(from.line).chars().count();
+    let first = if backwards {
+        from.col
+            .checked_sub(1)
+            .and_then(|hi| pick(from.line, 0, hi))
+    } else if from.col < line_len {
+        pick(from.line, from.col + 1, usize::MAX)
+    } else {
+        None
+    };
+    if let Some((pos, len)) = first {
+        return Some((pos, len, false));
+    }
+    let mut line = from.line;
+    let mut wrapped = false;
+    loop {
+        if backwards {
+            if line == 0 {
+                line = n - 1;
+                wrapped = true;
+            } else {
+                line -= 1;
+            }
+        } else if line + 1 >= n {
+            line = 0;
+            wrapped = true;
+        } else {
+            line += 1;
+        }
+        let full_circle = line == from.line;
+        if let Some((pos, len)) = pick(line, 0, usize::MAX) {
+            let beyond = if backwards {
+                pos.col < from.col
+            } else {
+                pos.col > from.col
+            };
+            if full_circle && beyond {
+                return None;
+            }
+            return Some((pos, len, wrapped));
+        }
+        if full_circle {
+            return None;
         }
     }
-    None
 }
 
 /// nano's report after writing a file: "Wrote 1 line" / "Wrote N lines".
@@ -4718,6 +4826,78 @@ mod tests {
         ed.replace_choice(state, ReplaceChoice::All);
         assert_eq!(ed.buf().to_string(), "Z y Z");
         assert!(matches!(ed.mode, Mode::Editing));
+    }
+
+    fn replace_state(ed: &Editor) -> ReplaceLoopState {
+        match &ed.mode {
+            Mode::Prompt(Prompt {
+                kind: PromptKind::ReplaceConfirm(s),
+                ..
+            }) => s.clone(),
+            _ => panic!("expected the Replace this instance? prompt"),
+        }
+    }
+
+    #[test]
+    fn a_replace_puts_the_cursor_back_and_counts_even_zero() {
+        // Confirmed against the installed nano 8.7.1: answering No to
+        // every match, or cancelling, leaves the cursor where it started
+        // and reports "Replaced 0 occurrences".
+        let mut ed = test_editor("foo bar foo\n");
+        ed.buf_mut().cursor = Pos::new(0, 2);
+        ed.begin_replace_loop("foo".to_string(), "X".to_string());
+        let state = replace_state(&ed);
+        assert_eq!(state.match_pos, Pos::new(0, 8));
+        ed.replace_choice(state, ReplaceChoice::No);
+        let state = replace_state(&ed);
+        assert_eq!(state.match_pos, Pos::new(0, 0), "wrapped around");
+        ed.replace_choice(state, ReplaceChoice::Cancel);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 2));
+        assert_eq!(ed.status.as_deref(), Some("Replaced 0 occurrences"));
+    }
+
+    #[test]
+    fn a_replace_before_the_start_shifts_where_the_cursor_returns() {
+        // nano's `real_current_x` upkeep: the cursor inside the first
+        // "foo" ends up after its (longer) replacement.
+        let mut ed = test_editor("foo bar foo\n");
+        ed.buf_mut().cursor = Pos::new(0, 2);
+        ed.begin_replace_loop("foo".to_string(), "LONGER".to_string());
+        ed.replace_choice(replace_state(&ed), ReplaceChoice::All);
+        assert_eq!(ed.buf().line(0), "LONGER bar LONGER");
+        assert_eq!(ed.buf().cursor, Pos::new(0, 6));
+        assert_eq!(ed.status.as_deref(), Some("Replaced 2 occurrences"));
+    }
+
+    #[test]
+    fn a_declined_replace_is_not_offered_again_after_wrapping() {
+        let mut ed = test_editor("foo\nbar\nfoo\n");
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.begin_replace_loop("foo".to_string(), "X".to_string());
+        assert_eq!(replace_state(&ed).match_pos, Pos::new(2, 0));
+        ed.replace_choice(replace_state(&ed), ReplaceChoice::No);
+        assert_eq!(replace_state(&ed).match_pos, Pos::new(0, 0));
+        ed.replace_choice(replace_state(&ed), ReplaceChoice::No);
+        assert!(matches!(ed.mode, Mode::Editing), "not line 3 again");
+        assert_eq!(ed.buf().cursor, Pos::new(1, 0));
+    }
+
+    #[test]
+    fn a_repeated_search_reports_wrapping_and_a_lone_match() {
+        let mut ed = test_editor("foo bar\nfoo\n");
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.run_search("foo", false);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 0));
+        assert_eq!(ed.status.as_deref(), Some("Search Wrapped"));
+        let mut ed = test_editor("one bar\n");
+        ed.run_search("bar", false);
+        ed.run_search("bar", false);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 4));
+        assert_eq!(ed.status.as_deref(), Some("This is the only occurrence"));
+        // Backward from the start of a line, the line itself comes last.
+        let mut ed = test_editor("foo x foo\n");
+        ed.run_search("foo", true);
+        assert_eq!(ed.buf().cursor, Pos::new(0, 6));
     }
 
     #[test]

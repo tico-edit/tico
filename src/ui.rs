@@ -4171,10 +4171,12 @@ fn render_minibar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Res
     let constantshow = editor.options.constantshow;
     let mut line = MinibarLine::new(cols);
 
+    // nano first cuts the name to the screen's width, keeping its start
+    // (`display_string(filename, 0, COLS)`), and measures that.
     let thename = buf
         .path
         .as_ref()
-        .map(|p| p.display().to_string())
+        .map(|p| head_of_width(&p.display().to_string(), cols))
         .unwrap_or_else(|| "(nameless)".to_string());
     let namewidth = thename.width();
     let text = buf.line(buf.cursor.line);
@@ -4186,6 +4188,8 @@ fn render_minibar(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Res
 
     if cols > 4 {
         if namewidth > cols - 2 {
+            // ...then shows the last `cols - 5` columns of what's left,
+            // so a very long path loses its first few columns, not its end.
             line.put(0, "...");
             line.add(&tail_of_width(&thename, cols - 5));
         } else {
@@ -4257,6 +4261,17 @@ fn minibar_char_codes(buf: &crate::buffer::Buffer) -> String {
 
 /// The last `width` columns' worth of `s` (nano's `display_string(name,
 /// namewidth - COLS + 5, COLS - 5, ...)` for a too-long minibar name).
+/// The longest start of `s` that fits in `width` columns.
+fn head_of_width(s: &str, width: usize) -> String {
+    let mut taken = 0;
+    s.chars()
+        .take_while(|&c| {
+            taken += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            taken <= width
+        })
+        .collect()
+}
+
 fn tail_of_width(s: &str, width: usize) -> String {
     let mut taken = 0;
     let mut tail: Vec<char> = Vec::new();
@@ -6170,6 +6185,12 @@ mod tests {
         assert!(minibar_text(&ed, 50).starts_with("  (nameless) *"));
         ed.buf_mut().path = Some(format!("/{}", "d".repeat(60)).into());
         assert_eq!(minibar_text(&ed, 50), format!("...{} *", "d".repeat(45)));
+        // Confirmed against the installed nano 8.7.1: the name is first cut
+        // to the screen's width, keeping its start, and then loses its
+        // first five columns to the "...".
+        let name = format!("/{}", "abcdefghij".repeat(6));
+        ed.buf_mut().path = Some(name.clone().into());
+        assert_eq!(minibar_text(&ed, 50), format!("...{} *", &name[5..50]));
     }
 
     #[test]
