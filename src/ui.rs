@@ -548,7 +548,7 @@ fn handle_main_screen_click(editor: &mut Editor, row: usize, col: usize) {
 /// given -- needed for the scrollbar's own proportion math.
 fn handle_buffer_click(editor: &mut Editor, row_in_buffer: usize, col: usize, editwinrows: usize) {
     let cols = editor.screen_cols;
-    let sidebar = usize::from(editor.options.indicator && cols > 9 && editor.screen_rows > 5);
+    let sidebar = editor.sidebar_width();
 
     if sidebar == 1 && col + 1 == cols {
         // Clicking the scrollbar jumps to the roughly corresponding line,
@@ -569,6 +569,16 @@ fn handle_buffer_click(editor: &mut Editor, row_in_buffer: usize, col: usize, ed
     }
 
     let gutter = editor.gutter_width();
+    if let Some(w) = editor.softwrap() {
+        let was = editor.buf().cursor;
+        let pos = editor.wrapped_pos_at(&w, row_in_buffer, col.saturating_sub(gutter));
+        editor.buf_mut().cursor = pos;
+        editor.scroll_to_cursor();
+        if pos == was {
+            editor.execute(Action::Mark);
+        }
+        return;
+    }
     let tabsize = editor.options.tabsize as usize;
     let buf = editor.buf();
     let line_idx = (buf.top_line + row_in_buffer).min(buf.line_count().saturating_sub(1));
@@ -3904,6 +3914,22 @@ fn finish_cursor(editor: &Editor, out: &mut impl Write, text_start_row: u16) -> 
             ),
             Show
         )?;
+    } else if let Some(w) = editor.softwrap() {
+        // nano's `place_the_cursor`: count the rows down to the cursor's
+        // chunk, and the columns from that chunk's start.
+        let buf = editor.buf();
+        let row = editor.wrapped_cursor_row(&w).max(0) as usize;
+        let cursor_col = editor.cursor_display_col();
+        let edge = w.leftedge_for(&buf.line(buf.cursor.line), cursor_col);
+        let col = editor.gutter_width() + cursor_col - edge;
+        queue!(
+            out,
+            MoveTo(
+                col.min(editor.screen_cols.saturating_sub(1)) as u16,
+                (text_start_row as usize + row) as u16
+            ),
+            Show
+        )?;
     } else {
         let buf = editor.buf();
         let screen_line = buf.cursor.line.saturating_sub(buf.top_line);
@@ -4808,12 +4834,17 @@ fn render_buffer(
     // `set indicator`: a one-column "scrollbar" on the right edge, showing
     // the viewport's position and extent within the buffer -- suppressed
     // on a too-small screen, matching nano's own `sidebar` guard exactly.
-    let sidebar = usize::from(editor.options.indicator && cols > 9 && editor.screen_rows > 5);
+    let sidebar = editor.sidebar_width();
+    let wrap = editor.softwrap();
     let (thumb_lowest, thumb_highest) = if sidebar == 1 && rows > 0 {
-        scrollbar_thumb_range(buf.top_line, rows, buf.line_count())
+        match &wrap {
+            Some(w) => wrapped_scrollbar_thumb_range(buf, w, rows),
+            None => scrollbar_thumb_range(buf.top_line, rows, buf.line_count()),
+        }
     } else {
         (0, 0)
     };
+    let plan = row_plan(buf, wrap.as_ref(), rows);
     let scrollbar_track_style = scrollbar_cell_style(&editor.options.scrollercolor, false);
     let scrollbar_thumb_style = scrollbar_cell_style(&editor.options.scrollercolor, true);
     // `set guidestripe`: a one-column vertical guide recoloring whatever
@@ -4825,9 +4856,15 @@ fn render_buffer(
         .map(|n| (n as usize).saturating_sub(1));
     let stripe_style = stripecolor_style(&editor.options.stripecolor);
 
-    for r in 0..rows {
+    for (
+        r,
+        &BufferRow {
+            line: line_idx,
+            chunk,
+        },
+    ) in plan.iter().enumerate()
+    {
         queue!(out, MoveTo(0, start_row + r as u16))?;
-        let line_idx = buf.top_line + r;
         let mut rendered = String::new();
         // Syntax-highlight style, one entry per char of `rendered`.
         let mut styles: Vec<Option<Style>> = Vec::new();
@@ -4845,13 +4882,25 @@ fn render_buffer(
 
         if is_real_line {
             if gutter > 0 {
-                let number = format!("{:>width$}", line_idx + 1, width = gutter - 1);
+                // A softwrapped line's continuation rows get a blank
+                // margin (still in the line-number color), and only its
+                // first row the anchor's dagger -- nano's `draw_row`.
+                let first_row = chunk.is_none_or(|c| c.from == 0);
+                let number = if first_row {
+                    format!("{:>width$}", line_idx + 1, width = gutter - 1)
+                } else {
+                    " ".repeat(gutter - 1)
+                };
                 styles.extend(number.chars().map(|_| Some(number_style)));
                 rendered.push_str(&number);
                 // nano's `draw_row`: after the number, outside the
                 // line-number color, a dagger marks an anchored line and
                 // a blank separates any other from its text.
-                rendered.push(if buf.has_anchor(line_idx) { '†' } else { ' ' });
+                rendered.push(if first_row && buf.has_anchor(line_idx) {
+                    '†'
+                } else {
+                    ' '
+                });
                 styles.push(None);
             }
             let raw = buf.line(line_idx);
@@ -4900,64 +4949,113 @@ fn render_buffer(
             styles.push(None);
         }
 
-        // Horizontal scroll: only the cursor's own line ever gets a nonzero
-        // offset (nano scrolls just the current line sideways, not the
-        // whole viewport — confirmed against the installed nano). A `<`
-        // marker appears once scrolled; a `>` marker appears whenever the
-        // line's text still overflows the available width, on any line.
-        let full_chars: Vec<char> = rendered.chars().collect();
-        let text_total = full_chars.len().saturating_sub(gutter_chars);
-        let left = if is_real_line && line_idx == buf.cursor.line {
-            buf.left_col.min(text_total)
+        let (mut chars, mut styles, highlight, selected, stripe_idx) = if let Some(chunk) = chunk {
+            softwrapped_row(
+                &rendered,
+                &styles,
+                gutter_chars,
+                chunk,
+                highlight,
+                selected,
+                stripe_col,
+                cols.saturating_sub(gutter_chars + sidebar),
+            )
         } else {
-            0
-        };
-        let content_width = cols.saturating_sub(gutter_chars + sidebar);
-        let show_left = left > 0;
-        let mut capacity = content_width.saturating_sub(if show_left { 1 } else { 0 });
-        let show_right = left + capacity < text_total;
-        if show_right {
-            capacity = capacity.saturating_sub(1);
-        }
-        let vis_start = gutter_chars + left;
-        let vis_end = (vis_start + capacity).min(full_chars.len());
+            // Horizontal scroll: only the cursor's own line ever gets a nonzero
+            // offset (nano scrolls just the current line sideways, not the
+            // whole viewport — confirmed against the installed nano). A `<`
+            // marker appears once scrolled; a `>` marker appears whenever the
+            // line's text still overflows the available width, on any line.
+            // All of this is in display columns, not characters, so that
+            // wide characters count double; one cut by either edge shows
+            // as nano's `]` (its right half) or `[` (its left half).
+            let full_chars: Vec<char> = rendered.chars().collect();
+            let text = &full_chars[gutter_chars.min(full_chars.len())..];
+            let mut starts = Vec::with_capacity(text.len() + 1);
+            let mut col = 0;
+            for &c in text {
+                starts.push(col);
+                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            }
+            starts.push(col);
+            let text_total = col;
+            let left = if is_real_line && line_idx == buf.cursor.line {
+                buf.left_col.min(text_total)
+            } else {
+                0
+            };
+            let content_width = cols.saturating_sub(gutter_chars + sidebar);
+            let show_left = left > 0;
+            let mut capacity = content_width.saturating_sub(if show_left { 1 } else { 0 });
+            let show_right = left + capacity < text_total;
+            if show_right {
+                capacity = capacity.saturating_sub(1);
+            }
+            let right = left + capacity;
 
-        let mut chars: Vec<char> = full_chars[..gutter_chars].to_vec();
-        if show_left {
-            chars.push('<');
-        }
-        chars.extend_from_slice(&full_chars[vis_start..vis_end]);
-        if show_right {
-            chars.push('>');
-        }
-        // nano draws both markers in `hilite_attribute`.
-        let mut windowed_styles: Vec<Option<Style>> = styles[..gutter_chars].to_vec();
-        if show_left {
-            windowed_styles.push(Some(hilite_style(editor)));
-        }
-        windowed_styles.extend_from_slice(&styles[vis_start..vis_end]);
-        if show_right {
-            windowed_styles.push(Some(hilite_style(editor)));
-        }
-        let mut styles = windowed_styles;
-        let marker_shift = gutter_chars + if show_left { 1 } else { 0 };
-        let clamp_to_view = |(s, e): (usize, usize)| {
-            let clamp = |x: usize| marker_shift + x.clamp(vis_start, vis_end) - vis_start;
-            (clamp(s), clamp(e))
-        };
-        let highlight = highlight.map(clamp_to_view);
-        let selected = selected.map(clamp_to_view);
+            let mut chars: Vec<char> = full_chars[..gutter_chars].to_vec();
+            let mut windowed_styles: Vec<Option<Style>> = styles[..gutter_chars].to_vec();
+            // nano draws both markers in `hilite_attribute`.
+            if show_left {
+                chars.push('<');
+                windowed_styles.push(Some(hilite_style(editor)));
+            }
+            let marker_shift = chars.len();
+            // The display column each shown character stands for, to place
+            // the search/selection highlights.
+            let mut shown_cols = Vec::new();
+            for (k, &c) in text.iter().enumerate() {
+                let (start, end) = (starts[k], starts[k + 1]);
+                if end <= left || start >= right {
+                    continue;
+                }
+                let shown = if start < left {
+                    ']'
+                } else if end > right {
+                    '['
+                } else {
+                    c
+                };
+                chars.push(shown);
+                windowed_styles.push(styles[gutter_chars + k]);
+                shown_cols.push(start.max(left));
+            }
+            let text_cells = chars.len() - marker_shift;
+            let used = starts[text.len()].min(right).saturating_sub(left);
+            if show_right {
+                chars.push('>');
+                windowed_styles.push(Some(hilite_style(editor)));
+            }
+            let styles = windowed_styles;
+            // `highlight`/`selected` are display columns past the gutter.
+            let to_view = |(s, e): (usize, usize)| {
+                let at = |x: usize| {
+                    let column = x.saturating_sub(gutter_chars);
+                    marker_shift + shown_cols.partition_point(|&c| c < column)
+                };
+                (at(s), at(e))
+            };
+            let highlight = highlight.map(to_view);
+            let selected = selected.map(to_view);
 
-        // The stripe recolors whatever's already at its column, so it
-        // scrolls along with the line -- hidden once scrolled past it
-        // (`stripe_col < left`) or off the right edge of the content area.
-        // It can land past the line's actual text (a short line, or past
-        // end-of-buffer's own blank rows), in which case `chars`/`styles`
-        // are extended with a plain space to carry it, matching nano's own
-        // fallback of painting a space there.
-        let stripe_idx = stripe_col
-            .and_then(|col| stripe_content_offset(col, left, content_width))
-            .map(|offset| marker_shift + offset);
+            // The stripe recolors whatever's already at its column, so it
+            // scrolls along with the line -- hidden once scrolled past it
+            // (`stripe_col < left`) or off the right edge of the content area.
+            // It can land past the line's actual text (a short line, or past
+            // end-of-buffer's own blank rows), in which case `chars`/`styles`
+            // are extended with a plain space to carry it, matching nano's own
+            // fallback of painting a space there.
+            let stripe_idx = stripe_col
+                .and_then(|col| stripe_content_offset(col, left, content_width))
+                .map(|offset| {
+                    if offset < used {
+                        marker_shift + shown_cols.partition_point(|&c| c <= left + offset) - 1
+                    } else {
+                        marker_shift + text_cells + (offset - used)
+                    }
+                });
+            (chars, styles, highlight, selected, stripe_idx)
+        };
         if let Some(idx) = stripe_idx
             && idx >= chars.len()
         {
@@ -5039,9 +5137,15 @@ fn render_buffer(
             }
             i = j;
         }
+        // Pad by display columns, not characters, so a row of wide
+        // characters doesn't overrun the screen width.
         let fill_width = cols.saturating_sub(sidebar);
-        if len < fill_width {
-            queue!(out, Print(" ".repeat(fill_width - len)))?;
+        let used: usize = chars
+            .iter()
+            .map(|&c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+            .sum();
+        if used < fill_width {
+            queue!(out, Print(" ".repeat(fill_width - used)))?;
         }
         if sidebar == 1 {
             let in_thumb = r >= thumb_lowest && r <= thumb_highest;
@@ -5054,6 +5158,173 @@ fn render_buffer(
         }
     }
     Ok(())
+}
+
+/// One row of the edit window: which buffer line it shows (a line past
+/// the end of the buffer for the blank rows below it) and, under
+/// `softwrap`, which chunk of that line.
+#[derive(Clone, Copy)]
+struct BufferRow {
+    line: usize,
+    chunk: Option<ChunkSpan>,
+}
+
+/// A softwrapped chunk: display columns `from..to` of its line.
+#[derive(Clone, Copy)]
+struct ChunkSpan {
+    from: usize,
+    to: usize,
+    last: bool,
+}
+
+/// The `rows` rows of the edit window, top to bottom: one per line from
+/// `top_line` normally; under `softwrap` (nano's
+/// `update_softwrapped_line`), each line's chunks in turn, starting from
+/// the chunk at `first_col` in `top_line`.
+fn row_plan(
+    buf: &crate::buffer::Buffer,
+    wrap: Option<&crate::softwrap::Wrap>,
+    rows: usize,
+) -> Vec<BufferRow> {
+    let Some(w) = wrap else {
+        return (0..rows)
+            .map(|r| BufferRow {
+                line: buf.top_line + r,
+                chunk: None,
+            })
+            .collect();
+    };
+    let mut plan = Vec::with_capacity(rows);
+    let mut line = buf.top_line;
+    let mut skip = if line < buf.line_count() {
+        w.chunk_for(&buf.line(line), buf.first_col)
+    } else {
+        0
+    };
+    while plan.len() < rows {
+        if line >= buf.line_count() {
+            plan.push(BufferRow { line, chunk: None });
+            line += 1;
+            continue;
+        }
+        let spans = w.spans(&buf.line(line));
+        let n = spans.len();
+        for (i, &(from, to)) in spans.iter().enumerate().skip(skip) {
+            if plan.len() == rows {
+                break;
+            }
+            plan.push(BufferRow {
+                line,
+                chunk: Some(ChunkSpan {
+                    from,
+                    to,
+                    last: i + 1 == n,
+                }),
+            });
+        }
+        skip = 0;
+        line += 1;
+    }
+    plan
+}
+
+/// One softwrapped row's characters and styles: the gutter, then the
+/// chunk's slice of the line's `rendered` text (tab-expanded, so every
+/// character but a wide one is one column). `highlight`/`selected` come
+/// in, and go out, as ranges of `rendered`'s positions, but arrive
+/// measured in display columns past the gutter, which are converted here;
+/// the guidestripe shows only on the chunk holding its column, as in
+/// nano's `draw_row`.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn softwrapped_row(
+    rendered: &str,
+    styles: &[Option<Style>],
+    gutter_chars: usize,
+    chunk: ChunkSpan,
+    highlight: Option<(usize, usize)>,
+    selected: Option<(usize, usize)>,
+    stripe_col: Option<usize>,
+    width: usize,
+) -> (
+    Vec<char>,
+    Vec<Option<Style>>,
+    Option<(usize, usize)>,
+    Option<(usize, usize)>,
+    Option<usize>,
+) {
+    let full: Vec<char> = rendered.chars().collect();
+    let text = &full[gutter_chars.min(full.len())..];
+    // The display column where each character of `text` starts, plus
+    // the end of the last.
+    let mut starts = Vec::with_capacity(text.len() + 1);
+    let mut col = 0;
+    for &c in text {
+        starts.push(col);
+        col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+    }
+    starts.push(col);
+    let index_at = |column: usize| starts.partition_point(|&s| s < column).min(text.len());
+    let vis_start = index_at(chunk.from);
+    let vis_end = if chunk.last {
+        text.len()
+    } else {
+        index_at(chunk.to)
+    };
+
+    let mut chars: Vec<char> = full[..gutter_chars.min(full.len())].to_vec();
+    chars.extend_from_slice(&text[vis_start..vis_end]);
+    let mut row_styles: Vec<Option<Style>> = styles[..gutter_chars.min(styles.len())].to_vec();
+    row_styles.extend_from_slice(&styles[gutter_chars + vis_start..gutter_chars + vis_end]);
+
+    let to_row = |(s, e): (usize, usize)| {
+        let clamp = |x: usize| {
+            gutter_chars + index_at(x.saturating_sub(gutter_chars)).clamp(vis_start, vis_end)
+                - vis_start
+        };
+        (clamp(s), clamp(e))
+    };
+    let stripe_idx = stripe_col.and_then(|col| {
+        let past_end = if chunk.last { usize::MAX } else { chunk.to };
+        if col < chunk.from || col >= past_end || col >= chunk.from + width {
+            return None;
+        }
+        let offset = col - chunk.from;
+        let row_text_cols = starts[vis_end] - starts[vis_start];
+        Some(if offset < row_text_cols {
+            gutter_chars + index_at(col) - vis_start
+        } else {
+            gutter_chars + (vis_end - vis_start) + (offset - row_text_cols)
+        })
+    });
+    (
+        chars,
+        row_styles,
+        highlight.map(to_row),
+        selected.map(to_row),
+        stripe_idx,
+    )
+}
+
+/// `scrollbar_thumb_range` under `softwrap`: nano's `draw_scrollbar`
+/// counts how many lines the viewport covers, chunks and all, and never
+/// stretches the thumb over the whole bar.
+fn wrapped_scrollbar_thumb_range(
+    buf: &crate::buffer::Buffer,
+    w: &crate::softwrap::Wrap,
+    rows: usize,
+) -> (usize, usize) {
+    let total = buf.line_count().max(1);
+    let from = buf.top_line.min(total - 1);
+    let mut line = from;
+    let text = buf.line(line);
+    let mut extras = w.extra_chunks(&text) as isize - w.chunk_for(&text, buf.first_col) as isize;
+    while (line + 1) as isize + extras < (from + rows) as isize && line + 1 < total {
+        line += 1;
+        extras += w.extra_chunks(&buf.line(line)) as isize;
+    }
+    let covered = line + 1 - from;
+    let lowest = (from * rows) / total;
+    (lowest, lowest + (rows * covered) / total)
 }
 
 /// The "plain reverse video by default, `cp`'s own colors when configured"
@@ -5113,8 +5384,8 @@ fn stripe_content_offset(stripe_col: usize, left: usize, content_width: usize) -
 /// The row range (inclusive, 0-based within the viewport) of `set
 /// indicator`'s scrollbar "thumb" -- the portion representing the current
 /// viewport within the whole buffer. Matches nano's own `draw_scrollbar`
-/// exactly (`lowest`/`highest`, for the no-softwrap case, since tico
-/// doesn't support `softwrap` yet): `top_line` is 0-based, `viewport_rows`
+/// exactly (`lowest`/`highest`, for the no-softwrap case; see
+/// `wrapped_scrollbar_thumb_range` for the other): `top_line` is 0-based, `viewport_rows`
 /// is the edit window's height, and `total_lines` is the buffer's own
 /// (ropey-native) line count, consistent with nano's `filebot->lineno`.
 fn scrollbar_thumb_range(
@@ -7465,6 +7736,48 @@ mod tests {
             text.contains("\x1b[7m \x1b[0m"),
             "expected a reverse-video space past the end of the line: {text:?}"
         );
+    }
+
+    /// The visible text of one rendered row, escape sequences removed.
+    fn plain_row(out: &[u8]) -> String {
+        let text = String::from_utf8_lossy(out);
+        let mut plain = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        plain
+    }
+
+    #[test]
+    fn an_overlong_line_of_wide_characters_gets_the_more_marker() {
+        // Ten two-column characters on a 10-column screen: four fit
+        // before the `>` column, and the fifth, cut by it, shows as `[`
+        // -- nano's `display_string`.
+        let mut ed = test_editor("日本語日本語日本語日\n");
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.screen_cols = 10;
+        let mut out = Vec::new();
+        render_buffer(&ed, &mut out, 0, 1).unwrap();
+        assert_eq!(plain_row(&out), "日本語日[>");
+    }
+
+    #[test]
+    fn a_wide_character_cut_by_the_left_marker_shows_its_right_half() {
+        let mut ed = test_editor("ab日本語日本語日本語日\n");
+        ed.screen_cols = 10;
+        ed.buf_mut().left_col = 3;
+        let mut out = Vec::new();
+        render_buffer(&ed, &mut out, 0, 1).unwrap();
+        assert_eq!(plain_row(&out), "<]本語日[>");
     }
 
     #[test]

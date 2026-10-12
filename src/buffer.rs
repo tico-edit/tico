@@ -150,6 +150,10 @@ pub struct Buffer {
     /// merges when the file changes on disk while we have local edits.
     pub original_content: String,
     pub top_line: usize,
+    /// Under `softwrap`, the display column where the viewport's first row
+    /// starts within `top_line` -- the start of one of its chunks (nano's
+    /// `firstcolumn`). Ignored, and kept at 0, otherwise.
+    pub first_col: usize,
     /// Horizontal scroll offset (in display columns) applied when rendering
     /// the cursor's current line, when it's too long to fit the screen and
     /// `softwrap` is off. Other lines always render from column 0 — nano
@@ -163,6 +167,9 @@ pub struct Buffer {
     /// edit -- makes the next Up/Down start from the cursor's own column,
     /// as in nano, without every such site having to clear it.
     goal_col: Option<(usize, Pos)>,
+    /// Under `softwrap`, Up/Down/Page aim for a display column instead
+    /// (nano's `placewewant` proper), held the same way as `goal_col`.
+    pub wrap_goal: Option<(usize, Pos)>,
     /// Path of this buffer's vim-style lock file (`set locking`), if one is
     /// currently held.
     pub lock_filename: Option<PathBuf>,
@@ -212,9 +219,11 @@ impl Buffer {
             disk_state: None,
             original_content: String::new(),
             top_line: 0,
+            first_col: 0,
             left_col: 0,
             language: None,
             goal_col: None,
+            wrap_goal: None,
             lock_filename: None,
             lock_modified_written: false,
             ignore_external_changes: false,

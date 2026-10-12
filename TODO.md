@@ -12,12 +12,10 @@ here.
 
 ### Display
 
-- [ ] `softwrap` — toggle flips the flag, nothing wraps
 - [ ] `stateflags`
 - [ ] `bookstyle`
 - [ ] `emptyline`
 - [ ] `rawsequences`
-- [ ] `atblanks`
 - [ ] `afterends`
 
 ### Editing
