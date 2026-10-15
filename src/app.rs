@@ -900,15 +900,28 @@ impl Editor {
     }
 
     /// Whether `c` forms part of a word for `^]` completion: nano's
-    /// `is_word_char(c, FALSE)` -- alphanumeric, or listed in `wordchars`.
-    /// Unlike word movement, an underscore counts only via `wordchars`.
+    /// `is_word_char(c, FALSE)`.
     fn is_completion_word_char(&self, c: char) -> bool {
+        self.is_word_char(c, false)
+    }
+
+    /// nano's `is_word_char`: alphanumeric, listed in `wordchars`, or --
+    /// with `allow_punct` -- any punctuation. An underscore counts only
+    /// via `wordchars`.
+    pub fn is_word_char(&self, c: char, allow_punct: bool) -> bool {
         c.is_alphanumeric()
+            || (allow_punct && is_punct_char(c))
             || self
                 .options
                 .wordchars
                 .as_deref()
                 .is_some_and(|w| w.contains(c))
+    }
+
+    /// The word test for word movement and deletion: `set wordbounds`
+    /// makes punctuation part of a word.
+    fn word_test(&self) -> impl Fn(char) -> bool + '_ {
+        move |c| self.is_word_char(c, self.options.wordbounds)
     }
 
     /// `^]` Complete: nano's `complete_a_word`. Takes the word fragment
@@ -2156,25 +2169,60 @@ impl Editor {
         }
     }
 
+    /// nano's `chop_word(FALSE)` (`M-Bsp`, `Sh-^Del`): delete back to the
+    /// start of the previous word -- but, when that word is on another
+    /// line, only to the start of this one, unless the cursor was already
+    /// there, in which case back to the end of the word's line (taking
+    /// any blank lines in between with it).
     fn chop_word_left(&mut self) {
         let end = self.buf().cursor;
-        let start = word_left_pos(self.buf(), end);
+        let mut start = prev_word_pos(&self.buf().word_lines(), end, self.word_test());
+        if start.line != end.line {
+            start = if end.col > 0 {
+                Pos::new(end.line, 0)
+            } else {
+                Pos::new(start.line, self.buf().line(start.line).chars().count())
+            };
+        }
         self.buf_mut().delete_range(start, end);
     }
 
+    /// nano's `chop_word(TRUE)` (`^Del`): delete up to the next word start
+    /// (word end under `afterends`) -- but, when that is on another line,
+    /// only to the end of this one, unless the cursor was already there.
     fn chop_word_right(&mut self) {
         let start = self.buf().cursor;
-        let end = word_right_pos(self.buf(), start);
+        let mut end = next_word_pos(
+            &self.buf().word_lines(),
+            start,
+            self.options.afterends,
+            self.word_test(),
+        );
+        let line_len = self.buf().line(start.line).chars().count();
+        if end.line != start.line && start.col < line_len {
+            end = Pos::new(start.line, line_len);
+        }
         self.buf_mut().delete_range(start, end);
     }
 
     fn move_prev_word(&mut self) {
-        let pos = word_left_pos(self.buf(), self.buf().cursor);
+        let pos = prev_word_pos(
+            &self.buf().word_lines(),
+            self.buf().cursor,
+            self.word_test(),
+        );
         self.buf_mut().cursor = pos;
     }
 
+    /// nano's `to_next_word`: to the next word start, or under
+    /// `set afterends` to the next word end.
     fn move_next_word(&mut self) {
-        let pos = word_right_pos(self.buf(), self.buf().cursor);
+        let pos = next_word_pos(
+            &self.buf().word_lines(),
+            self.buf().cursor,
+            self.options.afterends,
+            self.word_test(),
+        );
         self.buf_mut().cursor = pos;
     }
 
@@ -3326,48 +3374,128 @@ impl Editor {
     }
 }
 
-fn word_left_pos(buf: &Buffer, from: Pos) -> Pos {
-    let mut line = from.line;
-    let mut chars: Vec<char> = buf.line(line).chars().collect();
-    let mut col = from.col;
-    loop {
-        while col > 0 && !chars[col - 1].is_alphanumeric() && chars[col - 1] != '_' {
-            col -= 1;
-        }
-        while col > 0 && (chars[col - 1].is_alphanumeric() || chars[col - 1] == '_') {
-            col -= 1;
-        }
-        if col > 0 || line == 0 {
-            return Pos::new(line, col);
-        }
-        line -= 1;
-        chars = buf.line(line).chars().collect();
-        col = chars.len();
-        if col == 0 {
-            return Pos::new(line, 0);
+/// nano's `is_punct_char` (`iswpunct`): a printable character that is
+/// neither alphanumeric nor a space.
+fn is_punct_char(c: char) -> bool {
+    !c.is_alphanumeric() && !c.is_whitespace() && !c.is_control()
+}
+
+/// nano's `is_zerowidth`: a combining character (only from U+0300 on),
+/// which word movement steps over without deciding anything.
+fn is_zerowidth(c: char) -> bool {
+    use unicode_width::UnicodeWidthChar;
+    c as u32 >= 0x300 && c.width() == Some(0)
+}
+
+/// The `count` lines word movement steps through, as `line(i)`: a
+/// buffer's, or a prompt's single line of input.
+pub struct WordLines<F: Fn(usize) -> Vec<char>> {
+    pub count: usize,
+    pub line: F,
+}
+
+impl Buffer {
+    fn word_lines(&self) -> WordLines<impl Fn(usize) -> Vec<char> + '_> {
+        WordLines {
+            count: self.line_count(),
+            line: |i| self.line(i).chars().collect(),
         }
     }
 }
 
-fn word_right_pos(buf: &Buffer, from: Pos) -> Pos {
+/// A prompt's input as the one line word movement sees.
+pub fn prompt_word_lines(input: &str) -> WordLines<impl Fn(usize) -> Vec<char> + '_> {
+    WordLines {
+        count: 1,
+        line: move |_| input.chars().collect(),
+    }
+}
+
+/// nano's `do_prev_word` (and, on a prompt's one line,
+/// `do_statusbar_prev_word`): from `from`, back to the start of the word
+/// before it (or at it), crossing line ends.
+pub fn prev_word_pos<F: Fn(usize) -> Vec<char>>(
+    lines: &WordLines<F>,
+    from: Pos,
+    is_word: impl Fn(char) -> bool,
+) -> Pos {
     let mut line = from.line;
-    let mut chars: Vec<char> = buf.line(line).chars().collect();
-    let mut col = from.col;
+    let mut chars: Vec<char> = (lines.line)(line);
+    let mut col = from.col.min(chars.len());
+    let mut seen_a_word = false;
     loop {
-        while col < chars.len() && (chars[col].is_alphanumeric() || chars[col] == '_') {
+        // At the head of a line, continue from the end of the one above.
+        if col == 0 {
+            if line == 0 {
+                return Pos::new(line, col);
+            }
+            line -= 1;
+            chars = (lines.line)(line);
+            col = chars.len();
+        }
+        col = col.saturating_sub(1);
+        match chars.get(col).copied() {
+            Some(c) if is_word(c) => {
+                seen_a_word = true;
+                // At the head of a line now, this surely is a word start.
+                if col == 0 {
+                    return Pos::new(line, col);
+                }
+            }
+            Some(c) if is_zerowidth(c) => {}
+            // Space after a word: one past it is where the word starts.
+            _ if seen_a_word => return Pos::new(line, col + 1),
+            _ => {}
+        }
+    }
+}
+
+/// nano's `do_next_word` (and, on a prompt's one line,
+/// `do_statusbar_next_word`): from `from`, forward to the start of the
+/// next word -- or, with `after_ends` (`set afterends`), to the end of
+/// the current or next word -- crossing line ends.
+pub fn next_word_pos<F: Fn(usize) -> Vec<char>>(
+    lines: &WordLines<F>,
+    from: Pos,
+    after_ends: bool,
+    is_word: impl Fn(char) -> bool,
+) -> Pos {
+    let mut line = from.line;
+    let mut chars: Vec<char> = (lines.line)(line);
+    let mut col = from.col.min(chars.len());
+    let started_on_word = chars.get(col).is_some_and(|&c| is_word(c));
+    let mut seen_space = !started_on_word;
+    let mut seen_word = started_on_word;
+    loop {
+        if col >= chars.len() {
+            // At the end of a line, move to the start of the next one;
+            // at the end of the buffer, stop.
+            if line + 1 >= lines.count {
+                return Pos::new(line, col);
+            }
+            line += 1;
+            chars = (lines.line)(line);
+            col = 0;
+            seen_space = true;
+        } else {
             col += 1;
         }
-        while col < chars.len() && !chars[col].is_alphanumeric() && chars[col] != '_' {
-            col += 1;
-        }
-        if col < chars.len() || line + 1 >= buf.line_count() {
+        let here = chars.get(col).copied();
+        let word = here.is_some_and(&is_word);
+        let zerowidth = here.is_some_and(is_zerowidth);
+        if after_ends {
+            // A separator after a word is a word end.
+            if word {
+                seen_word = true;
+            } else if !zerowidth && seen_word {
+                return Pos::new(line, col);
+            }
+        } else if zerowidth {
+        } else if !word {
+            seen_space = true;
+        } else if seen_space {
+            // A word character after a separator is a word start.
             return Pos::new(line, col);
-        }
-        line += 1;
-        chars = buf.line(line).chars().collect();
-        col = 0;
-        if chars.is_empty() {
-            return Pos::new(line, 0);
         }
     }
 }
@@ -6235,6 +6363,108 @@ mod tests {
         keystroke(&mut ed, Action::Complete);
         assert_eq!(ed.status.as_deref(), Some("No matches"));
         assert_eq!(last_line(&ed), "x");
+    }
+
+    /// The 1-based `line:col` stops of `n` presses of `action` from the
+    /// top of `text`, as nano's constantshow reports them.
+    fn word_stops(text: &str, setup: impl Fn(&mut Editor), action: Action, n: usize) -> String {
+        let mut ed = test_editor(text);
+        setup(&mut ed);
+        if action == Action::PrevWord {
+            keystroke(&mut ed, Action::LastLine);
+        }
+        (0..n)
+            .map(|_| {
+                keystroke(&mut ed, action);
+                let c = ed.buf().cursor;
+                format!("{}:{}", c.line + 1, c.col + 1)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn word_movement_matches_nano_with_afterends_and_wordbounds() {
+        // Every expectation captured from the installed nano in tmux.
+        let text = "foo  bar, baz.qux   \n  next-line words\n\nlast\n";
+        let next = |setup: fn(&mut Editor)| word_stops(text, setup, Action::NextWord, 9);
+        assert_eq!(next(|_| {}), "1:6 1:11 1:15 2:3 2:8 2:13 4:1 5:1 5:1");
+        assert_eq!(
+            next(|ed| ed.options.afterends = true),
+            "1:4 1:9 1:14 1:18 2:7 2:12 2:18 4:5 5:1"
+        );
+        assert_eq!(
+            next(|ed| ed.options.wordbounds = true),
+            "1:6 1:11 2:3 2:13 4:1 5:1 5:1 5:1 5:1"
+        );
+        assert_eq!(
+            next(|ed| {
+                ed.options.afterends = true;
+                ed.options.wordbounds = true;
+            }),
+            "1:4 1:10 1:18 2:12 2:18 4:5 5:1 5:1 5:1"
+        );
+        let prev = |setup: fn(&mut Editor)| word_stops(text, setup, Action::PrevWord, 8);
+        assert_eq!(prev(|_| {}), "4:1 2:13 2:8 2:3 1:15 1:11 1:6 1:1");
+        assert_eq!(
+            prev(|ed| ed.options.wordbounds = true),
+            "4:1 2:13 2:3 1:11 1:6 1:1 1:1 1:1"
+        );
+        // An underscore is a word character only via `wordchars`.
+        let text = "foo_bar baz\n";
+        assert_eq!(word_stops(text, |_| {}, Action::NextWord, 2), "1:5 1:9");
+        assert_eq!(
+            word_stops(
+                text,
+                |ed| ed.options.wordchars = Some("_".into()),
+                Action::NextWord,
+                2
+            ),
+            "1:9 2:1"
+        );
+    }
+
+    #[test]
+    fn chop_word_keeps_to_the_cursors_line_unless_at_its_edge_like_nano() {
+        let chop = |text: &str, at: Pos, action: Action, afterends: bool| {
+            let mut ed = test_editor(text);
+            ed.options.afterends = afterends;
+            ed.buf_mut().cursor = at;
+            keystroke(&mut ed, action);
+            (0..ed.buf().line_count())
+                .map(|i| ed.buf().line(i))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        let text = "foo bar  \n\n  baz qux\n";
+        // Forward from mid-line stops at the line's end, not the next word.
+        assert_eq!(
+            chop(text, Pos::new(0, 7), Action::ChopWordRight, false),
+            "foo bar||  baz qux|"
+        );
+        // From the very end it joins up to the next word start.
+        assert_eq!(
+            chop(text, Pos::new(0, 9), Action::ChopWordRight, false),
+            "foo bar  baz qux|"
+        );
+        assert_eq!(
+            chop(text, Pos::new(2, 2), Action::ChopWordRight, false),
+            "foo bar  ||  qux|"
+        );
+        assert_eq!(
+            chop(text, Pos::new(2, 2), Action::ChopWordRight, true),
+            "foo bar  ||   qux|"
+        );
+        // Backward from mid-line stops at the line's start; from column 0
+        // it goes back to the end of the previous word's line.
+        assert_eq!(
+            chop(text, Pos::new(2, 1), Action::ChopWordLeft, false),
+            "foo bar  || baz qux|"
+        );
+        assert_eq!(
+            chop(text, Pos::new(2, 0), Action::ChopWordLeft, false),
+            "foo bar    baz qux|"
+        );
     }
 
     #[test]

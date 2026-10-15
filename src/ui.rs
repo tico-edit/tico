@@ -1226,6 +1226,22 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
         return false;
     }
     match action {
+        // nano's `do_statusbar_prev_word`/`do_statusbar_next_word`: word
+        // movement within the answer, where punctuation never counts as
+        // part of a word (`wordbounds` is for the edit window only) but
+        // `afterends` and `wordchars` apply.
+        Action::PrevWord | Action::NextWord => {
+            let lines = crate::app::prompt_word_lines(&prompt.input);
+            let from = Pos::new(0, prompt.cursor);
+            let is_word = |c| editor.is_word_char(c, false);
+            prompt.cursor = if action == Action::PrevWord {
+                crate::app::prev_word_pos(&lines, from, is_word)
+            } else {
+                crate::app::next_word_pos(&lines, from, editor.options.afterends, is_word)
+            }
+            .col;
+            false
+        }
         // nano's `do_statusbar_verbatim_input`: the next keystroke goes
         // into the answer as is (not at a name-locked Write Out prompt).
         Action::Verbatim => {

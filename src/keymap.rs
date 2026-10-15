@@ -987,6 +987,25 @@ impl KeyMap {
         // that prompted double-checking all of these); history recall
         // (^P/^N) is shared much more broadly, across every prompt that
         // remembers previous entries.
+        // nano's `MMOST` word movement (`do_statusbar_prev_word`/
+        // `next_word`) at every prompt that takes typing.
+        for &menu in &[
+            Menu::Search,
+            Menu::Replace,
+            Menu::ReplaceWith,
+            Menu::GotoLine,
+            Menu::WriteOut,
+            Menu::Insert,
+            Menu::Execute,
+            Menu::WhereIsFile,
+            Menu::GotoDir,
+            Menu::Spell,
+        ] {
+            self.bind(menu, K::CtrlLeft, Binding::Action(A::PrevWord));
+            self.bind(menu, K::CtrlRight, Binding::Action(A::NextWord));
+            self.bind(menu, K::Meta(' '), Binding::Action(A::PrevWord));
+            self.bind(menu, K::Ctrl(' '), Binding::Action(A::NextWord));
+        }
         // nano's `MMOST`: `M-V` works at every prompt that takes typing.
         for &menu in &[
             Menu::Search,
