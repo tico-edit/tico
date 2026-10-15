@@ -691,6 +691,10 @@ pub enum Binding {
 #[derive(Debug, Clone, Default)]
 pub struct KeyMap {
     table: HashMap<(Menu, Key), Binding>,
+    /// nano's `shifted_metas`: whether any `bind`/`unbind` has named a
+    /// `Sh-M-` key. Until one has, Shift+Meta+letter is just Meta+letter
+    /// (see `fold_key`).
+    shifted_metas: bool,
 }
 
 /// What nano leaves out of `menu` in restricted mode -- unbound, and so
@@ -715,11 +719,33 @@ impl KeyMap {
     pub fn new() -> KeyMap {
         KeyMap {
             table: HashMap::new(),
+            shifted_metas: false,
         }
     }
 
     pub fn bind(&mut self, menu: Menu, key: Key, binding: Binding) {
+        self.note_shifted_meta(key);
         self.table.insert((menu, key), binding);
+    }
+
+    /// Like nano's `keycode_from_string`, which sets `shifted_metas` on
+    /// parsing any `Sh-M-` key, for a `bind` and an `unbind` alike.
+    fn note_shifted_meta(&mut self, key: Key) {
+        if matches!(key, Key::ShiftMeta(_)) {
+            self.shifted_metas = true;
+        }
+    }
+
+    /// The key a keystroke counts as: Shift+Meta+letter folds to plain
+    /// Meta+letter unless some `Sh-M-` key has been bound or unbound --
+    /// nano's `parse_kbinput` lowercasing an uppercase Meta letter when
+    /// `!shifted_metas`. Once one has, every `Sh-M-` key is distinct
+    /// (an unbound one reports itself as `Sh-M-X`).
+    pub fn fold_key(&self, key: Key) -> Key {
+        match key {
+            Key::ShiftMeta(c) if !self.shifted_metas => Key::Meta(c),
+            other => other,
+        }
     }
 
     pub fn bind_all_menus(&mut self, menus: &[Menu], key: Key, binding: Binding) {
@@ -729,6 +755,7 @@ impl KeyMap {
     }
 
     pub fn unbind(&mut self, menu: Menu, key: Key) {
+        self.note_shifted_meta(key);
         self.table.remove(&(menu, key));
     }
 
@@ -742,6 +769,7 @@ impl KeyMap {
     /// that don't have their own entry for a given key (mirrors nano's
     /// "all menus" semantics for many global keys like ^C=cancel, arrows, etc).
     pub fn lookup(&self, menu: Menu, key: Key) -> Option<&Binding> {
+        let key = self.fold_key(key);
         self.table
             .get(&(menu, key))
             .or_else(|| self.table.get(&(Menu::Main, key)))
@@ -755,7 +783,7 @@ impl KeyMap {
     /// (e.g. Main's `Ctrl+Home` = FirstLine leaking into the WriteOut
     /// prompt and unexpectedly aborting a save).
     pub fn lookup_menu_only(&self, menu: Menu, key: Key) -> Option<&Binding> {
-        self.table.get(&(menu, key))
+        self.table.get(&(menu, self.fold_key(key)))
     }
 
     /// All (menu, key) -> binding entries, e.g. for building a help screen's
@@ -1405,5 +1433,34 @@ mod tests {
             action(Menu::Execute, Key::Ctrl('T')),
             Some(Binding::Action(Action::Speller))
         );
+    }
+
+    #[test]
+    fn shift_meta_folds_to_meta_until_a_sh_m_key_is_bound_like_nano() {
+        let mut km = KeyMap::defaults(false);
+        let justify = Some(&Binding::Action(Action::FullJustify));
+        assert_eq!(km.lookup(Menu::Main, Key::ShiftMeta('J')), justify);
+        assert_eq!(
+            km.lookup_menu_only(Menu::Main, Key::ShiftMeta('J')),
+            justify
+        );
+        assert_eq!(km.fold_key(Key::ShiftMeta('J')), Key::Meta('J'));
+
+        // nano's shifted_metas: naming any Sh-M- key, even in an unbind,
+        // makes every Sh-M- key distinct from its plain Meta one.
+        km.unbind(Menu::Main, Key::ShiftMeta('Q'));
+        assert_eq!(km.lookup(Menu::Main, Key::ShiftMeta('J')), None);
+        assert_eq!(km.fold_key(Key::ShiftMeta('J')), Key::ShiftMeta('J'));
+        assert_eq!(km.lookup(Menu::Main, Key::Meta('J')), justify);
+        km.bind(
+            Menu::Main,
+            Key::ShiftMeta('J'),
+            Binding::Action(Action::Cut),
+        );
+        assert_eq!(
+            km.lookup(Menu::Main, Key::ShiftMeta('J')),
+            Some(&Binding::Action(Action::Cut))
+        );
+        assert_eq!(km.lookup(Menu::Main, Key::Meta('J')), justify);
     }
 }

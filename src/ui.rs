@@ -721,7 +721,7 @@ fn synthetic_key_event_for_label(label: &str) -> Option<KeyEvent> {
 fn key_to_event(key: TKey) -> KeyEvent {
     let (code, modifiers) = match key {
         TKey::Ctrl(c) => (KeyCode::Char(c.to_ascii_lowercase()), KeyModifiers::CONTROL),
-        TKey::Meta(c) => (KeyCode::Char(c), KeyModifiers::ALT),
+        TKey::Meta(c) => (KeyCode::Char(c.to_ascii_lowercase()), KeyModifiers::ALT),
         TKey::ShiftMeta(c) => (KeyCode::Char(c), KeyModifiers::ALT | KeyModifiers::SHIFT),
         TKey::F(n) => (KeyCode::F(n), KeyModifiers::NONE),
         TKey::Ins => (KeyCode::Insert, KeyModifiers::NONE),
@@ -3216,13 +3216,16 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
             };
             Some(TKey::Ctrl(mapped))
         }
-        KeyCode::Char(c) if alt && shift && c.is_ascii_alphabetic() => {
+        // A terminal sends Shift+Meta+letter as Esc + the uppercase
+        // letter, which crossterm reports with ALT alone -- so an
+        // uppercase letter means Shift too. Whether that's distinct from
+        // plain Meta+letter is the keymap's call (`KeyMap::fold_key`,
+        // nano's `shifted_metas`).
+        KeyCode::Char(c) if alt && (shift || c.is_ascii_uppercase()) && c.is_ascii_alphabetic() => {
             Some(TKey::ShiftMeta(c.to_ascii_uppercase()))
         }
-        // Meta+letter is case-insensitive by default in nano (a bare
-        // Meta+letter keystroke does the same as Shift+Meta+letter unless
-        // a specific Sh-M- binding overrides it), and our keymap stores
-        // Meta letter bindings uppercase, so normalize here too.
+        // Our keymap stores Meta letter bindings uppercase, so normalize
+        // a plain Meta+letter here too.
         KeyCode::Char(c) if alt => Some(TKey::Meta(c.to_ascii_uppercase())),
         _ => None,
     }
@@ -3396,7 +3399,7 @@ fn handle_browser_key(editor: &mut Editor, key: KeyEvent) {
     });
     let Some(action) = action else {
         let name = match (key.code, tkey) {
-            (_, Some(k)) => k.describe(),
+            (_, Some(k)) => editor.keymap.fold_key(k).describe(),
             (KeyCode::Char(c), None) => c.to_string(),
             _ => return,
         };
@@ -8392,6 +8395,22 @@ mod tests {
             let ev = key_to_event(key);
             assert_eq!(normalize_key(ev), Some(key), "{key:?}");
         }
+    }
+
+    #[test]
+    fn esc_plus_uppercase_letter_is_shift_meta() {
+        // What a terminal sends for Shift+Meta+letter: Esc + 'A', which
+        // crossterm reports with ALT alone.
+        let ev = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::ALT);
+        assert_eq!(normalize_key(ev), Some(TKey::ShiftMeta('A')));
+        let ev = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(normalize_key(ev), Some(TKey::ShiftMeta('A')));
+        let ev = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(normalize_key(ev), Some(TKey::Meta('A')));
+        // With no Sh-M- binding it still runs the plain Meta binding.
+        let mut ed = test_editor("one\ntwo\n");
+        press(&mut ed, KeyCode::Char('A'), KeyModifiers::ALT);
+        assert!(ed.buf().mark.is_some(), "Sh-M-A falls back to M-A (Mark)");
     }
 
     #[test]
