@@ -454,7 +454,8 @@ fn replay_macro(editor: &mut Editor) {
 }
 
 fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
-    let was_help = matches!(editor.mode, Mode::Help { .. });
+    // (Its own Search prompt doesn't leave the help viewer.)
+    let was_help = matches!(editor.mode, Mode::Help { .. }) || editor.help_session.is_some();
     dispatch_key_by_mode(editor, key);
     // Opening the help viewer blanks the status bar, as nano's does.
     if !was_help && matches!(editor.mode, Mode::Help { .. }) {
@@ -494,8 +495,11 @@ fn dispatch_key_by_mode(editor: &mut Editor, key: KeyEvent) {
             return_to,
         } => {
             // nano's help loop reads keys with get_kbinput() too, so its
-            // message countdown ticks here as well.
+            // message countdown ticks here as well; and like there, a
+            // search match's spotlight and cursor last one keystroke.
             editor.tick_status_countdown();
+            editor.clear_spotlight();
+            editor.help_found = false;
             handle_help_key(editor, lines, top, cursor, return_to, key);
         }
         Mode::Diff {
@@ -578,6 +582,10 @@ fn dispatch_mouse(editor: &mut Editor, mev: MouseEvent) {
 /// layout (`main_screen_layout`); the full-screen Help and Diff viewers
 /// only expose their own bottom shortcut bar.
 fn handle_click(editor: &mut Editor, row: usize, col: usize) {
+    // The help viewer's Search prompt takes no clicks.
+    if editor.help_session.is_some() {
+        return;
+    }
     if editor.browser.is_some() && matches!(&editor.mode, Mode::Browser | Mode::Prompt(_)) {
         handle_browser_click(editor, row, col);
         return;
@@ -791,13 +799,17 @@ fn handle_help_key(
 
     let tkey = normalize_key(key);
     // nano's `interpret`: in the help viewer (as in the browser) a few
-    // plain letters work too. Its search letters (`w`, `/`, `n`, `N`) do
-    // nothing here, since tico's help has no search, but aren't reported
-    // as unbound either.
+    // plain letters work too -- `x`/`q`/`e` close, `b`/`-` and Space page,
+    // `w`/`/` search, `n`/`N` find the next/previous match.
     let action = match browser_plain_key(key) {
         Some(Action::Exit) => Some(Action::Cancel),
-        Some(a @ (Action::PageUp | Action::PageDown)) => Some(a),
-        Some(Action::WhereIs | Action::FindNext | Action::FindPrevious) => None,
+        Some(
+            a @ (Action::PageUp
+            | Action::PageDown
+            | Action::WhereIs
+            | Action::FindNext
+            | Action::FindPrevious),
+        ) => Some(a),
         _ => match tkey.and_then(|k| editor.keymap.lookup_menu_only(Menu::Help, k)) {
             Some(Binding::Action(a)) => Some(*a),
             _ => {
@@ -811,20 +823,79 @@ fn handle_help_key(
     if matches!(key.code, KeyCode::Esc) {
         close = true;
     } else if let Some(action) = action {
-        if action == Action::Cancel {
-            close = true;
-        } else if editor.options.showcursor {
-            move_help_cursor(body, &mut top, &mut cursor, action, body_rows);
-        } else {
-            match action {
-                Action::Up => top = top.saturating_sub(1),
-                Action::Down => top = (top + 1).min(max_top),
-                // nano's do_page_up/do_page_down: all but two rows.
-                Action::PageUp => top = top.saturating_sub(page_rows(body_rows)),
-                Action::PageDown => top = (top + page_rows(body_rows)).min(max_top),
-                Action::FirstLine => top = 0,
-                Action::LastLine => top = max_top,
-                _ => {}
+        match action {
+            Action::Cancel => close = true,
+            // nano's do_search_forward/do_search_backward: the Search
+            // prompt, over the help text parked in `help_session`.
+            Action::WhereIs | Action::WhereWas => {
+                let forwards = action == Action::WhereIs;
+                editor.help_session = Some(crate::app::HelpSession {
+                    lines,
+                    top,
+                    cursor,
+                    return_to,
+                });
+                editor.mode = Mode::Prompt(Prompt {
+                    kind: PromptKind::HelpSearch { forwards },
+                    menu: Menu::FindInHelp,
+                    label: browser_search_label(editor, forwards),
+                    input: String::new(),
+                    cursor: 0,
+                    history_pos: None,
+                    saved_input: None,
+                });
+                return;
+            }
+            // nano's do_findnext/do_findprevious, with the newest search
+            // history entry standing in when nothing was searched for yet.
+            Action::FindNext | Action::FindPrevious => {
+                if editor.search.last_pattern.is_none() {
+                    editor.search.last_pattern = editor.history.search.last().cloned();
+                }
+                match editor.search.last_pattern.clone() {
+                    Some(needle) => {
+                        editor.status = None;
+                        let forwards = action == Action::FindNext;
+                        help_find(editor, body, &mut top, &mut cursor, &needle, forwards);
+                    }
+                    None => editor.set_status_mild("No current search pattern"),
+                }
+            }
+            Action::Refresh => {}
+            _ if editor.options.showcursor => {
+                move_help_cursor(body, &mut top, &mut cursor, action, body_rows);
+            }
+            _ => {
+                let was_top = top;
+                match action {
+                    Action::Up => top = top.saturating_sub(1),
+                    // nano's do_scroll_down: only while the last line is
+                    // below the screen.
+                    Action::Down if top < max_top => top += 1,
+                    // nano's do_page_up/do_page_down: all but two rows.
+                    Action::PageUp => top = top.saturating_sub(page_rows(body_rows)),
+                    Action::PageDown => top = (top + page_rows(body_rows)).min(max_top.max(top)),
+                    Action::FirstLine => {
+                        top = 0;
+                        cursor = HelpCursor::default();
+                    }
+                    Action::LastLine => {
+                        top = max_top;
+                        cursor = HelpCursor {
+                            line: body.len().saturating_sub(1),
+                            col: 0,
+                            want: 0,
+                        };
+                    }
+                    _ => {}
+                }
+                // The hidden cursor still goes along, as nano's does, so
+                // that a search starts from where it would in nano: a
+                // page keeps its screen row, a scroll only pushes it.
+                if matches!(action, Action::PageUp | Action::PageDown) {
+                    cursor.line = (cursor.line + top).saturating_sub(was_top);
+                }
+                keep_help_cursor_in_view(body, top, body_rows, &mut cursor);
             }
         }
     }
@@ -852,6 +923,71 @@ fn handle_help_key(
 /// cursor "almost one screenful" (all but two rows) keeping it on the
 /// same screen row, or, when that would run off an end, to the first/last
 /// line (nano's `do_page_up`/`do_page_down`).
+/// Keep the help viewer's hidden cursor on screen after the view moved,
+/// on its wanted column (nano's `placewewant`) as far as the line allows.
+fn keep_help_cursor_in_view(body: &[String], top: usize, rows: usize, cursor: &mut HelpCursor) {
+    let last = body.len().saturating_sub(1);
+    let line = cursor
+        .line
+        .clamp(top, (top + rows).saturating_sub(1))
+        .min(last);
+    if line != cursor.line {
+        cursor.line = line;
+        let len = body.get(line).map_or(0, |l| l.chars().count());
+        cursor.col = cursor.want.min(len);
+    }
+}
+
+/// nano's `go_looking` in the help viewer: find `needle` from the cursor
+/// -- case-insensitively and literally, as help always searches -- put
+/// the cursor on it (shown until the next keystroke, nano's `didfind`),
+/// center it if it's off screen, and spotlight it.
+fn help_find(
+    editor: &mut Editor,
+    body: &[String],
+    top: &mut usize,
+    cursor: &mut HelpCursor,
+    needle: &str,
+    forwards: bool,
+) {
+    let buf = crate::buffer::Buffer::from_text(&body.join("\n"), None);
+    let was = Pos::new(cursor.line, cursor.col);
+    match crate::app::find_in_lines(&buf, was, needle, !forwards, false, false) {
+        Some((pos, len, wrapped)) => {
+            *cursor = HelpCursor {
+                line: pos.line,
+                col: pos.col,
+                want: pos.col,
+            };
+            let rows = help_body_rows(editor);
+            if pos.line < *top || pos.line >= *top + rows {
+                *top = pos.line.saturating_sub(rows / 2);
+            }
+            editor.set_spotlight_timed(pos, len);
+            editor.help_found = true;
+            if pos == was {
+                editor.set_status("This is the only occurrence");
+            } else if wrapped {
+                editor.set_status("Search Wrapped");
+            }
+        }
+        None => editor.set_status_mild(format!("\"{needle}\" not found")),
+    }
+}
+
+/// Leave the help viewer's Search prompt for the help text it covered.
+fn return_to_help(editor: &mut Editor) {
+    editor.mode = match editor.help_session.take() {
+        Some(h) => Mode::Help {
+            lines: h.lines,
+            top: h.top,
+            cursor: h.cursor,
+            return_to: h.return_to,
+        },
+        None => Mode::Editing,
+    };
+}
+
 /// How far a Page Up/Down moves in a `rows`-row viewer: nano's
 /// `mustmove`, all but two rows (at least one).
 fn page_rows(rows: usize) -> usize {
@@ -1085,12 +1221,16 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
     if let Some(tkey) = normalize_key(key) {
         if tkey == TKey::Ctrl('C') || matches!(key.code, KeyCode::Esc) {
             editor.mode = Mode::Editing;
-            // The file browser's own prompts go back to the browser.
+            // The file browser's own prompts go back to the browser, and
+            // the help viewer's Search prompt to the help text.
             if matches!(
                 prompt.kind,
                 PromptKind::BrowserSearch { .. } | PromptKind::GotoDir
             ) {
                 editor.mode = Mode::Browser;
+            }
+            if matches!(prompt.kind, PromptKind::HelpSearch { .. }) {
+                return_to_help(editor);
             }
             // Canceling out of a spell-fix prompt stops the word-by-word
             // loop, but (matching nano's `fix_spello`/`spell_check`) still
@@ -1275,6 +1415,33 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
                 cursor: Default::default(),
                 return_to: Some(Box::new(prompt.clone())),
             };
+            true
+        }
+        // nano runs `to_first_line`/`to_last_line` on the help text from
+        // its Search prompt, which then closes without searching.
+        Action::FirstLine | Action::LastLine
+            if matches!(prompt.kind, PromptKind::HelpSearch { .. }) =>
+        {
+            return_to_help(editor);
+            let emptyline = editor.emptyline_row() > 0;
+            let rows = help_body_rows(editor);
+            if let Mode::Help {
+                lines, top, cursor, ..
+            } = &mut editor.mode
+            {
+                let body_len = help_body_of(emptyline, lines).len();
+                if action == Action::FirstLine {
+                    *top = 0;
+                    *cursor = HelpCursor::default();
+                } else {
+                    *top = body_len.saturating_sub(rows);
+                    *cursor = HelpCursor {
+                        line: body_len.saturating_sub(1),
+                        col: 0,
+                        want: 0,
+                    };
+                }
+            }
             true
         }
         Action::FirstLine => {
@@ -1747,7 +1914,9 @@ fn common_prefix(a: &str, b: &str) -> String {
 /// whatever was live-typed before browsing started.
 fn cycle_history(editor: &mut Editor, prompt: &mut Prompt, older: bool) {
     let list: &[String] = match prompt.menu {
-        Menu::Search | Menu::Replace | Menu::WhereIsFile => &editor.history.search,
+        Menu::Search | Menu::Replace | Menu::WhereIsFile | Menu::FindInHelp => {
+            &editor.history.search
+        }
         Menu::ReplaceWith => &editor.history.replace,
         Menu::Execute => &editor.history.execute,
         _ => return,
@@ -2261,6 +2430,33 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
             remember_browser_search(editor, &text);
             let needle = editor.search.last_pattern.clone().unwrap_or_default();
             browser_find(editor, &needle, forwards);
+        }
+        PromptKind::HelpSearch { forwards } => {
+            return_to_help(editor);
+            // As at the browser's Search prompt: a blank answer with
+            // nothing searched for yet is the same as cancelling.
+            if text.is_empty() && editor.search.last_pattern.is_none() {
+                editor.set_status("Cancelled");
+                return;
+            }
+            remember_browser_search(editor, &text);
+            let needle = editor.search.last_pattern.clone().unwrap_or_default();
+            if let Mode::Help {
+                lines,
+                mut top,
+                mut cursor,
+                return_to,
+            } = std::mem::replace(&mut editor.mode, Mode::Editing)
+            {
+                let body = help_text_body(editor, &lines).to_vec();
+                help_find(editor, &body, &mut top, &mut cursor, &needle, forwards);
+                editor.mode = Mode::Help {
+                    lines,
+                    top,
+                    cursor,
+                    return_to,
+                };
+            }
         }
         PromptKind::GotoDir => {
             editor.mode = Mode::Browser;
@@ -3839,6 +4035,11 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
         return out.flush();
     }
 
+    // The help viewer's Search prompt, over the help text.
+    if let (Some(h), Mode::Prompt(_)) = (&editor.help_session, &editor.mode) {
+        render_help_screen(editor, &mut out, &h.lines, h.top, h.cursor)?;
+        return out.flush();
+    }
     if let Some(session) = &editor.browser
         && matches!(editor.mode, Mode::Browser | Mode::Prompt(_))
     {
@@ -3951,7 +4152,7 @@ fn help_body_rows(editor: &Editor) -> usize {
 /// blank (never the minibar).
 fn render_viewer_status(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Result<()> {
     let row = editor.screen_rows.saturating_sub(3) as u16;
-    if editor.status.is_some() {
+    if editor.status.is_some() || matches!(editor.mode, Mode::Prompt(_)) {
         render_status_line(editor, out, row, cols)
     } else {
         queue!(out, MoveTo(0, row), Print(" ".repeat(cols)))
@@ -3963,9 +4164,14 @@ fn render_viewer_status(editor: &Editor, out: &mut impl Write, cols: usize) -> i
 /// help then starts its text right below the blank row, and can't be
 /// scrolled back up to that line either.
 fn help_text_body<'a>(editor: &Editor, lines: &'a [String]) -> &'a [String] {
+    help_body_of(editor.emptyline_row() > 0, lines)
+}
+
+/// `help_text_body`, given whether `set emptyline` is in effect.
+fn help_body_of(emptyline: bool, lines: &[String]) -> &[String] {
     let body = &lines[1.min(lines.len())..];
     match body.first() {
-        Some(first) if first.is_empty() && editor.emptyline_row() > 0 => &body[1..],
+        Some(first) if first.is_empty() && emptyline => &body[1..],
         _ => body,
     }
 }
@@ -3998,6 +4204,21 @@ fn render_help_screen(
     )?;
     let body = help_text_body(editor, lines);
     let body_rows = help_body_rows(editor);
+    // A search match is spotlighted like one in the edit window.
+    let spot_styles = editor.spotlight.map(|(pos, len)| {
+        let (fg, bg) = spotlight_colors(&editor.options.spotlightcolor);
+        let lit = Style {
+            fg: Some(fg),
+            bg: Some(bg),
+            ..Style::default()
+        };
+        let mut styles = vec![Vec::new(); body.len()];
+        if let Some(line) = styles.get_mut(pos.line) {
+            *line = vec![None; pos.col];
+            line.extend(std::iter::repeat_n(Some(lit), len));
+        }
+        styles
+    });
     render_scrollable_body(
         out,
         cols,
@@ -4005,14 +4226,34 @@ fn render_help_screen(
         top,
         help_body_start(editor),
         body_rows,
-        None,
+        spot_styles.as_deref(),
     )?;
     render_viewer_status(editor, out, cols)?;
-    let entries = resolve_shortcuts(&editor.keymap, Menu::Help, HELP_SHORTCUTS);
+    let prompt = match &editor.mode {
+        Mode::Prompt(p) => Some(p),
+        _ => None,
+    };
+    let entries = match prompt {
+        Some(p) => shortcut_bar_entries(&editor.keymap, Some(p), editor.options.restricted),
+        None => resolve_shortcuts(&editor.keymap, Menu::Help, HELP_SHORTCUTS),
+    };
     render_shortcut_bar(editor, out, rows.saturating_sub(2) as u16, cols, &entries)?;
 
-    // `set showcursor`: the cursor stays visible in the help text.
-    if editor.options.showcursor
+    // At the Search prompt, the cursor is in the answer -- on the status
+    // row, which in help is always above the two bar rows.
+    if let Some(p) = prompt {
+        let typed: String = p.input.chars().take(p.cursor).collect();
+        let col = p.label.chars().count() + 2 + caret_notation(&typed).chars().count();
+        let row = rows.saturating_sub(3);
+        return queue!(
+            out,
+            MoveTo(col.min(cols.saturating_sub(1)) as u16, row as u16),
+            Show
+        );
+    }
+    // `set showcursor`, or a search that just found something (nano's
+    // `didfind`): the cursor is shown in the help text.
+    if (editor.options.showcursor || editor.help_found)
         && let Some(line) = body.get(cursor.line)
         && cursor.line >= top
         && cursor.line < top + body_rows
@@ -4821,15 +5062,24 @@ const GOTODIR_SHORTCUTS: &[(Action, &str)] = &[(Action::Help, "Help"), (Action::
 
 /// The `^G` help viewer's own bottom bar (confirmed against the installed
 /// nano's help screen).
+/// nano's MHELP bar, column by column (top row, then bottom row).
 const HELP_SHORTCUTS: &[(Action, &str)] = &[
-    (Action::Up, "Prev Line"),
-    (Action::PageUp, "Prev Page"),
-    (Action::FirstLine, "First Line"),
+    (Action::Refresh, "Refresh"),
     (Action::Cancel, "Close"),
+    (Action::WhereIs, "Where Is"),
+    (Action::WhereWas, "Where Was"),
+    (Action::FindPrevious, "Previous"),
+    (Action::FindNext, "Next"),
+    (Action::Up, "Prev Line"),
     (Action::Down, "Next Line"),
+    (Action::PageUp, "Prev Page"),
     (Action::PageDown, "Next Page"),
+    (Action::FirstLine, "First Line"),
     (Action::LastLine, "Last Line"),
 ];
+
+/// nano's MFINDINHELP bar: just Cancel.
+const FINDINHELP_SHORTCUTS: &[(Action, &str)] = &[(Action::Cancel, "Cancel")];
 
 /// The "file changed on disk, you have unsaved edits" choice prompt: R/K/M
 /// aren't keymap-driven (this prompt is tico-original and matches those
@@ -4917,6 +5167,7 @@ fn shortcut_bar_entries(
         Menu::Linter => LINTER_SHORTCUTS,
         Menu::WhereIsFile => WHEREISFILE_SHORTCUTS,
         Menu::GotoDir => GOTODIR_SHORTCUTS,
+        Menu::FindInHelp => FINDINHELP_SHORTCUTS,
         _ => return resolve_shortcuts(keymap, Menu::Main, main),
     };
     if restricted {
@@ -8457,7 +8708,8 @@ mod tests {
             if showcursor {
                 assert_eq!((*top, cursor.line), (0, 1));
             } else {
-                assert_eq!((*top, cursor.line), (1, 0));
+                // The hidden cursor is pushed along to stay on screen.
+                assert_eq!((*top, cursor.line), (1, 1));
             }
             let mut out = Vec::new();
             let Mode::Help {
@@ -8573,6 +8825,102 @@ mod tests {
         assert_eq!(ed.status, None);
     }
 
+    /// A 16-row editor with `^G` help open, from a Search prompt when
+    /// `from_prompt`.
+    fn help_open(from_prompt: bool) -> Editor {
+        let mut ed = test_editor("one\n");
+        ed.screen_cols = 80;
+        ed.screen_rows = 16;
+        if from_prompt {
+            press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        }
+        press(&mut ed, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(matches!(ed.mode, Mode::Help { .. }));
+        ed
+    }
+
+    fn help_state(ed: &Editor) -> (usize, HelpCursor, Vec<String>) {
+        match &ed.mode {
+            Mode::Help {
+                lines, top, cursor, ..
+            } => (*top, *cursor, help_text_body(ed, lines).to_vec()),
+            _ => panic!("not in help: {:?}", std::mem::discriminant(&ed.mode)),
+        }
+    }
+
+    fn help_search(ed: &mut Editor, needle: &str) {
+        press(ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(&ed.mode, Mode::Prompt(p) if p.menu == Menu::FindInHelp),
+            "^W opens the help's Search prompt"
+        );
+        type_text(ed, needle);
+        press(ed, KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn help_search_finds_case_insensitively_and_lights_the_match() {
+        let mut ed = help_open(false);
+        // Help always searches case-insensitively, whatever M-C says.
+        ed.search.case_sensitive = true;
+        help_search(&mut ed, "VERBATIM");
+        let (top, cursor, body) = help_state(&ed);
+        let line = &body[cursor.line];
+        assert!(line[..].to_lowercase()[..].contains("verbatim"));
+        let col = line.to_lowercase().find("verbatim").unwrap();
+        assert_eq!(cursor.col, line[..col].chars().count());
+        // Found off screen: centered (nano's CENTERING, rows / 2 down).
+        let rows = help_body_rows(&ed);
+        assert_eq!(top, cursor.line - rows / 2);
+        assert_eq!(ed.spotlight, Some((Pos::new(cursor.line, cursor.col), 8)));
+        assert!(ed.help_found, "the cursor is shown on the match");
+        assert!(ed.search.case_sensitive, "the editor's own setting is kept");
+        assert_eq!(ed.search.last_pattern.as_deref(), Some("VERBATIM"));
+        assert_eq!(
+            ed.history.search.last().map(String::as_str),
+            Some("VERBATIM")
+        );
+        // The next keystroke ends both.
+        press(&mut ed, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(ed.spotlight, None);
+        assert!(!ed.help_found);
+    }
+
+    #[test]
+    fn help_search_repeats_reports_and_cancels_like_nano() {
+        let mut ed = help_open(false);
+        press(&mut ed, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(ed.status.as_deref(), Some("No current search pattern"));
+        help_search(&mut ed, "zzzq");
+        assert_eq!(ed.status.as_deref(), Some("\"zzzq\" not found"));
+        help_search(&mut ed, "the matching bracket");
+        let (_, first, _) = help_state(&ed);
+        // The only occurrence: `n` comes back to it, and says so.
+        press(&mut ed, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(help_state(&ed).1, first);
+        assert_eq!(ed.status.as_deref(), Some("This is the only occurrence"));
+        // Cancelling goes back to the help text.
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+        assert_eq!(help_state(&ed).1, first);
+        // ^V at the prompt goes to the last line without searching.
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let (top, cursor, body) = help_state(&ed);
+        assert_eq!(cursor.line, body.len() - 1);
+        assert_eq!(top, body.len() - help_body_rows(&ed));
+    }
+
+    #[test]
+    fn help_search_from_a_prompts_help_returns_to_that_prompt() {
+        let mut ed = help_open(true);
+        help_search(&mut ed, "search");
+        assert!(matches!(ed.mode, Mode::Help { .. }));
+        press(&mut ed, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(&ed.mode, Mode::Prompt(p) if p.menu == Menu::Search));
+    }
+
     #[test]
     fn help_viewer_reports_unbound_keys_and_takes_nanos_plain_letters() {
         let open = || {
@@ -8601,9 +8949,9 @@ mod tests {
         assert_eq!(ed.status, None, "the message lasts one keystroke");
         press(&mut ed, KeyCode::Char('b'), KeyModifiers::NONE);
         assert_eq!(top(&ed), 0);
-        // The search letters do nothing (tico's help has no search).
+        // `w` searches, as `^W` does.
         press(&mut ed, KeyCode::Char('w'), KeyModifiers::NONE);
-        assert_eq!(ed.status, None);
+        assert!(matches!(&ed.mode, Mode::Prompt(p) if p.menu == Menu::FindInHelp));
         for c in ['x', 'q', 'E'] {
             let mut ed = open();
             press(&mut ed, KeyCode::Char(c), KeyModifiers::NONE);

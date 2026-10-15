@@ -76,6 +76,21 @@ pub enum PromptKind {
     },
     /// The file browser's Go To Directory prompt (nano's `MGOTODIR`).
     GotoDir,
+    /// The help viewer's Search prompt (nano's `MFINDINHELP`), shown over
+    /// the help text kept in `Editor::help_session`.
+    HelpSearch {
+        forwards: bool,
+    },
+}
+
+/// The help viewer's state while its Search prompt is up -- `Mode::Help`'s
+/// fields, parked here as the browser parks its own in `BrowserSession`.
+#[derive(Debug, Clone)]
+pub struct HelpSession {
+    pub lines: Vec<String>,
+    pub top: usize,
+    pub cursor: HelpCursor,
+    pub return_to: Option<Box<Prompt>>,
 }
 
 /// An open file browser (`^T` at the Read File / Write Out prompts): the
@@ -439,6 +454,13 @@ pub struct Editor {
     pub minibar_note: Option<String>,
     /// The open file browser, if any (see `Mode::Browser`).
     pub browser: Option<BrowserSession>,
+    /// The help viewer, while its Search prompt is up (see
+    /// `PromptKind::HelpSearch`).
+    pub help_session: Option<HelpSession>,
+    /// Whether the help viewer's last keystroke found a search match:
+    /// nano's `didfind`, which shows the cursor on the match until the
+    /// next keystroke.
+    pub help_found: bool,
     /// Set by `M-V` (in the edit window or at a prompt) until the next
     /// keystroke has been taken verbatim -- see `ui::handle_verbatim_key`.
     pub verbatim: Option<VerbatimInput>,
@@ -508,6 +530,8 @@ impl Editor {
             file_completions: None,
             minibar_note: None,
             browser: None,
+            help_session: None,
+            help_found: false,
             verbatim: None,
             macros: MacroRecorder::default(),
         }
@@ -559,7 +583,7 @@ impl Editor {
 
     /// Highlight a plain search match, auto-clearing after ~1.5s (0.8s with
     /// quickblank) of no further input.
-    fn set_spotlight_timed(&mut self, pos: Pos, len: usize) {
+    pub fn set_spotlight_timed(&mut self, pos: Pos, len: usize) {
         self.spotlight = Some((pos, len));
         let ms = if self.options.quickblank { 800 } else { 1500 };
         self.spotlight_deadline =
@@ -3750,7 +3774,7 @@ fn find_next_match_for_replace(
 /// again -- where only a match up to `from` itself counts (so the one at
 /// `from` is found last). Returns the match, its length in characters,
 /// and whether the search went around the end.
-fn find_in_lines(
+pub fn find_in_lines(
     buf: &Buffer,
     from: Pos,
     pattern: &str,

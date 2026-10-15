@@ -404,6 +404,9 @@ pub enum Menu {
     Execute,
     Spell,
     Linter,
+    /// The help viewer's Search prompt (nano's `MFINDINHELP`). Like nano's,
+    /// it has no name of its own in `bind`/`unbind`; only `all` reaches it.
+    FindInHelp,
 }
 
 impl Menu {
@@ -445,6 +448,7 @@ impl Menu {
         Menu::Execute,
         Menu::Spell,
         Menu::Linter,
+        Menu::FindInHelp,
     ];
 }
 
@@ -710,6 +714,7 @@ const TEXT_PROMPTS: &[Menu] = &[
     Menu::WhereIsFile,
     Menu::GotoDir,
     Menu::Spell,
+    Menu::FindInHelp,
 ];
 
 /// What nano leaves out of `menu` in restricted mode -- unbound, and so
@@ -1039,6 +1044,7 @@ impl KeyMap {
             Menu::Replace,
             Menu::ReplaceWith,
             Menu::Execute,
+            Menu::FindInHelp,
         ] {
             self.bind(menu, K::Ctrl('P'), Binding::Action(A::Older));
             self.bind(menu, K::Ctrl('N'), Binding::Action(A::Newer));
@@ -1049,6 +1055,16 @@ impl KeyMap {
             self.bind(menu, K::Up, Binding::Action(A::Older));
             self.bind(menu, K::Down, Binding::Action(A::Newer));
         }
+
+        // nano's MFINDINHELP: no help of its own (nano leaves `do_help` out
+        // of it), and `^Y`/`^V` to jump to the help text's first/last line.
+        self.unbind(Menu::FindInHelp, K::Ctrl('G'));
+        self.bind(
+            Menu::FindInHelp,
+            K::Ctrl('Y'),
+            Binding::Action(A::FirstLine),
+        );
+        self.bind(Menu::FindInHelp, K::Ctrl('V'), Binding::Action(A::LastLine));
 
         self.bind(Menu::GotoLine, K::Ctrl('M'), Binding::Action(A::GotoLine));
         self.bind(Menu::GotoLine, K::Ctrl('T'), Binding::Action(A::FlipGoto));
@@ -1122,6 +1138,17 @@ impl KeyMap {
         self.bind(Menu::Help, K::Meta('\\'), Binding::Action(A::FirstLine));
         self.bind(Menu::Help, K::Meta('/'), Binding::Action(A::LastLine));
         self.bind(Menu::Help, K::Ctrl('X'), Binding::Action(A::Cancel));
+        // Searching the help text, as in nano's MHELP.
+        self.bind(Menu::Help, K::Ctrl('L'), Binding::Action(A::Refresh));
+        self.bind(Menu::Help, K::Ctrl('W'), Binding::Action(A::WhereIs));
+        self.bind(Menu::Help, K::Ctrl('F'), Binding::Action(A::WhereIs));
+        self.bind(Menu::Help, K::F(6), Binding::Action(A::WhereIs));
+        self.bind(Menu::Help, K::Ctrl('Q'), Binding::Action(A::WhereWas));
+        self.bind(Menu::Help, K::Ctrl('B'), Binding::Action(A::WhereWas));
+        self.bind(Menu::Help, K::Meta('W'), Binding::Action(A::FindNext));
+        self.bind(Menu::Help, K::Meta('F'), Binding::Action(A::FindNext));
+        self.bind(Menu::Help, K::Meta('Q'), Binding::Action(A::FindPrevious));
+        self.bind(Menu::Help, K::Meta('B'), Binding::Action(A::FindPrevious));
 
         self.install_browser_defaults();
 
@@ -1271,7 +1298,7 @@ impl KeyMap {
         // existing ^G moves to ^H too, rather than being stranded on the
         // old key while everything else switches.
         for &menu in Menu::ALL {
-            if matches!(menu, Menu::Main | Menu::Help) {
+            if matches!(menu, Menu::Main | Menu::Help | Menu::FindInHelp) {
                 continue;
             }
             self.unbind(menu, K::Ctrl('G'));
@@ -1290,8 +1317,17 @@ impl KeyMap {
 
         // The help key toggles: pressing it again while help is open closes
         // it, same as nano's `add_to_sclist(MHELP, help_key, 0, do_exit)`.
-        self.unbind(Menu::Help, K::Ctrl('G'));
-        self.bind(Menu::Help, K::Ctrl('H'), Binding::Action(A::Cancel));
+        // Like the browser, help trades the traditional ^X/^Q/^W/^P/^N/
+        // ^Y/^V for the modern ^Q (close) and ^D/^G (previous/next match).
+        let hp = Menu::Help;
+        for k in ['X', 'Q', 'W', 'P', 'N', 'Y', 'V'] {
+            self.unbind(hp, K::Ctrl(k));
+        }
+        self.unbind(hp, K::Ctrl('G'));
+        self.bind(hp, K::Ctrl('H'), Binding::Action(A::Cancel));
+        self.bind(hp, K::Ctrl('Q'), Binding::Action(A::Cancel));
+        self.bind(hp, K::Ctrl('D'), Binding::Action(A::FindPrevious));
+        self.bind(hp, K::Ctrl('G'), Binding::Action(A::FindNext));
     }
 }
 
