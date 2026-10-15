@@ -697,6 +697,21 @@ pub struct KeyMap {
     shifted_metas: bool,
 }
 
+/// The prompts that take typing: nano's `MMOST` minus the main menu (and
+/// minus `MLINTER`, which in tico is a list rather than a text prompt).
+const TEXT_PROMPTS: &[Menu] = &[
+    Menu::Search,
+    Menu::Replace,
+    Menu::ReplaceWith,
+    Menu::GotoLine,
+    Menu::WriteOut,
+    Menu::Insert,
+    Menu::Execute,
+    Menu::WhereIsFile,
+    Menu::GotoDir,
+    Menu::Spell,
+];
+
 /// What nano leaves out of `menu` in restricted mode -- unbound, and so
 /// missing from its shortcut bar and help text: at the Write Out prompt
 /// Append, Prepend, Backup File and Browse; at the Read File and Execute
@@ -988,37 +1003,19 @@ impl KeyMap {
         // (^P/^N) is shared much more broadly, across every prompt that
         // remembers previous entries.
         // nano's `MMOST` word movement (`do_statusbar_prev_word`/
-        // `next_word`) at every prompt that takes typing.
-        for &menu in &[
-            Menu::Search,
-            Menu::Replace,
-            Menu::ReplaceWith,
-            Menu::GotoLine,
-            Menu::WriteOut,
-            Menu::Insert,
-            Menu::Execute,
-            Menu::WhereIsFile,
-            Menu::GotoDir,
-            Menu::Spell,
-        ] {
+        // `next_word`) and `^A`/`^E` Home/End (`do_statusbar_home`/`end`;
+        // dropped again by `--modernbindings`) at every prompt that takes
+        // typing.
+        for &menu in TEXT_PROMPTS {
             self.bind(menu, K::CtrlLeft, Binding::Action(A::PrevWord));
             self.bind(menu, K::CtrlRight, Binding::Action(A::NextWord));
             self.bind(menu, K::Meta(' '), Binding::Action(A::PrevWord));
             self.bind(menu, K::Ctrl(' '), Binding::Action(A::NextWord));
+            self.bind(menu, K::Ctrl('A'), Binding::Action(A::Home));
+            self.bind(menu, K::Ctrl('E'), Binding::Action(A::End));
         }
         // nano's `MMOST`: `M-V` works at every prompt that takes typing.
-        for &menu in &[
-            Menu::Search,
-            Menu::Replace,
-            Menu::ReplaceWith,
-            Menu::GotoLine,
-            Menu::WriteOut,
-            Menu::Insert,
-            Menu::Execute,
-            Menu::WhereIsFile,
-            Menu::GotoDir,
-            Menu::Spell,
-        ] {
+        for &menu in TEXT_PROMPTS {
             self.bind(menu, K::Meta('V'), Binding::Action(A::Verbatim));
         }
         self.bind(Menu::Search, K::Ctrl('M'), Binding::Action(A::WhereIs));
@@ -1251,6 +1248,12 @@ impl KeyMap {
         b(K::Ctrl('C'), A::Copy);
         b(K::Ctrl('V'), A::Paste);
         b(K::Ctrl('E'), A::Execute);
+        // nano binds `^A`/`^E` as Home/End at the prompts only without
+        // --modernbindings.
+        for &menu in TEXT_PROMPTS {
+            self.unbind(menu, K::Ctrl('A'));
+            self.unbind(menu, K::Ctrl('E'));
+        }
 
         // nano's own help-key rebinding isn't Main-only: it applies via a
         // broad `(MMOST|MBROWSER) & ~MFINDINHELP` menu set — "an

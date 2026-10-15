@@ -1230,6 +1230,15 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
         // movement within the answer, where punctuation never counts as
         // part of a word (`wordbounds` is for the edit window only) but
         // `afterends` and `wordchars` apply.
+        // nano's `do_statusbar_home`/`do_statusbar_end`.
+        Action::Home => {
+            prompt.cursor = 0;
+            false
+        }
+        Action::End => {
+            prompt.cursor = prompt.input.chars().count();
+            false
+        }
         Action::PrevWord | Action::NextWord => {
             let lines = crate::app::prompt_word_lines(&prompt.input);
             let from = Pos::new(0, prompt.cursor);
@@ -3262,6 +3271,9 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
+        // nano reads Alt+Backspace as the same key code as Shift+Ctrl+Del
+        // (`M-Bsp` and `Sh-^Del` are both chop-word-left).
+        KeyCode::Backspace if alt => Some(TKey::ShiftCtrlDel),
         KeyCode::Backspace => Some(TKey::Backspace),
         KeyCode::Tab => Some(TKey::Ctrl('I')),
         KeyCode::BackTab => Some(TKey::ShiftTab),
@@ -8597,6 +8609,48 @@ mod tests {
             press(&mut ed, KeyCode::Char(c), KeyModifiers::NONE);
             assert!(matches!(ed.mode, Mode::Editing), "{c} closes help");
         }
+    }
+
+    #[test]
+    fn alt_backspace_chops_the_previous_word_like_nano() {
+        let ev = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(normalize_key(ev), Some(TKey::ShiftCtrlDel));
+        let mut ed = test_editor("foo bar baz\n");
+        ed.buf_mut().cursor = Pos::new(0, 11);
+        press(&mut ed, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(ed.buf().line(0), "foo bar ");
+    }
+
+    #[test]
+    fn prompt_home_end_and_ctrl_a_e_move_to_the_answers_ends() {
+        let search = |modern: bool| {
+            let mut ed = test_editor("one\n");
+            ed.keymap = crate::keymap::KeyMap::defaults(modern);
+            let search_key = if modern { 'f' } else { 'w' };
+            press(&mut ed, KeyCode::Char(search_key), KeyModifiers::CONTROL);
+            type_text(&mut ed, "foo bar");
+            ed
+        };
+        let answer = |ed: &Editor| match &ed.mode {
+            Mode::Prompt(p) => p.input.clone(),
+            _ => panic!("no prompt"),
+        };
+        let mut ed = search(false);
+        press(&mut ed, KeyCode::Home, KeyModifiers::NONE);
+        type_text(&mut ed, "1");
+        press(&mut ed, KeyCode::End, KeyModifiers::NONE);
+        type_text(&mut ed, "2");
+        press(&mut ed, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "3");
+        press(&mut ed, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "4");
+        assert_eq!(answer(&ed), "31foo bar24");
+        // --modernbindings leaves ^A/^E unbound at the prompts.
+        let mut ed = search(true);
+        press(&mut ed, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut ed, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "1");
+        assert_eq!(answer(&ed), "1foo bar");
     }
 
     #[test]
