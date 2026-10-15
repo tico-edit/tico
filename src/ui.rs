@@ -770,7 +770,7 @@ fn handle_help_key(
     return_to: Option<Box<Prompt>>,
     key: KeyEvent,
 ) {
-    let body = &lines[1.min(lines.len())..];
+    let body = help_text_body(editor, &lines);
     let body_rows = help_body_rows(editor);
     let max_top = body.len().saturating_sub(body_rows);
     let mut top = top.min(max_top);
@@ -3630,6 +3630,7 @@ fn render_browser_screen(
         let title =
             crate::browser::title_line(&crate::browser::display_dir(&session.list.dir), cols);
         queue_bar_segment(out, title_bar_style(editor), &title)?;
+        render_emptyline(editor, out, cols)?;
     }
 
     if let Some(matches) = &editor.file_completions {
@@ -3738,6 +3739,7 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
     if text_start_row > 0 {
         queue!(out, MoveTo(0, 0))?;
         render_title_bar(editor, &mut out, cols)?;
+        render_emptyline(editor, &mut out, cols)?;
     }
 
     if let Some(matches) = &editor.file_completions {
@@ -3767,6 +3769,16 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
     out.flush()
 }
 
+/// `set emptyline`'s blank row below the title bar (row 1), when there is
+/// one (`Editor::emptyline_row`): plain, never title-colored, just like
+/// the unused second row of nano's two-row top window.
+fn render_emptyline(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Result<()> {
+    if editor.emptyline_row() > 0 {
+        queue!(out, MoveTo(0, 1), Print(" ".repeat(cols)))?;
+    }
+    Ok(())
+}
+
 /// The main editing screen's row layout (everything but `Mode::Help` /
 /// `Mode::Diff`, which have their own bespoke full-screen layout, and
 /// `set zero`, which hides all chrome and just needs `screen_rows`):
@@ -3774,7 +3786,8 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
 /// the two can never drift the way `Editor::text_rows` and `render`'s own
 /// row math once did.
 struct MainLayout {
-    /// 0 normally, 1 when `set minibar` drops the title bar.
+    /// 1 normally (below the title bar), 2 under `set emptyline`, 0 when
+    /// `set minibar` drops the title bar (`Editor::top_rows`).
     text_start_row: usize,
     /// Rows available to the buffer (or the `^R` tab-completion grid).
     text_rows: usize,
@@ -3786,7 +3799,7 @@ struct MainLayout {
 }
 
 fn main_screen_layout(editor: &Editor) -> MainLayout {
-    let text_start_row = if editor.options.minibar { 0 } else { 1 };
+    let text_start_row = editor.top_rows();
     let help_rows = if editor.options.nohelp { 0 } else { 2 };
     let text_rows = editor
         .screen_rows
@@ -3801,10 +3814,32 @@ fn main_screen_layout(editor: &Editor) -> MainLayout {
 }
 
 /// Number of rows available for the help viewer's scrollable body: the
-/// whole screen minus the title row and the (always-shown, regardless of
-/// `nohelp`) two-line shortcut bar.
+/// whole screen minus the title row (and `set emptyline`'s blank row below
+/// it) and the (always-shown, regardless of `nohelp`) two-line shortcut
+/// bar.
 fn help_body_rows(editor: &Editor) -> usize {
-    editor.screen_rows.saturating_sub(3).max(1)
+    editor
+        .screen_rows
+        .saturating_sub(3 + editor.emptyline_row())
+        .max(1)
+}
+
+/// The help viewer's scrollable body: everything after the title line,
+/// minus the body's leading blank line under `set emptyline` -- nano's
+/// help then starts its text right below the blank row, and can't be
+/// scrolled back up to that line either.
+fn help_text_body<'a>(editor: &Editor, lines: &'a [String]) -> &'a [String] {
+    let body = &lines[1.min(lines.len())..];
+    match body.first() {
+        Some(first) if first.is_empty() && editor.emptyline_row() > 0 => &body[1..],
+        _ => body,
+    }
+}
+
+/// The screen row the help/diff viewer's body starts on: below the title
+/// row, and below `set emptyline`'s blank row too.
+fn help_body_start(editor: &Editor) -> usize {
+    1 + editor.emptyline_row()
 }
 
 /// The `^G` help viewer takes over the whole screen: a centered,
@@ -3827,9 +3862,17 @@ fn render_help_screen(
         cols,
         lines.first().map(|s| s.as_str()).unwrap_or("Help"),
     )?;
-    let body = &lines[1.min(lines.len())..];
+    let body = help_text_body(editor, lines);
     let body_rows = help_body_rows(editor);
-    render_scrollable_body(out, cols, body, top, body_rows, None)?;
+    render_scrollable_body(
+        out,
+        cols,
+        body,
+        top,
+        help_body_start(editor),
+        body_rows,
+        None,
+    )?;
     let entries = resolve_shortcuts(&editor.keymap, Menu::Help, HELP_SHORTCUTS);
     render_shortcut_bar(editor, out, rows.saturating_sub(2) as u16, cols, &entries)?;
 
@@ -3844,7 +3887,7 @@ fn render_help_screen(
             .take(cursor.col)
             .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
             .sum();
-        let row = 1 + cursor.line - top;
+        let row = help_body_start(editor) + cursor.line - top;
         queue!(
             out,
             MoveTo(col.min(cols.saturating_sub(1)) as u16, row as u16),
@@ -3885,6 +3928,7 @@ fn render_diff_screen(
         cols,
         body,
         top,
+        help_body_start(editor),
         help_body_rows(editor),
         styles.as_deref(),
     )?;
@@ -3932,21 +3976,24 @@ fn render_centered_title_row(
     }
     let title_line: String = title_row.into_iter().collect();
     let style = title_bar_style(editor);
-    queue_bar_segment(out, style, &title_line)
+    queue_bar_segment(out, style, &title_line)?;
+    render_emptyline(editor, out, cols)
 }
 
 /// Draw `body_rows` rows of `body` starting at `top`, one screen row per
-/// line, below the title row — shared by the help and merge-diff viewers.
+/// line, from screen row `start_row` down — shared by the help and
+/// merge-diff viewers.
 fn render_scrollable_body(
     out: &mut impl Write,
     cols: usize,
     body: &[String],
     top: usize,
+    start_row: usize,
     body_rows: usize,
     styles: Option<&[Vec<Option<Style>>]>,
 ) -> io::Result<()> {
     for r in 0..body_rows {
-        queue!(out, MoveTo(0, 1 + r as u16))?;
+        queue!(out, MoveTo(0, (start_row + r) as u16))?;
         let idx = top + r;
         let text = body.get(idx).map(|s| s.as_str()).unwrap_or("");
         let chars: Vec<char> = text.chars().take(cols).collect();
@@ -8122,6 +8169,58 @@ mod tests {
         // at or near the end of the buffer.
         handle_click(&mut ed, 1 + 19, 79);
         assert_eq!(ed.buf().cursor.line, 100);
+    }
+
+    #[test]
+    fn emptyline_keeps_the_row_below_the_title_bar_blank_like_nano() {
+        // nano's window_init: toprows is 2 under EMPTY_LINE when LINES > 6,
+        // 0 under minibar/zero regardless.
+        let mut ed = test_editor("hello\n");
+        ed.screen_rows = 24;
+        ed.options.emptyline = true;
+        let layout = main_screen_layout(&ed);
+        assert_eq!(layout.text_start_row, 2);
+        assert_eq!(layout.text_rows, 19);
+        assert_eq!(layout.status_row, 21);
+        assert_eq!(ed.text_rows(), layout.text_rows);
+        assert_eq!((help_body_start(&ed), help_body_rows(&ed)), (2, 20));
+
+        // Too short a terminal: no blank row.
+        ed.screen_rows = 6;
+        assert_eq!(main_screen_layout(&ed).text_start_row, 1);
+        assert_eq!(ed.text_rows(), main_screen_layout(&ed).text_rows);
+        ed.screen_rows = 7;
+        assert_eq!(main_screen_layout(&ed).text_start_row, 2);
+
+        // minibar drops the whole top window, blank row included.
+        ed.screen_rows = 24;
+        ed.options.minibar = true;
+        assert_eq!(main_screen_layout(&ed).text_start_row, 0);
+        assert_eq!(ed.text_rows(), main_screen_layout(&ed).text_rows);
+    }
+
+    #[test]
+    fn emptyline_drops_the_help_texts_leading_blank_line_like_nano() {
+        let mut ed = test_editor("");
+        ed.screen_rows = 24;
+        let lines = crate::help::build(Menu::Main, &ed.keymap, 80, false);
+        assert_eq!(lines[1], "");
+        assert_eq!(help_text_body(&ed, &lines).len(), lines.len() - 1);
+        ed.options.emptyline = true;
+        let body = help_text_body(&ed, &lines);
+        assert_eq!(body.len(), lines.len() - 2);
+        assert!(!body[0].is_empty());
+    }
+
+    #[test]
+    fn mouse_click_under_emptyline_maps_rows_below_the_blank_line() {
+        let text: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        let mut ed = test_editor(&text);
+        ed.options.mouse = true;
+        ed.options.emptyline = true;
+        ed.screen_rows = 24;
+        handle_click(&mut ed, 2 + 3, 0);
+        assert_eq!(ed.buf().cursor.line, 3);
     }
 
     #[test]

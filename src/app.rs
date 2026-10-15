@@ -599,20 +599,35 @@ impl Editor {
         false
     }
 
+    /// Screen rows above the edit window: the title bar, plus the blank
+    /// line `set emptyline` keeps below it -- nano's `toprows` in
+    /// `window_init`, which grants that line only on a terminal taller than
+    /// six rows. None at all under `set minibar` or `set zero`.
+    pub fn top_rows(&self) -> usize {
+        if self.options.zero || self.options.minibar {
+            0
+        } else {
+            1 + self.emptyline_row()
+        }
+    }
+
+    /// 1 when `set emptyline` is in effect (the terminal is tall enough for
+    /// it), else 0 -- also used by the full-screen help viewer, whose title
+    /// row nano draws in the same top window.
+    pub fn emptyline_row(&self) -> usize {
+        usize::from(self.options.emptyline && self.screen_rows > 6)
+    }
+
     /// Number of rows available for buffer text (screen minus title bar,
-    /// status line, and the two-line shortcut help unless `nohelp`).
+    /// `emptyline`'s blank row, status line, and the two-line shortcut
+    /// help unless `nohelp`).
     pub fn text_rows(&self) -> usize {
-        let mut used = 2; // title bar + status/prompt/minibar line
-        if !self.options.nohelp {
-            used += 2;
-        }
         if self.options.zero {
-            used = 0;
-        } else if self.options.minibar {
-            // `set minibar` suppresses just the title bar row; the minibar
-            // itself takes over the status row, already counted above.
-            used -= 1;
+            return self.screen_rows.max(1);
         }
+        let help = if self.options.nohelp { 0 } else { 2 };
+        // The status/prompt/minibar line is always there.
+        let used = self.top_rows() + 1 + help;
         self.screen_rows.saturating_sub(used).max(1)
     }
 

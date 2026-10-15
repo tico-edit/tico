@@ -13,7 +13,6 @@ here.
 ### Display
 
 - [ ] `bookstyle`
-- [ ] `emptyline`
 - [ ] `rawsequences`
 - [ ] `afterends`
 
