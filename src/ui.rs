@@ -216,7 +216,37 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
             render_and_ring(editor)?;
         }
     }
+    #[cfg(windows)]
+    blank_footer_for_exit(editor)?;
     Ok(())
+}
+
+/// nano's `finish()`: blank the status bar and the shortcut rows, then
+/// leave the cursor in the bottom-left corner as curses' `endwin()` does.
+/// Windows-only: there, leaving the alternate screen can fail to restore
+/// the old screen, and without this the shell's prompt lands wherever the
+/// editor's cursor happened to be, in the middle of the stale UI. Unix
+/// terminals restore the old screen, so they're left alone.
+#[cfg(windows)]
+fn blank_footer_for_exit(editor: &Editor) -> io::Result<()> {
+    let rows = size().map_or(editor.screen_rows as u16, |(_, rows)| rows);
+    if rows == 0 {
+        return Ok(());
+    }
+    let footer = if editor.options.zero || editor.options.nohelp {
+        1
+    } else {
+        3
+    };
+    let mut out = io::stdout();
+    queue!(out, SetAttribute(Attribute::Reset))?;
+    for row in rows.saturating_sub(footer)..rows {
+        // Clearing rather than printing spaces: filling the last cell of
+        // the bottom row scrolls some consoles.
+        queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    queue!(out, MoveTo(0, rows - 1))?;
+    out.flush()
 }
 
 /// (De)activate the terminal's mouse-tracking mode to match
