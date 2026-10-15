@@ -549,6 +549,14 @@ impl Editor {
         self.message_posted = true;
     }
 
+    /// nano's AHEM-importance message followed by `set_blankdelay_to_one`
+    /// (as `unbound_key` does): colored like `set_status_mild`, but gone
+    /// after the very next keystroke.
+    pub fn set_status_brief(&mut self, msg: impl Into<String>) {
+        self.set_status_mild(msg);
+        self.status_countdown = 1;
+    }
+
     /// Highlight a plain search match, auto-clearing after ~1.5s (0.8s with
     /// quickblank) of no further input.
     fn set_spotlight_timed(&mut self, pos: Pos, len: usize) {

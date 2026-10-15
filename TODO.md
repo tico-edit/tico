@@ -25,3 +25,9 @@ here.
 - [ ] `zap` (the setting: Backspace/Delete erase the marked region)
 - [ ] `colonparsing`
 - [ ] `rebinddelete`
+
+## Help viewer
+
+- [ ] Searching the help text: `^W`/`w`/`/` (Where Is), `M-W`/`n` and
+      `M-Q`/`N` (next/previous match). nano's help viewer offers these;
+      tico's ignores them.

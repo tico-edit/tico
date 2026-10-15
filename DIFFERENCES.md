@@ -124,6 +124,12 @@ in the same order as nano's (capped at the count nano would show for
 the screen width), but laid out with tico's usual column sizing, so at
 80 columns it shows eight of nano's twelve.
 
+## `^K` reports "Cut"
+
+Cutting a line or the marked text with `^K` (Cut) shows `[ Cut ]` on
+the status bar, where nano cuts silently. This is deliberate: tico keeps
+the message. `M-T` (cut to end of file) stays silent, as in nano.
+
 ## Comment toggle: cursor after removing a postfix
 
 For a bracketing comment sequence such as HTML's `<!--|-->`, uncommenting

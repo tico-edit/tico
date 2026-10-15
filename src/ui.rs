@@ -454,6 +454,15 @@ fn replay_macro(editor: &mut Editor) {
 }
 
 fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
+    let was_help = matches!(editor.mode, Mode::Help { .. });
+    dispatch_key_by_mode(editor, key);
+    // Opening the help viewer blanks the status bar, as nano's does.
+    if !was_help && matches!(editor.mode, Mode::Help { .. }) {
+        editor.status = None;
+    }
+}
+
+fn dispatch_key_by_mode(editor: &mut Editor, key: KeyEvent) {
     match std::mem::replace(&mut editor.mode, Mode::Editing) {
         Mode::Editing => {
             editor.mode = Mode::Editing;
@@ -484,6 +493,9 @@ fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
             cursor,
             return_to,
         } => {
+            // nano's help loop reads keys with get_kbinput() too, so its
+            // message countdown ticks here as well.
+            editor.tick_status_countdown();
             handle_help_key(editor, lines, top, cursor, return_to, key);
         }
         Mode::Diff {
@@ -777,12 +789,28 @@ fn handle_help_key(
     let mut cursor = cursor;
     let mut close = false;
 
+    let tkey = normalize_key(key);
+    // nano's `interpret`: in the help viewer (as in the browser) a few
+    // plain letters work too. Its search letters (`w`, `/`, `n`, `N`) do
+    // nothing here, since tico's help has no search, but aren't reported
+    // as unbound either.
+    let action = match browser_plain_key(key) {
+        Some(Action::Exit) => Some(Action::Cancel),
+        Some(a @ (Action::PageUp | Action::PageDown)) => Some(a),
+        Some(Action::WhereIs | Action::FindNext | Action::FindPrevious) => None,
+        _ => match tkey.and_then(|k| editor.keymap.lookup_menu_only(Menu::Help, k)) {
+            Some(Binding::Action(a)) => Some(*a),
+            _ => {
+                if let Some(msg) = unbound_key_message(editor, key, tkey) {
+                    editor.set_status_brief(msg);
+                }
+                None
+            }
+        },
+    };
     if matches!(key.code, KeyCode::Esc) {
         close = true;
-    } else if let Some(tkey) = normalize_key(key)
-        && let Some(Binding::Action(action)) =
-            editor.keymap.lookup_menu_only(Menu::Help, tkey).cloned()
-    {
+    } else if let Some(action) = action {
         if action == Action::Cancel {
             close = true;
         } else if editor.options.showcursor {
@@ -791,8 +819,9 @@ fn handle_help_key(
             match action {
                 Action::Up => top = top.saturating_sub(1),
                 Action::Down => top = (top + 1).min(max_top),
-                Action::PageUp => top = top.saturating_sub(body_rows),
-                Action::PageDown => top = (top + body_rows).min(max_top),
+                // nano's do_page_up/do_page_down: all but two rows.
+                Action::PageUp => top = top.saturating_sub(page_rows(body_rows)),
+                Action::PageDown => top = (top + page_rows(body_rows)).min(max_top),
                 Action::FirstLine => top = 0,
                 Action::LastLine => top = max_top,
                 _ => {}
@@ -823,6 +852,12 @@ fn handle_help_key(
 /// cursor "almost one screenful" (all but two rows) keeping it on the
 /// same screen row, or, when that would run off an end, to the first/last
 /// line (nano's `do_page_up`/`do_page_down`).
+/// How far a Page Up/Down moves in a `rows`-row viewer: nano's
+/// `mustmove`, all but two rows (at least one).
+fn page_rows(rows: usize) -> usize {
+    if rows < 3 { 1 } else { rows - 2 }
+}
+
 fn move_help_cursor(
     body: &[String],
     top: &mut usize,
@@ -836,7 +871,7 @@ fn move_help_cursor(
     let last = body.len() - 1;
     let max_top = body.len().saturating_sub(rows);
     let len = |line: usize| body[line].chars().count();
-    let mustmove = if rows < 3 { 1 } else { rows - 2 };
+    let mustmove = page_rows(rows);
     cursor.line = cursor.line.min(last);
     cursor.col = cursor.col.min(len(cursor.line));
 
@@ -971,6 +1006,8 @@ fn handle_editing_key(editor: &mut Editor, key: KeyEvent) {
             // long line, horizontally) after an action.
             editor.scroll_to_cursor();
         }
+    } else if let Some(msg) = unbound_key_message(editor, key, tkey) {
+        editor.set_status_brief(msg);
     }
     editor.maybe_update_lock_modified_flag();
 
@@ -3160,6 +3197,49 @@ fn control_code(c: char) -> char {
     }
 }
 
+/// nano's `unbound_key`: the status-bar diagnostic for a keystroke that
+/// does nothing in the main editor or the help viewer, worded as nano
+/// words it -- `M-X`/`Sh-M-X` (per `KeyMap::fold_key`), `^X` and `FN` are
+/// named, Ctrl+Alt+letter is "Unbindable", Ctrl/Alt+Fn an "Unknown
+/// sequence", and any other special key just "Unbound key". `None` for a
+/// keystroke nano doesn't report (a lone Esc, which only starts a Meta
+/// sequence there) or that isn't a key press tico knows (lock, media and
+/// bare modifier keys).
+fn unbound_key_message(editor: &Editor, key: KeyEvent, tkey: Option<TKey>) -> Option<String> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let named = |name: String| Some(format!("Unbound key: {name}"));
+    match tkey.map(|k| editor.keymap.fold_key(k)) {
+        // nano names these by their raw codes: NUL is `^@`, and a Meta
+        // Space prints its space.
+        Some(TKey::Ctrl(' ')) => named("^@".to_string()),
+        Some(TKey::Meta(' ')) => named("M- ".to_string()),
+        Some(k @ (TKey::Ctrl(_) | TKey::Meta(_) | TKey::ShiftMeta(_) | TKey::F(_))) => {
+            named(k.describe())
+        }
+        Some(_) => Some("Unbound key".to_string()),
+        None => match key.code {
+            KeyCode::Char(c) if ctrl && alt && c.is_ascii_alphabetic() => {
+                Some(format!("Unbindable key: M-^{}", c.to_ascii_uppercase()))
+            }
+            KeyCode::F(_) => Some("Unknown sequence".to_string()),
+            KeyCode::Char(c) if !ctrl && !alt => named(c.to_string()),
+            KeyCode::Char(_)
+            | KeyCode::Insert
+            | KeyCode::Delete
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down => Some("Unbound key".to_string()),
+            _ => None,
+        },
+    }
+}
+
 fn normalize_key(key: KeyEvent) -> Option<TKey> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -3189,6 +3269,9 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
         KeyCode::End if alt => Some(TKey::MetaEnd),
         KeyCode::Home => Some(TKey::Home),
         KeyCode::End => Some(TKey::End),
+        // Ctrl+PgUp/PgDn have no key of their own; rather than run the
+        // plain PgUp/PgDn, report them unbound as nano does.
+        KeyCode::PageUp | KeyCode::PageDown if ctrl => None,
         KeyCode::PageUp if alt => Some(TKey::MetaPgUp),
         KeyCode::PageDown if alt => Some(TKey::MetaPgDn),
         KeyCode::PageUp => Some(TKey::PageUp),
@@ -3197,9 +3280,17 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
         KeyCode::Delete if ctrl => Some(TKey::CtrlDel),
         KeyCode::Delete if alt => Some(TKey::MetaDel),
         KeyCode::Delete => Some(TKey::Ctrl('D')),
+        KeyCode::Insert if ctrl => None,
         KeyCode::Insert if alt => Some(TKey::MetaIns),
         KeyCode::Insert => Some(TKey::Ins),
+        // nano knows Ctrl/Alt+Fn only as an "Unknown sequence", and
+        // Shift+F1..F12 as F13..F24 (the xterm convention ncurses uses).
+        KeyCode::F(_) if ctrl || alt => None,
+        KeyCode::F(n) if shift && n <= 12 => Some(TKey::F(n + 12)),
         KeyCode::F(n) => Some(TKey::F(n)),
+        // Ctrl+Alt+letter is nano's unbindable `M-^X` (see
+        // `unbound_key_message`), not plain `^X`.
+        KeyCode::Char(c) if ctrl && alt && c.is_ascii_alphabetic() => None,
         KeyCode::Char(c) if ctrl => {
             // crossterm's unix parser reports Ctrl+\, Ctrl+], Ctrl+^ and
             // Ctrl+_ (raw bytes 0x1C-0x1F) as Char('4')..Char('7') with
@@ -3818,13 +3909,25 @@ fn main_screen_layout(editor: &Editor) -> MainLayout {
 
 /// Number of rows available for the help viewer's scrollable body: the
 /// whole screen minus the title row (and `set emptyline`'s blank row below
-/// it) and the (always-shown, regardless of `nohelp`) two-line shortcut
-/// bar.
+/// it), the status row, and the (always-shown, regardless of `nohelp`)
+/// two-line shortcut bar -- nano's help text fills its edit window.
 fn help_body_rows(editor: &Editor) -> usize {
     editor
         .screen_rows
-        .saturating_sub(3 + editor.emptyline_row())
+        .saturating_sub(4 + editor.emptyline_row())
         .max(1)
+}
+
+/// The help/diff viewer's status row, between the body and the shortcut
+/// bar: a message such as "Unbound key: M-1" when there is one, else
+/// blank (never the minibar).
+fn render_viewer_status(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Result<()> {
+    let row = editor.screen_rows.saturating_sub(3) as u16;
+    if editor.status.is_some() {
+        render_status_line(editor, out, row, cols)
+    } else {
+        queue!(out, MoveTo(0, row), Print(" ".repeat(cols)))
+    }
 }
 
 /// The help viewer's scrollable body: everything after the title line,
@@ -3876,6 +3979,7 @@ fn render_help_screen(
         body_rows,
         None,
     )?;
+    render_viewer_status(editor, out, cols)?;
     let entries = resolve_shortcuts(&editor.keymap, Menu::Help, HELP_SHORTCUTS);
     render_shortcut_bar(editor, out, rows.saturating_sub(2) as u16, cols, &entries)?;
 
@@ -3936,6 +4040,7 @@ fn render_diff_screen(
         styles.as_deref(),
     )?;
 
+    render_viewer_status(editor, out, cols)?;
     let entries = diff_shortcut_entries(outcome);
     render_shortcut_bar(editor, out, rows.saturating_sub(2) as u16, cols, &entries)
 }
@@ -8186,7 +8291,7 @@ mod tests {
         assert_eq!(layout.text_rows, 19);
         assert_eq!(layout.status_row, 21);
         assert_eq!(ed.text_rows(), layout.text_rows);
-        assert_eq!((help_body_start(&ed), help_body_rows(&ed)), (2, 20));
+        assert_eq!((help_body_start(&ed), help_body_rows(&ed)), (2, 19));
 
         // Too short a terminal: no blank row.
         ed.screen_rows = 6;
@@ -8394,6 +8499,87 @@ mod tests {
         ] {
             let ev = key_to_event(key);
             assert_eq!(normalize_key(ev), Some(key), "{key:?}");
+        }
+    }
+
+    /// The status message after pressing `code`+`modifiers` in a fresh
+    /// editor, and whether it's still there one more keystroke later.
+    fn unbound_report(
+        ed: &mut Editor,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> (Option<String>, bool) {
+        press(ed, code, modifiers);
+        let msg = ed.status.clone();
+        press(ed, KeyCode::Right, KeyModifiers::NONE);
+        (msg, ed.status.is_some())
+    }
+
+    #[test]
+    fn unbound_keys_report_themselves_as_nano_words_it() {
+        // Each checked against nano's own message in tmux.
+        use KeyModifiers as M;
+        let ctrl_alt = M::CONTROL | M::ALT;
+        for (code, modifiers, want) in [
+            (KeyCode::Char('1'), M::ALT, "Unbound key: M-1"),
+            (KeyCode::Char('@'), M::ALT, "Unbound key: M-@"),
+            (KeyCode::Char('a'), ctrl_alt, "Unbindable key: M-^A"),
+            (KeyCode::Char('z'), ctrl_alt, "Unbindable key: M-^Z"),
+            (KeyCode::Insert, M::CONTROL, "Unbound key"),
+            (KeyCode::Insert, ctrl_alt, "Unbound key"),
+            (KeyCode::PageUp, M::CONTROL, "Unbound key"),
+            (KeyCode::F(1), M::ALT, "Unknown sequence"),
+            (KeyCode::F(1), M::CONTROL, "Unknown sequence"),
+            (KeyCode::F(3), M::SHIFT, "Unbound key: F15"),
+        ] {
+            let mut ed = test_editor("one\ntwo\n");
+            let (msg, lingers) = unbound_report(&mut ed, code, modifiers);
+            assert_eq!(msg.as_deref(), Some(want), "{code:?} {modifiers:?}");
+            assert!(!lingers, "{want} is gone after the next key");
+            assert_eq!(ed.buf().line(0), "one", "{want} did nothing else");
+            assert!(!ed.buf().modified, "{want} did nothing else");
+        }
+        // A lone Esc only starts a Meta sequence in nano: no message.
+        let mut ed = test_editor("one\n");
+        press(&mut ed, KeyCode::Esc, M::NONE);
+        assert_eq!(ed.status, None);
+    }
+
+    #[test]
+    fn help_viewer_reports_unbound_keys_and_takes_nanos_plain_letters() {
+        let open = || {
+            let mut ed = test_editor("one\n");
+            ed.screen_rows = 12;
+            press(&mut ed, KeyCode::Char('g'), KeyModifiers::CONTROL);
+            assert!(matches!(ed.mode, Mode::Help { .. }));
+            assert_eq!(ed.status, None, "opening help blanks the status bar");
+            ed
+        };
+        let top = |ed: &Editor| match &ed.mode {
+            Mode::Help { top, .. } => *top,
+            _ => panic!("help closed"),
+        };
+        for (c, want) in [('s', "Unbound key: s"), ('?', "Unbound key: ?")] {
+            let mut ed = open();
+            press(&mut ed, KeyCode::Char(c), KeyModifiers::NONE);
+            assert_eq!(ed.status.as_deref(), Some(want));
+        }
+        let mut ed = open();
+        press(&mut ed, KeyCode::Char('1'), KeyModifiers::ALT);
+        assert_eq!(ed.status.as_deref(), Some("Unbound key: M-1"));
+        // 8 body rows on a 12-row screen; a page is all but two of them.
+        press(&mut ed, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(top(&ed), 6);
+        assert_eq!(ed.status, None, "the message lasts one keystroke");
+        press(&mut ed, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(top(&ed), 0);
+        // The search letters do nothing (tico's help has no search).
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::NONE);
+        assert_eq!(ed.status, None);
+        for c in ['x', 'q', 'E'] {
+            let mut ed = open();
+            press(&mut ed, KeyCode::Char(c), KeyModifiers::NONE);
+            assert!(matches!(ed.mode, Mode::Editing), "{c} closes help");
         }
     }
 
