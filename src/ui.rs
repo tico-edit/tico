@@ -9,8 +9,8 @@ use crate::keymap::{Action, Binding, Key as TKey, KeyMap, Menu};
 use crate::theme::{Style, print_styled};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::style::{
     Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -30,6 +30,7 @@ impl RawModeGuard {
     fn new() -> io::Result<RawModeGuard> {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        set_bracketed_paste(true);
         Ok(RawModeGuard)
     }
 }
@@ -38,6 +39,7 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         // Harmless even if mouse capture was never turned on -- terminals
         // silently ignore a mode-reset escape they weren't in.
+        set_bracketed_paste(false);
         let _ = execute!(
             io::stdout(),
             DisableMouseCapture,
@@ -46,6 +48,20 @@ impl Drop for RawModeGuard {
         );
         let _ = disable_raw_mode();
     }
+}
+
+/// Ask the terminal to bracket a paste with markers (or stop asking), as
+/// nano does at startup and undoes whenever it hands the terminal back,
+/// so a paste arrives as one `Event::Paste` instead of a stream of
+/// keystrokes whose newlines would each be an auto-indenting Enter. A
+/// terminal that can't (e.g. the legacy Windows console) just keeps
+/// sending keystrokes.
+fn set_bracketed_paste(on: bool) {
+    let _ = if on {
+        execute!(io::stdout(), EnableBracketedPaste)
+    } else {
+        execute!(io::stdout(), DisableBracketedPaste)
+    };
 }
 
 /// Keeps a `watch::FileWatcher` pointed at whichever file the current
@@ -129,6 +145,10 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
                     }
                     Event::Mouse(mev) => {
                         handle_mouse(editor, mev);
+                        dirty = true;
+                    }
+                    Event::Paste(text) => {
+                        handle_paste(editor, &text);
                         dirty = true;
                     }
                     Event::Resize(cols, rows) => {
@@ -364,6 +384,57 @@ fn handle_key(editor: &mut Editor, key: KeyEvent) {
     if std::mem::take(&mut editor.macros.run_pending) {
         replay_macro(editor);
     }
+}
+
+/// A bracketed paste (see `set_bracketed_paste`), which nano reads as a
+/// single keystroke. In the edit window the text goes in verbatim
+/// (`Editor::paste_from_terminal`); at a text prompt only its printable
+/// characters are kept -- newlines, Tabs and other control characters are
+/// dropped, as the installed nano does. Elsewhere it's ignored.
+fn handle_paste(editor: &mut Editor, text: &str) {
+    editor.begin_keystroke();
+    // A pending `M-V` is given up on rather than fed the paste's first
+    // character.
+    if editor.verbatim.take().is_some() && matches!(editor.mode, Mode::Editing) {
+        editor.status = None;
+    }
+    match std::mem::replace(&mut editor.mode, Mode::Editing) {
+        Mode::Editing => {
+            editor.tick_status_countdown();
+            editor.clear_spotlight();
+            editor.minibar_note = None;
+            editor.paste_from_terminal(text);
+        }
+        Mode::Prompt(mut prompt) => {
+            let choice = matches!(
+                prompt.kind,
+                PromptKind::Exit { .. }
+                    | PromptKind::WriteConfirm { .. }
+                    | PromptKind::ExternalChangeConflict
+                    | PromptKind::LockConflict { .. }
+                    | PromptKind::ReplaceConfirm(_)
+                    | PromptKind::Linter { .. }
+            );
+            if !choice && !write_name_locked(editor, &prompt) {
+                editor.file_completions = None;
+                let idx = prompt
+                    .input
+                    .char_indices()
+                    .nth(prompt.cursor)
+                    .map(|(i, _)| i)
+                    .unwrap_or(prompt.input.len());
+                let kept: String = text.chars().filter(|c| !c.is_control()).collect();
+                prompt.input.insert_str(idx, &kept);
+                prompt.cursor += kept.chars().count();
+                prompt.history_pos = None;
+                prompt.saved_input = None;
+            }
+            editor.mode = Mode::Prompt(prompt);
+        }
+        other => editor.mode = other,
+    }
+    editor.ensure_magic_line();
+    editor.end_keystroke();
 }
 
 /// `M-;`: nano's `run_macro` puts the recorded key codes back into its
@@ -2254,6 +2325,7 @@ fn write_temp_file(text: &str) -> io::Result<std::path::PathBuf> {
 /// repaint, since the program may have written anything to the screen)
 /// once it exits.
 fn run_suspended(mut cmd: std::process::Command) -> io::Result<std::process::ExitStatus> {
+    set_bracketed_paste(false);
     execute!(io::stdout(), Show, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     let result = cmd.status();
@@ -2264,6 +2336,7 @@ fn run_suspended(mut cmd: std::process::Command) -> io::Result<std::process::Exi
         Hide,
         Clear(ClearType::All)
     );
+    set_bracketed_paste(true);
     result
 }
 
@@ -2285,6 +2358,7 @@ fn suspend_editor(editor: &mut Editor) {
     // nano comes back with a blank status bar (its `lastmessage = HUSH`),
     // not whatever was showing before the ^T prompt replaced it.
     editor.status = None;
+    set_bracketed_paste(false);
     let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     println!("\n\nUse \"fg\" to return to tico.");
@@ -2304,6 +2378,7 @@ fn suspend_editor(editor: &mut Editor) {
         Hide,
         Clear(ClearType::All)
     );
+    set_bracketed_paste(true);
     if let Ok((cols, rows)) = size() {
         editor.screen_cols = cols as usize;
         editor.screen_rows = rows as usize;

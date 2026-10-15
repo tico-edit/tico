@@ -1509,6 +1509,42 @@ impl Editor {
         self.scroll_to_cursor();
     }
 
+    /// A paste the terminal delivered in one piece (bracketed paste):
+    /// nano's `suck_up_input_and_paste_it`. The text goes in exactly as
+    /// it came -- no auto-indentation, Tabs left as Tabs whatever
+    /// `tabstospaces` says -- as a single undo step, so pasting indented
+    /// code doesn't pile the autoindent on top of the code's own
+    /// indentation. A CR, LF or CR LF breaks the line; other control
+    /// characters are dropped with a beep.
+    pub fn paste_from_terminal(&mut self, text: &str) {
+        if self.options.view {
+            self.set_status_mild("Key is invalid in view mode");
+            return;
+        }
+        let mut clean = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    chars.next_if_eq(&'\n');
+                    clean.push('\n');
+                }
+                '\n' | '\t' => clean.push(c),
+                c if c.is_control() => self.bell_pending = true,
+                c => clean.push(c),
+            }
+        }
+        self.cycling_aim = 0;
+        self.completion = None;
+        self.buf_mut().insert_str(&clean);
+        if self.buf().softmark {
+            self.buf_mut().mark = None;
+            self.buf_mut().softmark = false;
+        }
+        self.maybe_update_lock_modified_flag();
+        self.scroll_to_cursor();
+    }
+
     fn do_enter(&mut self) {
         let indent = if self.options.autoindent {
             let line = self.buf().line(self.buf().cursor.line);
@@ -6234,6 +6270,29 @@ mod tests {
         assert_eq!(ed.buf().line(0), "a\t\r\x1b\0b");
         assert_eq!(ed.buf().line_count(), 1);
         assert_eq!(ed.buf().cursor, Pos::new(0, 5));
+    }
+
+    #[test]
+    fn terminal_paste_goes_in_verbatim_without_autoindent_as_one_undo() {
+        let mut ed = test_editor("    x\n");
+        ed.options.autoindent = true;
+        ed.options.tabstospaces = true;
+        ed.buf_mut().cursor = Pos::new(0, 5);
+        ed.paste_from_terminal("{\r  a\r\n\tb\x01\n}");
+        assert_eq!(ed.buf().rope.to_string(), "    x{\n  a\n\tb\n}\n");
+        assert_eq!(ed.buf().cursor, Pos::new(3, 1));
+        assert!(ed.bell_pending, "the ^A is dropped with a beep");
+        ed.execute(Action::Undo);
+        assert_eq!(ed.buf().rope.to_string(), "    x\n");
+    }
+
+    #[test]
+    fn terminal_paste_is_refused_in_view_mode() {
+        let mut ed = test_editor("ab");
+        ed.options.view = true;
+        ed.paste_from_terminal("zz");
+        assert_eq!(ed.buf().rope.to_string(), "ab");
+        assert_eq!(ed.status.as_deref(), Some("Key is invalid in view mode"));
     }
 
     #[test]
