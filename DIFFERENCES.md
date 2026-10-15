@@ -154,3 +154,15 @@ xterm, but not where it doesn't: under tmux or screen, for example, Home
 sends `^[[1~`, which nano inserts and tico renders as `^[[H`. Plain
 characters, control codes, Tab, Enter, Backspace, Esc and Alt-combinations
 come out exactly as in nano, as does Unicode input by hex code.
+
+## Bracketed paste: CR LF, macros and `M-V`
+
+Like nano, tico asks the terminal for bracketed paste and inserts a
+paste verbatim (no autoindent, Tabs kept, one undo step). Three corners
+differ. A CR LF pair in the pasted text breaks the line once, where
+nano's `suck_up_input_and_paste_it` treats the CR and the LF as two line
+breaks. A paste made while recording a macro (`M-:`) is not recorded,
+since tico's macros are a list of decoded keys and a paste isn't one. A
+paste right after `M-V` cancels the pending verbatim input and goes in
+as a normal paste, rather than feeding its first raw bytes to `M-V` as
+nano does.
