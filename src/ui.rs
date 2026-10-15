@@ -454,6 +454,16 @@ fn replay_macro(editor: &mut Editor) {
 }
 
 fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
+    // (Its own Search prompt doesn't leave the help viewer.)
+    let was_help = matches!(editor.mode, Mode::Help { .. }) || editor.help_session.is_some();
+    dispatch_key_by_mode(editor, key);
+    // Opening the help viewer blanks the status bar, as nano's does.
+    if !was_help && matches!(editor.mode, Mode::Help { .. }) {
+        editor.status = None;
+    }
+}
+
+fn dispatch_key_by_mode(editor: &mut Editor, key: KeyEvent) {
     match std::mem::replace(&mut editor.mode, Mode::Editing) {
         Mode::Editing => {
             editor.mode = Mode::Editing;
@@ -484,6 +494,12 @@ fn dispatch_key(editor: &mut Editor, key: KeyEvent) {
             cursor,
             return_to,
         } => {
+            // nano's help loop reads keys with get_kbinput() too, so its
+            // message countdown ticks here as well; and like there, a
+            // search match's spotlight and cursor last one keystroke.
+            editor.tick_status_countdown();
+            editor.clear_spotlight();
+            editor.help_found = false;
             handle_help_key(editor, lines, top, cursor, return_to, key);
         }
         Mode::Diff {
@@ -566,6 +582,10 @@ fn dispatch_mouse(editor: &mut Editor, mev: MouseEvent) {
 /// layout (`main_screen_layout`); the full-screen Help and Diff viewers
 /// only expose their own bottom shortcut bar.
 fn handle_click(editor: &mut Editor, row: usize, col: usize) {
+    // The help viewer's Search prompt takes no clicks.
+    if editor.help_session.is_some() {
+        return;
+    }
     if editor.browser.is_some() && matches!(&editor.mode, Mode::Browser | Mode::Prompt(_)) {
         handle_browser_click(editor, row, col);
         return;
@@ -721,7 +741,7 @@ fn synthetic_key_event_for_label(label: &str) -> Option<KeyEvent> {
 fn key_to_event(key: TKey) -> KeyEvent {
     let (code, modifiers) = match key {
         TKey::Ctrl(c) => (KeyCode::Char(c.to_ascii_lowercase()), KeyModifiers::CONTROL),
-        TKey::Meta(c) => (KeyCode::Char(c), KeyModifiers::ALT),
+        TKey::Meta(c) => (KeyCode::Char(c.to_ascii_lowercase()), KeyModifiers::ALT),
         TKey::ShiftMeta(c) => (KeyCode::Char(c), KeyModifiers::ALT | KeyModifiers::SHIFT),
         TKey::F(n) => (KeyCode::F(n), KeyModifiers::NONE),
         TKey::Ins => (KeyCode::Insert, KeyModifiers::NONE),
@@ -770,32 +790,112 @@ fn handle_help_key(
     return_to: Option<Box<Prompt>>,
     key: KeyEvent,
 ) {
-    let body = &lines[1.min(lines.len())..];
+    let body = help_text_body(editor, &lines);
     let body_rows = help_body_rows(editor);
     let max_top = body.len().saturating_sub(body_rows);
     let mut top = top.min(max_top);
     let mut cursor = cursor;
     let mut close = false;
 
+    let tkey = normalize_key(key);
+    // nano's `interpret`: in the help viewer (as in the browser) a few
+    // plain letters work too -- `x`/`q`/`e` close, `b`/`-` and Space page,
+    // `w`/`/` search, `n`/`N` find the next/previous match.
+    let action = match browser_plain_key(key) {
+        Some(Action::Exit) => Some(Action::Cancel),
+        Some(
+            a @ (Action::PageUp
+            | Action::PageDown
+            | Action::WhereIs
+            | Action::FindNext
+            | Action::FindPrevious),
+        ) => Some(a),
+        _ => match tkey.and_then(|k| editor.keymap.lookup_menu_only(Menu::Help, k)) {
+            Some(Binding::Action(a)) => Some(*a),
+            _ => {
+                if let Some(msg) = unbound_key_message(editor, key, tkey) {
+                    editor.set_status_brief(msg);
+                }
+                None
+            }
+        },
+    };
     if matches!(key.code, KeyCode::Esc) {
         close = true;
-    } else if let Some(tkey) = normalize_key(key)
-        && let Some(Binding::Action(action)) =
-            editor.keymap.lookup_menu_only(Menu::Help, tkey).cloned()
-    {
-        if action == Action::Cancel {
-            close = true;
-        } else if editor.options.showcursor {
-            move_help_cursor(body, &mut top, &mut cursor, action, body_rows);
-        } else {
-            match action {
-                Action::Up => top = top.saturating_sub(1),
-                Action::Down => top = (top + 1).min(max_top),
-                Action::PageUp => top = top.saturating_sub(body_rows),
-                Action::PageDown => top = (top + body_rows).min(max_top),
-                Action::FirstLine => top = 0,
-                Action::LastLine => top = max_top,
-                _ => {}
+    } else if let Some(action) = action {
+        match action {
+            Action::Cancel => close = true,
+            // nano's do_search_forward/do_search_backward: the Search
+            // prompt, over the help text parked in `help_session`.
+            Action::WhereIs | Action::WhereWas => {
+                let forwards = action == Action::WhereIs;
+                editor.help_session = Some(crate::app::HelpSession {
+                    lines,
+                    top,
+                    cursor,
+                    return_to,
+                });
+                editor.mode = Mode::Prompt(Prompt {
+                    kind: PromptKind::HelpSearch { forwards },
+                    menu: Menu::FindInHelp,
+                    label: browser_search_label(editor, forwards),
+                    input: String::new(),
+                    cursor: 0,
+                    history_pos: None,
+                    saved_input: None,
+                });
+                return;
+            }
+            // nano's do_findnext/do_findprevious, with the newest search
+            // history entry standing in when nothing was searched for yet.
+            Action::FindNext | Action::FindPrevious => {
+                if editor.search.last_pattern.is_none() {
+                    editor.search.last_pattern = editor.history.search.last().cloned();
+                }
+                match editor.search.last_pattern.clone() {
+                    Some(needle) => {
+                        editor.status = None;
+                        let forwards = action == Action::FindNext;
+                        help_find(editor, body, &mut top, &mut cursor, &needle, forwards);
+                    }
+                    None => editor.set_status_mild("No current search pattern"),
+                }
+            }
+            Action::Refresh => {}
+            _ if editor.options.showcursor => {
+                move_help_cursor(body, &mut top, &mut cursor, action, body_rows);
+            }
+            _ => {
+                let was_top = top;
+                match action {
+                    Action::Up => top = top.saturating_sub(1),
+                    // nano's do_scroll_down: only while the last line is
+                    // below the screen.
+                    Action::Down if top < max_top => top += 1,
+                    // nano's do_page_up/do_page_down: all but two rows.
+                    Action::PageUp => top = top.saturating_sub(page_rows(body_rows)),
+                    Action::PageDown => top = (top + page_rows(body_rows)).min(max_top.max(top)),
+                    Action::FirstLine => {
+                        top = 0;
+                        cursor = HelpCursor::default();
+                    }
+                    Action::LastLine => {
+                        top = max_top;
+                        cursor = HelpCursor {
+                            line: body.len().saturating_sub(1),
+                            col: 0,
+                            want: 0,
+                        };
+                    }
+                    _ => {}
+                }
+                // The hidden cursor still goes along, as nano's does, so
+                // that a search starts from where it would in nano: a
+                // page keeps its screen row, a scroll only pushes it.
+                if matches!(action, Action::PageUp | Action::PageDown) {
+                    cursor.line = (cursor.line + top).saturating_sub(was_top);
+                }
+                keep_help_cursor_in_view(body, top, body_rows, &mut cursor);
             }
         }
     }
@@ -823,6 +923,77 @@ fn handle_help_key(
 /// cursor "almost one screenful" (all but two rows) keeping it on the
 /// same screen row, or, when that would run off an end, to the first/last
 /// line (nano's `do_page_up`/`do_page_down`).
+/// Keep the help viewer's hidden cursor on screen after the view moved,
+/// on its wanted column (nano's `placewewant`) as far as the line allows.
+fn keep_help_cursor_in_view(body: &[String], top: usize, rows: usize, cursor: &mut HelpCursor) {
+    let last = body.len().saturating_sub(1);
+    let line = cursor
+        .line
+        .clamp(top, (top + rows).saturating_sub(1))
+        .min(last);
+    if line != cursor.line {
+        cursor.line = line;
+        let len = body.get(line).map_or(0, |l| l.chars().count());
+        cursor.col = cursor.want.min(len);
+    }
+}
+
+/// nano's `go_looking` in the help viewer: find `needle` from the cursor
+/// -- case-insensitively and literally, as help always searches -- put
+/// the cursor on it (shown until the next keystroke, nano's `didfind`),
+/// center it if it's off screen, and spotlight it.
+fn help_find(
+    editor: &mut Editor,
+    body: &[String],
+    top: &mut usize,
+    cursor: &mut HelpCursor,
+    needle: &str,
+    forwards: bool,
+) {
+    let buf = crate::buffer::Buffer::from_text(&body.join("\n"), None);
+    let was = Pos::new(cursor.line, cursor.col);
+    match crate::app::find_in_lines(&buf, was, needle, !forwards, false, false) {
+        Some((pos, len, wrapped)) => {
+            *cursor = HelpCursor {
+                line: pos.line,
+                col: pos.col,
+                want: pos.col,
+            };
+            let rows = help_body_rows(editor);
+            if pos.line < *top || pos.line >= *top + rows {
+                *top = pos.line.saturating_sub(rows / 2);
+            }
+            editor.set_spotlight_timed(pos, len);
+            editor.help_found = true;
+            if pos == was {
+                editor.set_status("This is the only occurrence");
+            } else if wrapped {
+                editor.set_status("Search Wrapped");
+            }
+        }
+        None => editor.set_status_mild(format!("\"{needle}\" not found")),
+    }
+}
+
+/// Leave the help viewer's Search prompt for the help text it covered.
+fn return_to_help(editor: &mut Editor) {
+    editor.mode = match editor.help_session.take() {
+        Some(h) => Mode::Help {
+            lines: h.lines,
+            top: h.top,
+            cursor: h.cursor,
+            return_to: h.return_to,
+        },
+        None => Mode::Editing,
+    };
+}
+
+/// How far a Page Up/Down moves in a `rows`-row viewer: nano's
+/// `mustmove`, all but two rows (at least one).
+fn page_rows(rows: usize) -> usize {
+    if rows < 3 { 1 } else { rows - 2 }
+}
+
 fn move_help_cursor(
     body: &[String],
     top: &mut usize,
@@ -836,7 +1007,7 @@ fn move_help_cursor(
     let last = body.len() - 1;
     let max_top = body.len().saturating_sub(rows);
     let len = |line: usize| body[line].chars().count();
-    let mustmove = if rows < 3 { 1 } else { rows - 2 };
+    let mustmove = page_rows(rows);
     cursor.line = cursor.line.min(last);
     cursor.col = cursor.col.min(len(cursor.line));
 
@@ -971,6 +1142,8 @@ fn handle_editing_key(editor: &mut Editor, key: KeyEvent) {
             // long line, horizontally) after an action.
             editor.scroll_to_cursor();
         }
+    } else if let Some(msg) = unbound_key_message(editor, key, tkey) {
+        editor.set_status_brief(msg);
     }
     editor.maybe_update_lock_modified_flag();
 
@@ -1048,12 +1221,16 @@ fn handle_prompt_key(editor: &mut Editor, mut prompt: Prompt, key: KeyEvent) {
     if let Some(tkey) = normalize_key(key) {
         if tkey == TKey::Ctrl('C') || matches!(key.code, KeyCode::Esc) {
             editor.mode = Mode::Editing;
-            // The file browser's own prompts go back to the browser.
+            // The file browser's own prompts go back to the browser, and
+            // the help viewer's Search prompt to the help text.
             if matches!(
                 prompt.kind,
                 PromptKind::BrowserSearch { .. } | PromptKind::GotoDir
             ) {
                 editor.mode = Mode::Browser;
+            }
+            if matches!(prompt.kind, PromptKind::HelpSearch { .. }) {
+                return_to_help(editor);
             }
             // Canceling out of a spell-fix prompt stops the word-by-word
             // loop, but (matching nano's `fix_spello`/`spell_check`) still
@@ -1189,6 +1366,31 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
         return false;
     }
     match action {
+        // nano's `do_statusbar_prev_word`/`do_statusbar_next_word`: word
+        // movement within the answer, where punctuation never counts as
+        // part of a word (`wordbounds` is for the edit window only) but
+        // `afterends` and `wordchars` apply.
+        // nano's `do_statusbar_home`/`do_statusbar_end`.
+        Action::Home => {
+            prompt.cursor = 0;
+            false
+        }
+        Action::End => {
+            prompt.cursor = prompt.input.chars().count();
+            false
+        }
+        Action::PrevWord | Action::NextWord => {
+            let lines = crate::app::prompt_word_lines(&prompt.input);
+            let from = Pos::new(0, prompt.cursor);
+            let is_word = |c| editor.is_word_char(c, false);
+            prompt.cursor = if action == Action::PrevWord {
+                crate::app::prev_word_pos(&lines, from, is_word)
+            } else {
+                crate::app::next_word_pos(&lines, from, editor.options.afterends, is_word)
+            }
+            .col;
+            false
+        }
         // nano's `do_statusbar_verbatim_input`: the next keystroke goes
         // into the answer as is (not at a name-locked Write Out prompt).
         Action::Verbatim => {
@@ -1213,6 +1415,33 @@ fn apply_prompt_action(editor: &mut Editor, prompt: &mut Prompt, action: Action)
                 cursor: Default::default(),
                 return_to: Some(Box::new(prompt.clone())),
             };
+            true
+        }
+        // nano runs `to_first_line`/`to_last_line` on the help text from
+        // its Search prompt, which then closes without searching.
+        Action::FirstLine | Action::LastLine
+            if matches!(prompt.kind, PromptKind::HelpSearch { .. }) =>
+        {
+            return_to_help(editor);
+            let emptyline = editor.emptyline_row() > 0;
+            let rows = help_body_rows(editor);
+            if let Mode::Help {
+                lines, top, cursor, ..
+            } = &mut editor.mode
+            {
+                let body_len = help_body_of(emptyline, lines).len();
+                if action == Action::FirstLine {
+                    *top = 0;
+                    *cursor = HelpCursor::default();
+                } else {
+                    *top = body_len.saturating_sub(rows);
+                    *cursor = HelpCursor {
+                        line: body_len.saturating_sub(1),
+                        col: 0,
+                        want: 0,
+                    };
+                }
+            }
             true
         }
         Action::FirstLine => {
@@ -1685,7 +1914,9 @@ fn common_prefix(a: &str, b: &str) -> String {
 /// whatever was live-typed before browsing started.
 fn cycle_history(editor: &mut Editor, prompt: &mut Prompt, older: bool) {
     let list: &[String] = match prompt.menu {
-        Menu::Search | Menu::Replace | Menu::WhereIsFile => &editor.history.search,
+        Menu::Search | Menu::Replace | Menu::WhereIsFile | Menu::FindInHelp => {
+            &editor.history.search
+        }
         Menu::ReplaceWith => &editor.history.replace,
         Menu::Execute => &editor.history.execute,
         _ => return,
@@ -2199,6 +2430,33 @@ fn submit_prompt(editor: &mut Editor, prompt: Prompt) {
             remember_browser_search(editor, &text);
             let needle = editor.search.last_pattern.clone().unwrap_or_default();
             browser_find(editor, &needle, forwards);
+        }
+        PromptKind::HelpSearch { forwards } => {
+            return_to_help(editor);
+            // As at the browser's Search prompt: a blank answer with
+            // nothing searched for yet is the same as cancelling.
+            if text.is_empty() && editor.search.last_pattern.is_none() {
+                editor.set_status("Cancelled");
+                return;
+            }
+            remember_browser_search(editor, &text);
+            let needle = editor.search.last_pattern.clone().unwrap_or_default();
+            if let Mode::Help {
+                lines,
+                mut top,
+                mut cursor,
+                return_to,
+            } = std::mem::replace(&mut editor.mode, Mode::Editing)
+            {
+                let body = help_text_body(editor, &lines).to_vec();
+                help_find(editor, &body, &mut top, &mut cursor, &needle, forwards);
+                editor.mode = Mode::Help {
+                    lines,
+                    top,
+                    cursor,
+                    return_to,
+                };
+            }
         }
         PromptKind::GotoDir => {
             editor.mode = Mode::Browser;
@@ -3160,12 +3418,58 @@ fn control_code(c: char) -> char {
     }
 }
 
+/// nano's `unbound_key`: the status-bar diagnostic for a keystroke that
+/// does nothing in the main editor or the help viewer, worded as nano
+/// words it -- `M-X`/`Sh-M-X` (per `KeyMap::fold_key`), `^X` and `FN` are
+/// named, Ctrl+Alt+letter is "Unbindable", Ctrl/Alt+Fn an "Unknown
+/// sequence", and any other special key just "Unbound key". `None` for a
+/// keystroke nano doesn't report (a lone Esc, which only starts a Meta
+/// sequence there) or that isn't a key press tico knows (lock, media and
+/// bare modifier keys).
+fn unbound_key_message(editor: &Editor, key: KeyEvent, tkey: Option<TKey>) -> Option<String> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let named = |name: String| Some(format!("Unbound key: {name}"));
+    match tkey.map(|k| editor.keymap.fold_key(k)) {
+        // nano names these by their raw codes: NUL is `^@`, and a Meta
+        // Space prints its space.
+        Some(TKey::Ctrl(' ')) => named("^@".to_string()),
+        Some(TKey::Meta(' ')) => named("M- ".to_string()),
+        Some(k @ (TKey::Ctrl(_) | TKey::Meta(_) | TKey::ShiftMeta(_) | TKey::F(_))) => {
+            named(k.describe())
+        }
+        Some(_) => Some("Unbound key".to_string()),
+        None => match key.code {
+            KeyCode::Char(c) if ctrl && alt && c.is_ascii_alphabetic() => {
+                Some(format!("Unbindable key: M-^{}", c.to_ascii_uppercase()))
+            }
+            KeyCode::F(_) => Some("Unknown sequence".to_string()),
+            KeyCode::Char(c) if !ctrl && !alt => named(c.to_string()),
+            KeyCode::Char(_)
+            | KeyCode::Insert
+            | KeyCode::Delete
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down => Some("Unbound key".to_string()),
+            _ => None,
+        },
+    }
+}
+
 fn normalize_key(key: KeyEvent) -> Option<TKey> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
+        // nano reads Alt+Backspace as the same key code as Shift+Ctrl+Del
+        // (`M-Bsp` and `Sh-^Del` are both chop-word-left).
+        KeyCode::Backspace if alt => Some(TKey::ShiftCtrlDel),
         KeyCode::Backspace => Some(TKey::Backspace),
         KeyCode::Tab => Some(TKey::Ctrl('I')),
         KeyCode::BackTab => Some(TKey::ShiftTab),
@@ -3189,6 +3493,9 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
         KeyCode::End if alt => Some(TKey::MetaEnd),
         KeyCode::Home => Some(TKey::Home),
         KeyCode::End => Some(TKey::End),
+        // Ctrl+PgUp/PgDn have no key of their own; rather than run the
+        // plain PgUp/PgDn, report them unbound as nano does.
+        KeyCode::PageUp | KeyCode::PageDown if ctrl => None,
         KeyCode::PageUp if alt => Some(TKey::MetaPgUp),
         KeyCode::PageDown if alt => Some(TKey::MetaPgDn),
         KeyCode::PageUp => Some(TKey::PageUp),
@@ -3197,9 +3504,17 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
         KeyCode::Delete if ctrl => Some(TKey::CtrlDel),
         KeyCode::Delete if alt => Some(TKey::MetaDel),
         KeyCode::Delete => Some(TKey::Ctrl('D')),
+        KeyCode::Insert if ctrl => None,
         KeyCode::Insert if alt => Some(TKey::MetaIns),
         KeyCode::Insert => Some(TKey::Ins),
+        // nano knows Ctrl/Alt+Fn only as an "Unknown sequence", and
+        // Shift+F1..F12 as F13..F24 (the xterm convention ncurses uses).
+        KeyCode::F(_) if ctrl || alt => None,
+        KeyCode::F(n) if shift && n <= 12 => Some(TKey::F(n + 12)),
         KeyCode::F(n) => Some(TKey::F(n)),
+        // Ctrl+Alt+letter is nano's unbindable `M-^X` (see
+        // `unbound_key_message`), not plain `^X`.
+        KeyCode::Char(c) if ctrl && alt && c.is_ascii_alphabetic() => None,
         KeyCode::Char(c) if ctrl => {
             // crossterm's unix parser reports Ctrl+\, Ctrl+], Ctrl+^ and
             // Ctrl+_ (raw bytes 0x1C-0x1F) as Char('4')..Char('7') with
@@ -3216,13 +3531,16 @@ fn normalize_key(key: KeyEvent) -> Option<TKey> {
             };
             Some(TKey::Ctrl(mapped))
         }
-        KeyCode::Char(c) if alt && shift && c.is_ascii_alphabetic() => {
+        // A terminal sends Shift+Meta+letter as Esc + the uppercase
+        // letter, which crossterm reports with ALT alone -- so an
+        // uppercase letter means Shift too. Whether that's distinct from
+        // plain Meta+letter is the keymap's call (`KeyMap::fold_key`,
+        // nano's `shifted_metas`).
+        KeyCode::Char(c) if alt && (shift || c.is_ascii_uppercase()) && c.is_ascii_alphabetic() => {
             Some(TKey::ShiftMeta(c.to_ascii_uppercase()))
         }
-        // Meta+letter is case-insensitive by default in nano (a bare
-        // Meta+letter keystroke does the same as Shift+Meta+letter unless
-        // a specific Sh-M- binding overrides it), and our keymap stores
-        // Meta letter bindings uppercase, so normalize here too.
+        // Our keymap stores Meta letter bindings uppercase, so normalize
+        // a plain Meta+letter here too.
         KeyCode::Char(c) if alt => Some(TKey::Meta(c.to_ascii_uppercase())),
         _ => None,
     }
@@ -3396,7 +3714,7 @@ fn handle_browser_key(editor: &mut Editor, key: KeyEvent) {
     });
     let Some(action) = action else {
         let name = match (key.code, tkey) {
-            (_, Some(k)) => k.describe(),
+            (_, Some(k)) => editor.keymap.fold_key(k).describe(),
             (KeyCode::Char(c), None) => c.to_string(),
             _ => return,
         };
@@ -3630,6 +3948,7 @@ fn render_browser_screen(
         let title =
             crate::browser::title_line(&crate::browser::display_dir(&session.list.dir), cols);
         queue_bar_segment(out, title_bar_style(editor), &title)?;
+        render_emptyline(editor, out, cols)?;
     }
 
     if let Some(matches) = &editor.file_completions {
@@ -3716,6 +4035,11 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
         return out.flush();
     }
 
+    // The help viewer's Search prompt, over the help text.
+    if let (Some(h), Mode::Prompt(_)) = (&editor.help_session, &editor.mode) {
+        render_help_screen(editor, &mut out, &h.lines, h.top, h.cursor)?;
+        return out.flush();
+    }
     if let Some(session) = &editor.browser
         && matches!(editor.mode, Mode::Browser | Mode::Prompt(_))
     {
@@ -3738,6 +4062,7 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
     if text_start_row > 0 {
         queue!(out, MoveTo(0, 0))?;
         render_title_bar(editor, &mut out, cols)?;
+        render_emptyline(editor, &mut out, cols)?;
     }
 
     if let Some(matches) = &editor.file_completions {
@@ -3767,6 +4092,16 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
     out.flush()
 }
 
+/// `set emptyline`'s blank row below the title bar (row 1), when there is
+/// one (`Editor::emptyline_row`): plain, never title-colored, just like
+/// the unused second row of nano's two-row top window.
+fn render_emptyline(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Result<()> {
+    if editor.emptyline_row() > 0 {
+        queue!(out, MoveTo(0, 1), Print(" ".repeat(cols)))?;
+    }
+    Ok(())
+}
+
 /// The main editing screen's row layout (everything but `Mode::Help` /
 /// `Mode::Diff`, which have their own bespoke full-screen layout, and
 /// `set zero`, which hides all chrome and just needs `screen_rows`):
@@ -3774,7 +4109,8 @@ fn render_frame(editor: &Editor, blank_bars: bool) -> io::Result<()> {
 /// the two can never drift the way `Editor::text_rows` and `render`'s own
 /// row math once did.
 struct MainLayout {
-    /// 0 normally, 1 when `set minibar` drops the title bar.
+    /// 1 normally (below the title bar), 2 under `set emptyline`, 0 when
+    /// `set minibar` drops the title bar (`Editor::top_rows`).
     text_start_row: usize,
     /// Rows available to the buffer (or the `^R` tab-completion grid).
     text_rows: usize,
@@ -3786,7 +4122,7 @@ struct MainLayout {
 }
 
 fn main_screen_layout(editor: &Editor) -> MainLayout {
-    let text_start_row = if editor.options.minibar { 0 } else { 1 };
+    let text_start_row = editor.top_rows();
     let help_rows = if editor.options.nohelp { 0 } else { 2 };
     let text_rows = editor
         .screen_rows
@@ -3801,10 +4137,49 @@ fn main_screen_layout(editor: &Editor) -> MainLayout {
 }
 
 /// Number of rows available for the help viewer's scrollable body: the
-/// whole screen minus the title row and the (always-shown, regardless of
-/// `nohelp`) two-line shortcut bar.
+/// whole screen minus the title row (and `set emptyline`'s blank row below
+/// it), the status row, and the (always-shown, regardless of `nohelp`)
+/// two-line shortcut bar -- nano's help text fills its edit window.
 fn help_body_rows(editor: &Editor) -> usize {
-    editor.screen_rows.saturating_sub(3).max(1)
+    editor
+        .screen_rows
+        .saturating_sub(4 + editor.emptyline_row())
+        .max(1)
+}
+
+/// The help/diff viewer's status row, between the body and the shortcut
+/// bar: a message such as "Unbound key: M-1" when there is one, else
+/// blank (never the minibar).
+fn render_viewer_status(editor: &Editor, out: &mut impl Write, cols: usize) -> io::Result<()> {
+    let row = editor.screen_rows.saturating_sub(3) as u16;
+    if editor.status.is_some() || matches!(editor.mode, Mode::Prompt(_)) {
+        render_status_line(editor, out, row, cols)
+    } else {
+        queue!(out, MoveTo(0, row), Print(" ".repeat(cols)))
+    }
+}
+
+/// The help viewer's scrollable body: everything after the title line,
+/// minus the body's leading blank line under `set emptyline` -- nano's
+/// help then starts its text right below the blank row, and can't be
+/// scrolled back up to that line either.
+fn help_text_body<'a>(editor: &Editor, lines: &'a [String]) -> &'a [String] {
+    help_body_of(editor.emptyline_row() > 0, lines)
+}
+
+/// `help_text_body`, given whether `set emptyline` is in effect.
+fn help_body_of(emptyline: bool, lines: &[String]) -> &[String] {
+    let body = &lines[1.min(lines.len())..];
+    match body.first() {
+        Some(first) if first.is_empty() && emptyline => &body[1..],
+        _ => body,
+    }
+}
+
+/// The screen row the help/diff viewer's body starts on: below the title
+/// row, and below `set emptyline`'s blank row too.
+fn help_body_start(editor: &Editor) -> usize {
+    1 + editor.emptyline_row()
 }
 
 /// The `^G` help viewer takes over the whole screen: a centered,
@@ -3827,14 +4202,58 @@ fn render_help_screen(
         cols,
         lines.first().map(|s| s.as_str()).unwrap_or("Help"),
     )?;
-    let body = &lines[1.min(lines.len())..];
+    let body = help_text_body(editor, lines);
     let body_rows = help_body_rows(editor);
-    render_scrollable_body(out, cols, body, top, body_rows, None)?;
-    let entries = resolve_shortcuts(&editor.keymap, Menu::Help, HELP_SHORTCUTS);
+    // A search match is spotlighted like one in the edit window.
+    let spot_styles = editor.spotlight.map(|(pos, len)| {
+        let (fg, bg) = spotlight_colors(&editor.options.spotlightcolor);
+        let lit = Style {
+            fg: Some(fg),
+            bg: Some(bg),
+            ..Style::default()
+        };
+        let mut styles = vec![Vec::new(); body.len()];
+        if let Some(line) = styles.get_mut(pos.line) {
+            *line = vec![None; pos.col];
+            line.extend(std::iter::repeat_n(Some(lit), len));
+        }
+        styles
+    });
+    render_scrollable_body(
+        out,
+        cols,
+        body,
+        top,
+        help_body_start(editor),
+        body_rows,
+        spot_styles.as_deref(),
+    )?;
+    render_viewer_status(editor, out, cols)?;
+    let prompt = match &editor.mode {
+        Mode::Prompt(p) => Some(p),
+        _ => None,
+    };
+    let entries = match prompt {
+        Some(p) => shortcut_bar_entries(&editor.keymap, Some(p), editor.options.restricted),
+        None => resolve_shortcuts(&editor.keymap, Menu::Help, HELP_SHORTCUTS),
+    };
     render_shortcut_bar(editor, out, rows.saturating_sub(2) as u16, cols, &entries)?;
 
-    // `set showcursor`: the cursor stays visible in the help text.
-    if editor.options.showcursor
+    // At the Search prompt, the cursor is in the answer -- on the status
+    // row, which in help is always above the two bar rows.
+    if let Some(p) = prompt {
+        let typed: String = p.input.chars().take(p.cursor).collect();
+        let col = p.label.chars().count() + 2 + caret_notation(&typed).chars().count();
+        let row = rows.saturating_sub(3);
+        return queue!(
+            out,
+            MoveTo(col.min(cols.saturating_sub(1)) as u16, row as u16),
+            Show
+        );
+    }
+    // `set showcursor`, or a search that just found something (nano's
+    // `didfind`): the cursor is shown in the help text.
+    if (editor.options.showcursor || editor.help_found)
         && let Some(line) = body.get(cursor.line)
         && cursor.line >= top
         && cursor.line < top + body_rows
@@ -3844,7 +4263,7 @@ fn render_help_screen(
             .take(cursor.col)
             .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
             .sum();
-        let row = 1 + cursor.line - top;
+        let row = help_body_start(editor) + cursor.line - top;
         queue!(
             out,
             MoveTo(col.min(cols.saturating_sub(1)) as u16, row as u16),
@@ -3885,10 +4304,12 @@ fn render_diff_screen(
         cols,
         body,
         top,
+        help_body_start(editor),
         help_body_rows(editor),
         styles.as_deref(),
     )?;
 
+    render_viewer_status(editor, out, cols)?;
     let entries = diff_shortcut_entries(outcome);
     render_shortcut_bar(editor, out, rows.saturating_sub(2) as u16, cols, &entries)
 }
@@ -3932,21 +4353,24 @@ fn render_centered_title_row(
     }
     let title_line: String = title_row.into_iter().collect();
     let style = title_bar_style(editor);
-    queue_bar_segment(out, style, &title_line)
+    queue_bar_segment(out, style, &title_line)?;
+    render_emptyline(editor, out, cols)
 }
 
 /// Draw `body_rows` rows of `body` starting at `top`, one screen row per
-/// line, below the title row — shared by the help and merge-diff viewers.
+/// line, from screen row `start_row` down — shared by the help and
+/// merge-diff viewers.
 fn render_scrollable_body(
     out: &mut impl Write,
     cols: usize,
     body: &[String],
     top: usize,
+    start_row: usize,
     body_rows: usize,
     styles: Option<&[Vec<Option<Style>>]>,
 ) -> io::Result<()> {
     for r in 0..body_rows {
-        queue!(out, MoveTo(0, 1 + r as u16))?;
+        queue!(out, MoveTo(0, (start_row + r) as u16))?;
         let idx = top + r;
         let text = body.get(idx).map(|s| s.as_str()).unwrap_or("");
         let chars: Vec<char> = text.chars().take(cols).collect();
@@ -4638,15 +5062,24 @@ const GOTODIR_SHORTCUTS: &[(Action, &str)] = &[(Action::Help, "Help"), (Action::
 
 /// The `^G` help viewer's own bottom bar (confirmed against the installed
 /// nano's help screen).
+/// nano's MHELP bar, column by column (top row, then bottom row).
 const HELP_SHORTCUTS: &[(Action, &str)] = &[
-    (Action::Up, "Prev Line"),
-    (Action::PageUp, "Prev Page"),
-    (Action::FirstLine, "First Line"),
+    (Action::Refresh, "Refresh"),
     (Action::Cancel, "Close"),
+    (Action::WhereIs, "Where Is"),
+    (Action::WhereWas, "Where Was"),
+    (Action::FindPrevious, "Previous"),
+    (Action::FindNext, "Next"),
+    (Action::Up, "Prev Line"),
     (Action::Down, "Next Line"),
+    (Action::PageUp, "Prev Page"),
     (Action::PageDown, "Next Page"),
+    (Action::FirstLine, "First Line"),
     (Action::LastLine, "Last Line"),
 ];
+
+/// nano's MFINDINHELP bar: just Cancel.
+const FINDINHELP_SHORTCUTS: &[(Action, &str)] = &[(Action::Cancel, "Cancel")];
 
 /// The "file changed on disk, you have unsaved edits" choice prompt: R/K/M
 /// aren't keymap-driven (this prompt is tico-original and matches those
@@ -4734,6 +5167,7 @@ fn shortcut_bar_entries(
         Menu::Linter => LINTER_SHORTCUTS,
         Menu::WhereIsFile => WHEREISFILE_SHORTCUTS,
         Menu::GotoDir => GOTODIR_SHORTCUTS,
+        Menu::FindInHelp => FINDINHELP_SHORTCUTS,
         _ => return resolve_shortcuts(keymap, Menu::Main, main),
     };
     if restricted {
@@ -8125,6 +8559,58 @@ mod tests {
     }
 
     #[test]
+    fn emptyline_keeps_the_row_below_the_title_bar_blank_like_nano() {
+        // nano's window_init: toprows is 2 under EMPTY_LINE when LINES > 6,
+        // 0 under minibar/zero regardless.
+        let mut ed = test_editor("hello\n");
+        ed.screen_rows = 24;
+        ed.options.emptyline = true;
+        let layout = main_screen_layout(&ed);
+        assert_eq!(layout.text_start_row, 2);
+        assert_eq!(layout.text_rows, 19);
+        assert_eq!(layout.status_row, 21);
+        assert_eq!(ed.text_rows(), layout.text_rows);
+        assert_eq!((help_body_start(&ed), help_body_rows(&ed)), (2, 19));
+
+        // Too short a terminal: no blank row.
+        ed.screen_rows = 6;
+        assert_eq!(main_screen_layout(&ed).text_start_row, 1);
+        assert_eq!(ed.text_rows(), main_screen_layout(&ed).text_rows);
+        ed.screen_rows = 7;
+        assert_eq!(main_screen_layout(&ed).text_start_row, 2);
+
+        // minibar drops the whole top window, blank row included.
+        ed.screen_rows = 24;
+        ed.options.minibar = true;
+        assert_eq!(main_screen_layout(&ed).text_start_row, 0);
+        assert_eq!(ed.text_rows(), main_screen_layout(&ed).text_rows);
+    }
+
+    #[test]
+    fn emptyline_drops_the_help_texts_leading_blank_line_like_nano() {
+        let mut ed = test_editor("");
+        ed.screen_rows = 24;
+        let lines = crate::help::build(Menu::Main, &ed.keymap, 80, false);
+        assert_eq!(lines[1], "");
+        assert_eq!(help_text_body(&ed, &lines).len(), lines.len() - 1);
+        ed.options.emptyline = true;
+        let body = help_text_body(&ed, &lines);
+        assert_eq!(body.len(), lines.len() - 2);
+        assert!(!body[0].is_empty());
+    }
+
+    #[test]
+    fn mouse_click_under_emptyline_maps_rows_below_the_blank_line() {
+        let text: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        let mut ed = test_editor(&text);
+        ed.options.mouse = true;
+        ed.options.emptyline = true;
+        ed.screen_rows = 24;
+        handle_click(&mut ed, 2 + 3, 0);
+        assert_eq!(ed.buf().cursor.line, 3);
+    }
+
+    #[test]
     fn mouse_click_on_a_shortcut_activates_it() {
         let mut ed = test_editor("hello\n");
         ed.options.mouse = true;
@@ -8222,7 +8708,8 @@ mod tests {
             if showcursor {
                 assert_eq!((*top, cursor.line), (0, 1));
             } else {
-                assert_eq!((*top, cursor.line), (1, 0));
+                // The hidden cursor is pushed along to stay on screen.
+                assert_eq!((*top, cursor.line), (1, 1));
             }
             let mut out = Vec::new();
             let Mode::Help {
@@ -8293,6 +8780,241 @@ mod tests {
             let ev = key_to_event(key);
             assert_eq!(normalize_key(ev), Some(key), "{key:?}");
         }
+    }
+
+    /// The status message after pressing `code`+`modifiers` in a fresh
+    /// editor, and whether it's still there one more keystroke later.
+    fn unbound_report(
+        ed: &mut Editor,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> (Option<String>, bool) {
+        press(ed, code, modifiers);
+        let msg = ed.status.clone();
+        press(ed, KeyCode::Right, KeyModifiers::NONE);
+        (msg, ed.status.is_some())
+    }
+
+    #[test]
+    fn unbound_keys_report_themselves_as_nano_words_it() {
+        // Each checked against nano's own message in tmux.
+        use KeyModifiers as M;
+        let ctrl_alt = M::CONTROL | M::ALT;
+        for (code, modifiers, want) in [
+            (KeyCode::Char('1'), M::ALT, "Unbound key: M-1"),
+            (KeyCode::Char('@'), M::ALT, "Unbound key: M-@"),
+            (KeyCode::Char('a'), ctrl_alt, "Unbindable key: M-^A"),
+            (KeyCode::Char('z'), ctrl_alt, "Unbindable key: M-^Z"),
+            (KeyCode::Insert, M::CONTROL, "Unbound key"),
+            (KeyCode::Insert, ctrl_alt, "Unbound key"),
+            (KeyCode::PageUp, M::CONTROL, "Unbound key"),
+            (KeyCode::F(1), M::ALT, "Unknown sequence"),
+            (KeyCode::F(1), M::CONTROL, "Unknown sequence"),
+            (KeyCode::F(3), M::SHIFT, "Unbound key: F15"),
+        ] {
+            let mut ed = test_editor("one\ntwo\n");
+            let (msg, lingers) = unbound_report(&mut ed, code, modifiers);
+            assert_eq!(msg.as_deref(), Some(want), "{code:?} {modifiers:?}");
+            assert!(!lingers, "{want} is gone after the next key");
+            assert_eq!(ed.buf().line(0), "one", "{want} did nothing else");
+            assert!(!ed.buf().modified, "{want} did nothing else");
+        }
+        // A lone Esc only starts a Meta sequence in nano: no message.
+        let mut ed = test_editor("one\n");
+        press(&mut ed, KeyCode::Esc, M::NONE);
+        assert_eq!(ed.status, None);
+    }
+
+    /// A 16-row editor with `^G` help open, from a Search prompt when
+    /// `from_prompt`.
+    fn help_open(from_prompt: bool) -> Editor {
+        let mut ed = test_editor("one\n");
+        ed.screen_cols = 80;
+        ed.screen_rows = 16;
+        if from_prompt {
+            press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        }
+        press(&mut ed, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(matches!(ed.mode, Mode::Help { .. }));
+        ed
+    }
+
+    fn help_state(ed: &Editor) -> (usize, HelpCursor, Vec<String>) {
+        match &ed.mode {
+            Mode::Help {
+                lines, top, cursor, ..
+            } => (*top, *cursor, help_text_body(ed, lines).to_vec()),
+            _ => panic!("not in help: {:?}", std::mem::discriminant(&ed.mode)),
+        }
+    }
+
+    fn help_search(ed: &mut Editor, needle: &str) {
+        press(ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(&ed.mode, Mode::Prompt(p) if p.menu == Menu::FindInHelp),
+            "^W opens the help's Search prompt"
+        );
+        type_text(ed, needle);
+        press(ed, KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn help_search_finds_case_insensitively_and_lights_the_match() {
+        let mut ed = help_open(false);
+        // Help always searches case-insensitively, whatever M-C says.
+        ed.search.case_sensitive = true;
+        help_search(&mut ed, "VERBATIM");
+        let (top, cursor, body) = help_state(&ed);
+        let line = &body[cursor.line];
+        assert!(line[..].to_lowercase()[..].contains("verbatim"));
+        let col = line.to_lowercase().find("verbatim").unwrap();
+        assert_eq!(cursor.col, line[..col].chars().count());
+        // Found off screen: centered (nano's CENTERING, rows / 2 down).
+        let rows = help_body_rows(&ed);
+        assert_eq!(top, cursor.line - rows / 2);
+        assert_eq!(ed.spotlight, Some((Pos::new(cursor.line, cursor.col), 8)));
+        assert!(ed.help_found, "the cursor is shown on the match");
+        assert!(ed.search.case_sensitive, "the editor's own setting is kept");
+        assert_eq!(ed.search.last_pattern.as_deref(), Some("VERBATIM"));
+        assert_eq!(
+            ed.history.search.last().map(String::as_str),
+            Some("VERBATIM")
+        );
+        // The next keystroke ends both.
+        press(&mut ed, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(ed.spotlight, None);
+        assert!(!ed.help_found);
+    }
+
+    #[test]
+    fn help_search_repeats_reports_and_cancels_like_nano() {
+        let mut ed = help_open(false);
+        press(&mut ed, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(ed.status.as_deref(), Some("No current search pattern"));
+        help_search(&mut ed, "zzzq");
+        assert_eq!(ed.status.as_deref(), Some("\"zzzq\" not found"));
+        help_search(&mut ed, "the matching bracket");
+        let (_, first, _) = help_state(&ed);
+        // The only occurrence: `n` comes back to it, and says so.
+        press(&mut ed, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(help_state(&ed).1, first);
+        assert_eq!(ed.status.as_deref(), Some("This is the only occurrence"));
+        // Cancelling goes back to the help text.
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(ed.status.as_deref(), Some("Cancelled"));
+        assert_eq!(help_state(&ed).1, first);
+        // ^V at the prompt goes to the last line without searching.
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut ed, KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let (top, cursor, body) = help_state(&ed);
+        assert_eq!(cursor.line, body.len() - 1);
+        assert_eq!(top, body.len() - help_body_rows(&ed));
+    }
+
+    #[test]
+    fn help_search_from_a_prompts_help_returns_to_that_prompt() {
+        let mut ed = help_open(true);
+        help_search(&mut ed, "search");
+        assert!(matches!(ed.mode, Mode::Help { .. }));
+        press(&mut ed, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(&ed.mode, Mode::Prompt(p) if p.menu == Menu::Search));
+    }
+
+    #[test]
+    fn help_viewer_reports_unbound_keys_and_takes_nanos_plain_letters() {
+        let open = || {
+            let mut ed = test_editor("one\n");
+            ed.screen_rows = 12;
+            press(&mut ed, KeyCode::Char('g'), KeyModifiers::CONTROL);
+            assert!(matches!(ed.mode, Mode::Help { .. }));
+            assert_eq!(ed.status, None, "opening help blanks the status bar");
+            ed
+        };
+        let top = |ed: &Editor| match &ed.mode {
+            Mode::Help { top, .. } => *top,
+            _ => panic!("help closed"),
+        };
+        for (c, want) in [('s', "Unbound key: s"), ('?', "Unbound key: ?")] {
+            let mut ed = open();
+            press(&mut ed, KeyCode::Char(c), KeyModifiers::NONE);
+            assert_eq!(ed.status.as_deref(), Some(want));
+        }
+        let mut ed = open();
+        press(&mut ed, KeyCode::Char('1'), KeyModifiers::ALT);
+        assert_eq!(ed.status.as_deref(), Some("Unbound key: M-1"));
+        // 8 body rows on a 12-row screen; a page is all but two of them.
+        press(&mut ed, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(top(&ed), 6);
+        assert_eq!(ed.status, None, "the message lasts one keystroke");
+        press(&mut ed, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(top(&ed), 0);
+        // `w` searches, as `^W` does.
+        press(&mut ed, KeyCode::Char('w'), KeyModifiers::NONE);
+        assert!(matches!(&ed.mode, Mode::Prompt(p) if p.menu == Menu::FindInHelp));
+        for c in ['x', 'q', 'E'] {
+            let mut ed = open();
+            press(&mut ed, KeyCode::Char(c), KeyModifiers::NONE);
+            assert!(matches!(ed.mode, Mode::Editing), "{c} closes help");
+        }
+    }
+
+    #[test]
+    fn alt_backspace_chops_the_previous_word_like_nano() {
+        let ev = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(normalize_key(ev), Some(TKey::ShiftCtrlDel));
+        let mut ed = test_editor("foo bar baz\n");
+        ed.buf_mut().cursor = Pos::new(0, 11);
+        press(&mut ed, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(ed.buf().line(0), "foo bar ");
+    }
+
+    #[test]
+    fn prompt_home_end_and_ctrl_a_e_move_to_the_answers_ends() {
+        let search = |modern: bool| {
+            let mut ed = test_editor("one\n");
+            ed.keymap = crate::keymap::KeyMap::defaults(modern);
+            let search_key = if modern { 'f' } else { 'w' };
+            press(&mut ed, KeyCode::Char(search_key), KeyModifiers::CONTROL);
+            type_text(&mut ed, "foo bar");
+            ed
+        };
+        let answer = |ed: &Editor| match &ed.mode {
+            Mode::Prompt(p) => p.input.clone(),
+            _ => panic!("no prompt"),
+        };
+        let mut ed = search(false);
+        press(&mut ed, KeyCode::Home, KeyModifiers::NONE);
+        type_text(&mut ed, "1");
+        press(&mut ed, KeyCode::End, KeyModifiers::NONE);
+        type_text(&mut ed, "2");
+        press(&mut ed, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "3");
+        press(&mut ed, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "4");
+        assert_eq!(answer(&ed), "31foo bar24");
+        // --modernbindings leaves ^A/^E unbound at the prompts.
+        let mut ed = search(true);
+        press(&mut ed, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut ed, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        type_text(&mut ed, "1");
+        assert_eq!(answer(&ed), "1foo bar");
+    }
+
+    #[test]
+    fn esc_plus_uppercase_letter_is_shift_meta() {
+        // What a terminal sends for Shift+Meta+letter: Esc + 'A', which
+        // crossterm reports with ALT alone.
+        let ev = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::ALT);
+        assert_eq!(normalize_key(ev), Some(TKey::ShiftMeta('A')));
+        let ev = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(normalize_key(ev), Some(TKey::ShiftMeta('A')));
+        let ev = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(normalize_key(ev), Some(TKey::Meta('A')));
+        // With no Sh-M- binding it still runs the plain Meta binding.
+        let mut ed = test_editor("one\ntwo\n");
+        press(&mut ed, KeyCode::Char('A'), KeyModifiers::ALT);
+        assert!(ed.buf().mark.is_some(), "Sh-M-A falls back to M-A (Mark)");
     }
 
     #[test]

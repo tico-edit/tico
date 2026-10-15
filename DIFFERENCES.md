@@ -124,6 +124,12 @@ in the same order as nano's (capped at the count nano would show for
 the screen width), but laid out with tico's usual column sizing, so at
 80 columns it shows eight of nano's twelve.
 
+## `^K` reports "Cut"
+
+Cutting a line or the marked text with `^K` (Cut) shows `[ Cut ]` on
+the status bar, where nano cuts silently. This is deliberate: tico keeps
+the message. `M-T` (cut to end of file) stays silent, as in nano.
+
 ## Comment toggle: cursor after removing a postfix
 
 For a bracketing comment sequence such as HTML's `<!--|-->`, uncommenting
@@ -141,6 +147,16 @@ it: vintage machines still produce and consume such files, and tico is
 used with them. Do not remove Mac format to track newer nano; when the
 installed nano no longer has it, this becomes an intentional difference
 rather than a bug.
+
+## `set rawsequences` only turns the mouse off
+
+nano's `rawsequences` stops ncurses from translating key escape
+sequences, so nano decodes them itself, and it turns mouse support off
+at startup because ncurses can no longer report clicks. tico always
+decodes key sequences itself (crossterm doesn't use terminfo), so the
+option has nothing to change there. Its one effect in tico is nano's
+other one: `mouse` is off at startup, even with `set mouse` or `-m`.
+`M-M` still turns the mouse back on, as it toggles the setting in nano.
 
 ## Verbatim input (`M-V`): special keys are re-encoded
 

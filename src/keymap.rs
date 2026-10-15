@@ -404,6 +404,9 @@ pub enum Menu {
     Execute,
     Spell,
     Linter,
+    /// The help viewer's Search prompt (nano's `MFINDINHELP`). Like nano's,
+    /// it has no name of its own in `bind`/`unbind`; only `all` reaches it.
+    FindInHelp,
 }
 
 impl Menu {
@@ -445,6 +448,7 @@ impl Menu {
         Menu::Execute,
         Menu::Spell,
         Menu::Linter,
+        Menu::FindInHelp,
     ];
 }
 
@@ -691,7 +695,27 @@ pub enum Binding {
 #[derive(Debug, Clone, Default)]
 pub struct KeyMap {
     table: HashMap<(Menu, Key), Binding>,
+    /// nano's `shifted_metas`: whether any `bind`/`unbind` has named a
+    /// `Sh-M-` key. Until one has, Shift+Meta+letter is just Meta+letter
+    /// (see `fold_key`).
+    shifted_metas: bool,
 }
+
+/// The prompts that take typing: nano's `MMOST` minus the main menu (and
+/// minus `MLINTER`, which in tico is a list rather than a text prompt).
+const TEXT_PROMPTS: &[Menu] = &[
+    Menu::Search,
+    Menu::Replace,
+    Menu::ReplaceWith,
+    Menu::GotoLine,
+    Menu::WriteOut,
+    Menu::Insert,
+    Menu::Execute,
+    Menu::WhereIsFile,
+    Menu::GotoDir,
+    Menu::Spell,
+    Menu::FindInHelp,
+];
 
 /// What nano leaves out of `menu` in restricted mode -- unbound, and so
 /// missing from its shortcut bar and help text: at the Write Out prompt
@@ -715,11 +739,33 @@ impl KeyMap {
     pub fn new() -> KeyMap {
         KeyMap {
             table: HashMap::new(),
+            shifted_metas: false,
         }
     }
 
     pub fn bind(&mut self, menu: Menu, key: Key, binding: Binding) {
+        self.note_shifted_meta(key);
         self.table.insert((menu, key), binding);
+    }
+
+    /// Like nano's `keycode_from_string`, which sets `shifted_metas` on
+    /// parsing any `Sh-M-` key, for a `bind` and an `unbind` alike.
+    fn note_shifted_meta(&mut self, key: Key) {
+        if matches!(key, Key::ShiftMeta(_)) {
+            self.shifted_metas = true;
+        }
+    }
+
+    /// The key a keystroke counts as: Shift+Meta+letter folds to plain
+    /// Meta+letter unless some `Sh-M-` key has been bound or unbound --
+    /// nano's `parse_kbinput` lowercasing an uppercase Meta letter when
+    /// `!shifted_metas`. Once one has, every `Sh-M-` key is distinct
+    /// (an unbound one reports itself as `Sh-M-X`).
+    pub fn fold_key(&self, key: Key) -> Key {
+        match key {
+            Key::ShiftMeta(c) if !self.shifted_metas => Key::Meta(c),
+            other => other,
+        }
     }
 
     pub fn bind_all_menus(&mut self, menus: &[Menu], key: Key, binding: Binding) {
@@ -729,6 +775,7 @@ impl KeyMap {
     }
 
     pub fn unbind(&mut self, menu: Menu, key: Key) {
+        self.note_shifted_meta(key);
         self.table.remove(&(menu, key));
     }
 
@@ -742,6 +789,7 @@ impl KeyMap {
     /// that don't have their own entry for a given key (mirrors nano's
     /// "all menus" semantics for many global keys like ^C=cancel, arrows, etc).
     pub fn lookup(&self, menu: Menu, key: Key) -> Option<&Binding> {
+        let key = self.fold_key(key);
         self.table
             .get(&(menu, key))
             .or_else(|| self.table.get(&(Menu::Main, key)))
@@ -755,7 +803,7 @@ impl KeyMap {
     /// (e.g. Main's `Ctrl+Home` = FirstLine leaking into the WriteOut
     /// prompt and unexpectedly aborting a save).
     pub fn lookup_menu_only(&self, menu: Menu, key: Key) -> Option<&Binding> {
-        self.table.get(&(menu, key))
+        self.table.get(&(menu, self.fold_key(key)))
     }
 
     /// All (menu, key) -> binding entries, e.g. for building a help screen's
@@ -959,19 +1007,20 @@ impl KeyMap {
         // that prompted double-checking all of these); history recall
         // (^P/^N) is shared much more broadly, across every prompt that
         // remembers previous entries.
+        // nano's `MMOST` word movement (`do_statusbar_prev_word`/
+        // `next_word`) and `^A`/`^E` Home/End (`do_statusbar_home`/`end`;
+        // dropped again by `--modernbindings`) at every prompt that takes
+        // typing.
+        for &menu in TEXT_PROMPTS {
+            self.bind(menu, K::CtrlLeft, Binding::Action(A::PrevWord));
+            self.bind(menu, K::CtrlRight, Binding::Action(A::NextWord));
+            self.bind(menu, K::Meta(' '), Binding::Action(A::PrevWord));
+            self.bind(menu, K::Ctrl(' '), Binding::Action(A::NextWord));
+            self.bind(menu, K::Ctrl('A'), Binding::Action(A::Home));
+            self.bind(menu, K::Ctrl('E'), Binding::Action(A::End));
+        }
         // nano's `MMOST`: `M-V` works at every prompt that takes typing.
-        for &menu in &[
-            Menu::Search,
-            Menu::Replace,
-            Menu::ReplaceWith,
-            Menu::GotoLine,
-            Menu::WriteOut,
-            Menu::Insert,
-            Menu::Execute,
-            Menu::WhereIsFile,
-            Menu::GotoDir,
-            Menu::Spell,
-        ] {
+        for &menu in TEXT_PROMPTS {
             self.bind(menu, K::Meta('V'), Binding::Action(A::Verbatim));
         }
         self.bind(Menu::Search, K::Ctrl('M'), Binding::Action(A::WhereIs));
@@ -995,6 +1044,7 @@ impl KeyMap {
             Menu::Replace,
             Menu::ReplaceWith,
             Menu::Execute,
+            Menu::FindInHelp,
         ] {
             self.bind(menu, K::Ctrl('P'), Binding::Action(A::Older));
             self.bind(menu, K::Ctrl('N'), Binding::Action(A::Newer));
@@ -1005,6 +1055,16 @@ impl KeyMap {
             self.bind(menu, K::Up, Binding::Action(A::Older));
             self.bind(menu, K::Down, Binding::Action(A::Newer));
         }
+
+        // nano's MFINDINHELP: no help of its own (nano leaves `do_help` out
+        // of it), and `^Y`/`^V` to jump to the help text's first/last line.
+        self.unbind(Menu::FindInHelp, K::Ctrl('G'));
+        self.bind(
+            Menu::FindInHelp,
+            K::Ctrl('Y'),
+            Binding::Action(A::FirstLine),
+        );
+        self.bind(Menu::FindInHelp, K::Ctrl('V'), Binding::Action(A::LastLine));
 
         self.bind(Menu::GotoLine, K::Ctrl('M'), Binding::Action(A::GotoLine));
         self.bind(Menu::GotoLine, K::Ctrl('T'), Binding::Action(A::FlipGoto));
@@ -1078,6 +1138,17 @@ impl KeyMap {
         self.bind(Menu::Help, K::Meta('\\'), Binding::Action(A::FirstLine));
         self.bind(Menu::Help, K::Meta('/'), Binding::Action(A::LastLine));
         self.bind(Menu::Help, K::Ctrl('X'), Binding::Action(A::Cancel));
+        // Searching the help text, as in nano's MHELP.
+        self.bind(Menu::Help, K::Ctrl('L'), Binding::Action(A::Refresh));
+        self.bind(Menu::Help, K::Ctrl('W'), Binding::Action(A::WhereIs));
+        self.bind(Menu::Help, K::Ctrl('F'), Binding::Action(A::WhereIs));
+        self.bind(Menu::Help, K::F(6), Binding::Action(A::WhereIs));
+        self.bind(Menu::Help, K::Ctrl('Q'), Binding::Action(A::WhereWas));
+        self.bind(Menu::Help, K::Ctrl('B'), Binding::Action(A::WhereWas));
+        self.bind(Menu::Help, K::Meta('W'), Binding::Action(A::FindNext));
+        self.bind(Menu::Help, K::Meta('F'), Binding::Action(A::FindNext));
+        self.bind(Menu::Help, K::Meta('Q'), Binding::Action(A::FindPrevious));
+        self.bind(Menu::Help, K::Meta('B'), Binding::Action(A::FindPrevious));
 
         self.install_browser_defaults();
 
@@ -1204,6 +1275,12 @@ impl KeyMap {
         b(K::Ctrl('C'), A::Copy);
         b(K::Ctrl('V'), A::Paste);
         b(K::Ctrl('E'), A::Execute);
+        // nano binds `^A`/`^E` as Home/End at the prompts only without
+        // --modernbindings.
+        for &menu in TEXT_PROMPTS {
+            self.unbind(menu, K::Ctrl('A'));
+            self.unbind(menu, K::Ctrl('E'));
+        }
 
         // nano's own help-key rebinding isn't Main-only: it applies via a
         // broad `(MMOST|MBROWSER) & ~MFINDINHELP` menu set — "an
@@ -1221,7 +1298,7 @@ impl KeyMap {
         // existing ^G moves to ^H too, rather than being stranded on the
         // old key while everything else switches.
         for &menu in Menu::ALL {
-            if matches!(menu, Menu::Main | Menu::Help) {
+            if matches!(menu, Menu::Main | Menu::Help | Menu::FindInHelp) {
                 continue;
             }
             self.unbind(menu, K::Ctrl('G'));
@@ -1240,8 +1317,17 @@ impl KeyMap {
 
         // The help key toggles: pressing it again while help is open closes
         // it, same as nano's `add_to_sclist(MHELP, help_key, 0, do_exit)`.
-        self.unbind(Menu::Help, K::Ctrl('G'));
-        self.bind(Menu::Help, K::Ctrl('H'), Binding::Action(A::Cancel));
+        // Like the browser, help trades the traditional ^X/^Q/^W/^P/^N/
+        // ^Y/^V for the modern ^Q (close) and ^D/^G (previous/next match).
+        let hp = Menu::Help;
+        for k in ['X', 'Q', 'W', 'P', 'N', 'Y', 'V'] {
+            self.unbind(hp, K::Ctrl(k));
+        }
+        self.unbind(hp, K::Ctrl('G'));
+        self.bind(hp, K::Ctrl('H'), Binding::Action(A::Cancel));
+        self.bind(hp, K::Ctrl('Q'), Binding::Action(A::Cancel));
+        self.bind(hp, K::Ctrl('D'), Binding::Action(A::FindPrevious));
+        self.bind(hp, K::Ctrl('G'), Binding::Action(A::FindNext));
     }
 }
 
@@ -1405,5 +1491,34 @@ mod tests {
             action(Menu::Execute, Key::Ctrl('T')),
             Some(Binding::Action(Action::Speller))
         );
+    }
+
+    #[test]
+    fn shift_meta_folds_to_meta_until_a_sh_m_key_is_bound_like_nano() {
+        let mut km = KeyMap::defaults(false);
+        let justify = Some(&Binding::Action(Action::FullJustify));
+        assert_eq!(km.lookup(Menu::Main, Key::ShiftMeta('J')), justify);
+        assert_eq!(
+            km.lookup_menu_only(Menu::Main, Key::ShiftMeta('J')),
+            justify
+        );
+        assert_eq!(km.fold_key(Key::ShiftMeta('J')), Key::Meta('J'));
+
+        // nano's shifted_metas: naming any Sh-M- key, even in an unbind,
+        // makes every Sh-M- key distinct from its plain Meta one.
+        km.unbind(Menu::Main, Key::ShiftMeta('Q'));
+        assert_eq!(km.lookup(Menu::Main, Key::ShiftMeta('J')), None);
+        assert_eq!(km.fold_key(Key::ShiftMeta('J')), Key::ShiftMeta('J'));
+        assert_eq!(km.lookup(Menu::Main, Key::Meta('J')), justify);
+        km.bind(
+            Menu::Main,
+            Key::ShiftMeta('J'),
+            Binding::Action(Action::Cut),
+        );
+        assert_eq!(
+            km.lookup(Menu::Main, Key::ShiftMeta('J')),
+            Some(&Binding::Action(Action::Cut))
+        );
+        assert_eq!(km.lookup(Menu::Main, Key::Meta('J')), justify);
     }
 }

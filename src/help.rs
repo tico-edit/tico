@@ -269,9 +269,17 @@ fn shortcut_lines(menu: Menu, keymap: &KeyMap, restricted: bool) -> Vec<String> 
             if *action == Action::Enter && menu != Menu::Main {
                 continue;
             }
-            // `M-V` works at the prompts too, but nano lists it only in
-            // the main menu's help.
-            if *action == Action::Verbatim && menu != Menu::Main {
+            // `M-V`, word movement and Home/End work at the prompts too,
+            // but nano lists them only in the main menu's help (and word
+            // movement in the browser's).
+            if menu != Menu::Main
+                && (*action == Action::Verbatim
+                    || (menu != Menu::Browser
+                        && matches!(
+                            *action,
+                            Action::PrevWord | Action::NextWord | Action::Home | Action::End
+                        )))
+            {
                 continue;
             }
             if restricted && crate::keymap::hidden_when_restricted(menu, *action) {

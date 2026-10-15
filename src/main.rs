@@ -64,6 +64,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // nano: "When getting untranslated escape sequences, the mouse cannot
+    // be used." tico always decodes key sequences itself (crossterm, no
+    // terminfo), so turning the mouse off at startup is all that
+    // `set rawsequences` does; `M-M` can still turn it back on.
+    if options.rawsequences {
+        options.mouse = false;
+    }
     // nano's `init_operating_dir`: everything happens from inside it.
     if let Some(dir) = options.operatingdir.take() {
         match fileio::resolve_directory(&dir) {
