@@ -10,10 +10,6 @@ here.
 
 ## Options parsed but never consulted
 
-### Display
-
-- [ ] `rawsequences`
-
 ### Editing
 
 - [ ] `breaklonglines` — the `M-L` toggle flips the flag; typing never
