@@ -12,7 +12,6 @@ here.
 
 ### Display
 
-- [ ] `bookstyle`
 - [ ] `rawsequences`
 - [ ] `afterends`
 

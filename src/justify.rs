@@ -57,7 +57,9 @@ fn inpar(line: &[char], quote_re: Option<&Regex>) -> bool {
 }
 
 /// nano's `begpar`: whether `lines[idx]` begins a new paragraph.
-fn begpar(lines: &[Vec<char>], idx: usize, quote_re: Option<&Regex>) -> bool {
+/// `bookstyle` is `set bookstyle` in effect -- nano honors it only while
+/// `autoindent` is off, which the caller folds in.
+fn begpar(lines: &[Vec<char>], idx: usize, quote_re: Option<&Regex>, bookstyle: bool) -> bool {
     if idx == 0 {
         return true;
     }
@@ -66,6 +68,11 @@ fn begpar(lines: &[Vec<char>], idx: usize, quote_re: Option<&Regex>) -> bool {
     let indent_len = indent_length(&line[quot_len..]);
     if line.len() == quot_len + indent_len {
         return false;
+    }
+    // `set bookstyle`: a line starting with whitespace (before any quote
+    // prefix, so an indented line under a `>` doesn't count) begins one.
+    if bookstyle && line.first().is_some_and(|&c| is_blank(c)) {
+        return true;
     }
     let prev = &lines[idx - 1];
     let prev_quot_len = quote_length(prev, quote_re);
@@ -79,14 +86,19 @@ fn begpar(lines: &[Vec<char>], idx: usize, quote_re: Option<&Regex>) -> bool {
     if indent_len == prev_indent_len {
         return false;
     }
-    !begpar(lines, idx - 1, quote_re)
+    !begpar(lines, idx - 1, quote_re, bookstyle)
 }
 
 /// nano's `do_para_begin`: step back to the first line of the paragraph
 /// that contains (or immediately precedes) `from`.
-pub fn para_begin(lines: &[Vec<char>], from: usize, quote_re: Option<&Regex>) -> usize {
+pub fn para_begin(
+    lines: &[Vec<char>],
+    from: usize,
+    quote_re: Option<&Regex>,
+    bookstyle: bool,
+) -> usize {
     let mut idx = from.saturating_sub(1);
-    while idx > 0 && !begpar(lines, idx, quote_re) {
+    while idx > 0 && !begpar(lines, idx, quote_re, bookstyle) {
         idx -= 1;
     }
     idx
@@ -95,13 +107,21 @@ pub fn para_begin(lines: &[Vec<char>], from: usize, quote_re: Option<&Regex>) ->
 /// nano's `do_para_end`: step forward to the last line of the first
 /// paragraph found at or after `from` (the last line of the buffer when
 /// there is none).
-pub fn para_end(lines: &[Vec<char>], from: usize, quote_re: Option<&Regex>) -> usize {
+pub fn para_end(
+    lines: &[Vec<char>],
+    from: usize,
+    quote_re: Option<&Regex>,
+    bookstyle: bool,
+) -> usize {
     let last = lines.len().saturating_sub(1);
     let mut idx = from.min(last);
     while idx < last && !inpar(&lines[idx], quote_re) {
         idx += 1;
     }
-    while idx < last && inpar(&lines[idx + 1], quote_re) && !begpar(lines, idx + 1, quote_re) {
+    while idx < last
+        && inpar(&lines[idx + 1], quote_re)
+        && !begpar(lines, idx + 1, quote_re, bookstyle)
+    {
         idx += 1;
     }
     idx
@@ -110,8 +130,13 @@ pub fn para_end(lines: &[Vec<char>], from: usize, quote_re: Option<&Regex>) -> u
 /// Whether `lines[from]` sits inside a paragraph without being its first
 /// line -- nano's own gate for whether `^J` should first back up to
 /// `para_begin` before searching forward.
-pub fn in_mid_paragraph(lines: &[Vec<char>], from: usize, quote_re: Option<&Regex>) -> bool {
-    inpar(&lines[from], quote_re) && !begpar(lines, from, quote_re)
+pub fn in_mid_paragraph(
+    lines: &[Vec<char>],
+    from: usize,
+    quote_re: Option<&Regex>,
+    bookstyle: bool,
+) -> bool {
+    inpar(&lines[from], quote_re) && !begpar(lines, from, quote_re, bookstyle)
 }
 
 /// nano's `find_paragraph`: from `start` onward, the first paragraph found
@@ -120,6 +145,7 @@ pub fn find_paragraph(
     lines: &[Vec<char>],
     mut start: usize,
     quote_re: Option<&Regex>,
+    bookstyle: bool,
 ) -> Option<(usize, usize)> {
     while start < lines.len() && !inpar(&lines[start], quote_re) {
         start += 1;
@@ -130,7 +156,7 @@ pub fn find_paragraph(
     let mut end = start;
     while end + 1 < lines.len()
         && inpar(&lines[end + 1], quote_re)
-        && !begpar(lines, end + 1, quote_re)
+        && !begpar(lines, end + 1, quote_re, bookstyle)
     {
         end += 1;
     }
@@ -327,6 +353,27 @@ mod tests {
     }
 
     #[test]
+    fn bookstyle_makes_a_line_starting_with_whitespace_begin_a_paragraph() {
+        // Checked against the installed nano's M-J with and without -O.
+        let lines = chars("  aaa bbb\n  ccc ddd\n  eee\n> fff\n>  ggg\n>  hhh\n");
+        let q = Regex::new(r"^([ \t]*([!#%:;>|}]|//))+").ok();
+        let paras = |bookstyle| {
+            let mut found = Vec::new();
+            let mut at = 0;
+            while let Some((start, count)) = find_paragraph(&lines, at, q.as_ref(), bookstyle) {
+                found.push((start, count));
+                at = start + count;
+            }
+            found
+        };
+        assert_eq!(paras(false), vec![(0, 3), (3, 3)]);
+        // A quoted line's own indent comes after its `>`, so it doesn't count.
+        assert_eq!(paras(true), vec![(0, 1), (1, 1), (2, 1), (3, 3)]);
+        assert_eq!(para_begin(&lines, 2, q.as_ref(), true), 1);
+        assert_eq!(para_end(&lines, 1, q.as_ref(), true), 1);
+    }
+
+    #[test]
     fn wrap_at_matches_nano_defaults() {
         assert_eq!(wrap_at(-8, 80), 72);
         assert_eq!(wrap_at(40, 80), 40);
@@ -336,14 +383,14 @@ mod tests {
     #[test]
     fn find_paragraph_skips_blank_lines_and_stops_at_the_next_blank() {
         let lines = chars("\none two three\nfour five\n\nnext para\n");
-        let found = find_paragraph(&lines, 0, no_quote().as_ref());
+        let found = find_paragraph(&lines, 0, no_quote().as_ref(), false);
         assert_eq!(found, Some((1, 2)));
     }
 
     #[test]
     fn find_paragraph_returns_none_past_the_last_paragraph() {
         let lines = chars("text\n\n");
-        assert_eq!(find_paragraph(&lines, 2, no_quote().as_ref()), None);
+        assert_eq!(find_paragraph(&lines, 2, no_quote().as_ref(), false), None);
     }
 
     #[test]

@@ -1876,6 +1876,7 @@ impl Editor {
         }
         let quote_re = regex::Regex::new(&self.options.quotestr).ok();
         let quote_re = quote_re.as_ref();
+        let bookstyle = self.bookstyle();
         let wrap_at = crate::justify::wrap_at(self.options.fill, self.screen_cols);
         let punct = self.options.punct.clone();
         let brackets = self.options.brackets.clone();
@@ -1888,7 +1889,7 @@ impl Editor {
             let mut search_start = 0;
             let mut touched = false;
             while let Some((start, count)) =
-                crate::justify::find_paragraph(&result, search_start, quote_re)
+                crate::justify::find_paragraph(&result, search_start, quote_re, bookstyle)
             {
                 let new_lines = crate::justify::justify_paragraph(
                     &result,
@@ -1924,13 +1925,14 @@ impl Editor {
             self.set_status("Justified file");
         } else {
             let cursor_line = self.buf().cursor.line;
-            let search_start = if crate::justify::in_mid_paragraph(&lines, cursor_line, quote_re) {
-                crate::justify::para_begin(&lines, cursor_line, quote_re)
-            } else {
-                cursor_line
-            };
+            let search_start =
+                if crate::justify::in_mid_paragraph(&lines, cursor_line, quote_re, bookstyle) {
+                    crate::justify::para_begin(&lines, cursor_line, quote_re, bookstyle)
+                } else {
+                    cursor_line
+                };
             let Some((start, count)) =
-                crate::justify::find_paragraph(&lines, search_start, quote_re)
+                crate::justify::find_paragraph(&lines, search_start, quote_re, bookstyle)
             else {
                 self.set_status("Nothing to justify");
                 return;
@@ -2175,6 +2177,12 @@ impl Editor {
             .collect()
     }
 
+    /// Whether `set bookstyle` applies to paragraph detection: nano's
+    /// `begpar` ignores it while `autoindent` is on.
+    fn bookstyle(&self) -> bool {
+        self.options.bookstyle && !self.options.autoindent
+    }
+
     /// nano's `to_para_begin` (`M-(`, `M-9`; `^W` in the Go To Line
     /// prompt): to the first line of the paragraph the cursor is in, or
     /// of the previous one when already on that line. A paragraph here
@@ -2184,7 +2192,7 @@ impl Editor {
         let quote_re = regex::Regex::new(&self.options.quotestr).ok();
         let lines = self.char_lines();
         let from = self.buf().cursor.line;
-        let line = crate::justify::para_begin(&lines, from, quote_re.as_ref());
+        let line = crate::justify::para_begin(&lines, from, quote_re.as_ref(), self.bookstyle());
         self.buf_mut().cursor = Pos::new(line, 0);
         self.scroll_to_cursor_centered();
     }
@@ -2197,7 +2205,7 @@ impl Editor {
         let quote_re = regex::Regex::new(&self.options.quotestr).ok();
         let lines = self.char_lines();
         let from = self.buf().cursor.line;
-        let line = crate::justify::para_end(&lines, from, quote_re.as_ref());
+        let line = crate::justify::para_end(&lines, from, quote_re.as_ref(), self.bookstyle());
         let cursor = if line + 1 < lines.len() {
             Pos::new(line + 1, 0)
         } else {
