@@ -465,6 +465,49 @@ impl Cli {
     }
 }
 
+/// `set colonparsing` (`-@`): nano's reading of a `NAME:LINE` or
+/// `NAME:LINE:COLUMN` argument naming a file that doesn't exist, as
+/// `NAME` opened at that position -- but only when `NAME` itself does
+/// exist (`exists`), trying the shorter `NAME:LINE` as the name first.
+/// `Ok(None)` when the argument is to be taken as the plain name it is;
+/// `Err` (nano dies with "Invalid number") when the digits don't make a
+/// number.
+pub fn split_colon_position(
+    name: &str,
+    exists: impl Fn(&str) -> bool,
+) -> Result<Option<(String, i64, Option<i64>)>, std::num::ParseIntError> {
+    if !name.contains(':') || exists(name) {
+        return Ok(None);
+    }
+    let bytes = name.as_bytes();
+    let mut coda = bytes.len();
+    loop {
+        // Back over the trailing digits, though never to the name's
+        // first two bytes.
+        loop {
+            coda -= 1;
+            if !(coda > 1 && bytes[coda].is_ascii_digit()) {
+                break;
+            }
+        }
+        if bytes[coda] != b':' || !bytes.get(coda + 1).is_some_and(u8::is_ascii_digit) {
+            return Ok(None);
+        }
+        let base = &name[..coda];
+        let numbers = &name[coda + 1..];
+        if exists(base) {
+            let mut parts = numbers.splitn(2, ':');
+            let line = parts.next().unwrap_or_default().parse::<i64>()?;
+            let column = parts.next().map(str::parse::<i64>).transpose()?;
+            return Ok(Some((base.to_string(), line, column)));
+        }
+        // When this was the last colon, look for one before it.
+        if numbers.contains(':') {
+            return Ok(None);
+        }
+    }
+}
+
 /// Parsed positional argument: an optional `+LINE[,COLUMN]` followed by a
 /// filename.
 pub struct FileArg {
@@ -514,6 +557,29 @@ mod tests {
         };
         cli.apply(&mut options);
         options
+    }
+
+    #[test]
+    fn colon_parsing_splits_off_a_line_and_column_like_nano() {
+        let exists = |names: &'static [&'static str]| move |n: &str| names.contains(&n);
+        let split = |name, names| split_colon_position(name, exists(names));
+        let got = |name: &str, line, column| Ok(Some((name.to_string(), line, column)));
+        assert_eq!(split("foo.c:12", &["foo.c"]), got("foo.c", 12, None));
+        assert_eq!(split("foo.c:12:5", &["foo.c"]), got("foo.c", 12, Some(5)));
+        // The shorter split is tried first.
+        assert_eq!(
+            split("foo.c:12:5", &["foo.c", "foo.c:12"]),
+            got("foo.c:12", 5, None)
+        );
+        // A name that exists as it is, or whose base doesn't, stays whole.
+        assert_eq!(split("foo.c:12", &["foo.c:12", "foo.c"]), Ok(None));
+        assert_eq!(split("foo.c:12", &[]), Ok(None));
+        assert_eq!(split("foo.c:1:2:3", &["foo.c"]), Ok(None));
+        assert_eq!(split("foo.c:", &["foo.c"]), Ok(None));
+        assert_eq!(split("foo.c:12x", &["foo.c"]), Ok(None));
+        assert_eq!(split("a:5", &["a"]), got("a", 5, None));
+        assert_eq!(split(":5", &[""]), Ok(None));
+        assert!(split("foo.c:99999999999999999999", &["foo.c"]).is_err());
     }
 
     #[test]

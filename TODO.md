@@ -12,5 +12,4 @@ here.
 
 ### Editing
 
-- [ ] `colonparsing`
 - [ ] `rebinddelete`
