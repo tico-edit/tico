@@ -1,5 +1,13 @@
 # tico
 
+A friendly terminal text editor that keeps nano's key bindings and
+configuration, and adds syntax-aware (tree-sitter) highlighting.
+
+![tico editing hello.cxx, a C++ program, on a white CRT monitor](https://ticoedit.org/images/hello-cxx-crt.png)
+
+Downloads, documentation and the FAQ are at
+**[ticoedit.org](https://ticoedit.org)**.
+
 ## License
 
 tico is released under the MIT License (see `LICENSE`), with these
