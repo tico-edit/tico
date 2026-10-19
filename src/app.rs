@@ -365,6 +365,11 @@ pub struct Editor {
     pub language_themes: std::collections::HashMap<String, crate::theme::Theme>,
     pub cutbuffer: String,
     pub cut_was_consecutive: bool,
+    /// After a zap of a whole line (or the rest of one), the buffer and
+    /// undo-stack depth it left: a further line zap straight after it
+    /// joins the same undo step (nano's ZAP undo item plus
+    /// `keep_cutbuffer`). Cleared by any other action.
+    pub zap_run: Option<(usize, usize)>,
     /// nano's `cycling_aim`: where the next `M-%` Cycle puts the cursor
     /// line -- 0 the center, 1 the top row, 2 the bottom row. Reset to 0
     /// by any keystroke other than Cycle itself.
@@ -506,6 +511,7 @@ impl Editor {
             language_themes: std::collections::HashMap::new(),
             cutbuffer: String::new(),
             cut_was_consecutive: false,
+            zap_run: None,
             cycling_aim: 0,
             completion: None,
             full_refresh_pending: false,
@@ -1180,7 +1186,9 @@ impl Editor {
     }
 
     fn do_delete(&mut self) {
-        if !self.at_end_above_magic_line() {
+        if self.options.zap && self.buf().mark.is_some() {
+            self.do_zap();
+        } else if !self.at_end_above_magic_line() {
             self.buf_mut().delete_forward();
         }
     }
@@ -1188,6 +1196,10 @@ impl Editor {
     /// nano's do_backspace is a do_left followed by a do_delete, so on
     /// the magic line under a line with text it only moves the cursor.
     fn do_backspace(&mut self) {
+        if self.options.zap && self.buf().mark.is_some() {
+            self.do_zap();
+            return;
+        }
         let cursor = self.buf().cursor;
         if cursor.col == 0 && cursor.line > 0 {
             self.buf_mut().move_left();
@@ -1214,6 +1226,9 @@ impl Editor {
         // to the same cutbuffer" chain.
         if !matches!(action, Cut | CutRestOfFile) {
             self.cut_was_consecutive = false;
+        }
+        if action != Zap {
+            self.zap_run = None;
         }
         if action != Cycle {
             self.cycling_aim = 0;
@@ -2233,22 +2248,67 @@ impl Editor {
         self.set_status("Pasted");
     }
 
-    fn do_zap(&mut self) {
-        if let Some((start, end)) = self.selection_range() {
-            self.buf_mut().delete_range(start, end);
+    /// nano's `is_cuttable`: whether a cut (or zap) has anything to take
+    /// -- not with the mark on the cursor, nor, without a mark, at the end
+    /// of the last line (only counting from the cursor when `cut_cliff`,
+    /// i.e. `cutfromcursor` applies), nor from a line's end just above the
+    /// magic line. Otherwise says "Nothing was cut" and drops the mark.
+    fn is_cuttable(&mut self, cut_cliff: bool) -> bool {
+        let buf = self.buf();
+        let cursor = buf.cursor;
+        let from = if cut_cliff { cursor.col } else { 0 };
+        let at_end = from >= buf.line(cursor.line).chars().count();
+        let line_count = buf.line_count();
+        let nothing = (cursor.line + 1 >= line_count && at_end && buf.mark.is_none())
+            || buf.mark == Some(cursor)
+            || (from > 0 && !self.options.nonewlines && at_end && cursor.line + 2 == line_count);
+        if nothing {
+            self.set_status("Nothing was cut");
             self.buf_mut().mark = None;
-            self.set_status("Zapped");
-        } else {
-            let line = self.buf().cursor.line;
-            let has_next = line + 1 < self.buf().line_count();
-            let start = Pos::new(line, 0);
-            let end = if has_next {
-                Pos::new(line + 1, 0)
-            } else {
-                Pos::new(line, self.buf().line(line).chars().count())
-            };
-            self.buf_mut().delete_range(start, end);
+            self.buf_mut().softmark = false;
         }
+        !nothing
+    }
+
+    /// nano's `zap_text` (`M-Del`, and Bsp/Del on a marked region under
+    /// `set zap`): cut without touching the cutbuffer -- the marked region,
+    /// else the current line, or with `cutfromcursor` the rest of it (or
+    /// its line break, at its end). A run of consecutive line zaps undoes
+    /// as one, like nano's.
+    fn do_zap(&mut self) {
+        let marked = self.buf().mark.is_some();
+        if !self.is_cuttable(self.options.cutfromcursor && !marked) {
+            return;
+        }
+        let (start, end) = if let Some(range) = self.selection_range() {
+            range
+        } else {
+            let cursor = self.buf().cursor;
+            let line = cursor.line;
+            let line_len = self.buf().line(line).chars().count();
+            let has_next = line + 1 < self.buf().line_count();
+            if self.options.cutfromcursor {
+                let end = if cursor.col < line_len || !has_next {
+                    Pos::new(line, line_len)
+                } else {
+                    Pos::new(line + 1, 0)
+                };
+                (cursor, end)
+            } else if has_next {
+                (Pos::new(line, 0), Pos::new(line + 1, 0))
+            } else {
+                (Pos::new(line, 0), Pos::new(line, line_len))
+            }
+        };
+        let continues_run = self.zap_run == Some((self.current, self.buf().undo_stack.len()));
+        self.buf_mut().delete_range(start, end);
+        self.buf_mut().mark = None;
+        self.buf_mut().softmark = false;
+        if continues_run {
+            self.buf_mut().merge_last_two_edits();
+        }
+        self.zap_run = (!marked).then(|| (self.current, self.buf().undo_stack.len()));
+        self.status = None;
     }
 
     /// nano's `chop_word(FALSE)` (`M-Bsp`, `Sh-^Del`): delete back to the
@@ -4038,6 +4098,58 @@ mod tests {
             ed.insert_char(c);
         }
         assert_eq!(ed.buf().rope.to_string(), "one two three");
+    }
+
+    #[test]
+    fn set_zap_lets_backspace_and_delete_erase_the_marked_region() {
+        for action in [Action::Backspace, Action::Delete] {
+            let mut ed = test_editor("hello world\nline two\n");
+            ed.options.zap = true;
+            ed.cutbuffer = "kept".into();
+            ed.buf_mut().mark = Some(Pos::new(0, 0));
+            ed.buf_mut().cursor = Pos::new(0, 3);
+            ed.execute(action);
+            assert_eq!(ed.buf().rope.to_string(), "lo world\nline two\n");
+            assert_eq!(ed.buf().mark, None);
+            assert_eq!(ed.cutbuffer, "kept", "a zap leaves the cutbuffer alone");
+            // An empty region is nothing to cut, and drops the mark.
+            ed.buf_mut().mark = Some(Pos::new(0, 1));
+            ed.buf_mut().cursor = Pos::new(0, 1);
+            ed.execute(action);
+            assert_eq!(ed.status.as_deref(), Some("Nothing was cut"));
+            assert_eq!(ed.buf().mark, None);
+            assert_eq!(ed.buf().rope.to_string(), "lo world\nline two\n");
+        }
+        // Without the setting, they erase a character as usual.
+        let mut ed = test_editor("hello\n");
+        ed.buf_mut().mark = Some(Pos::new(0, 0));
+        ed.buf_mut().cursor = Pos::new(0, 3);
+        ed.execute(Action::Backspace);
+        assert_eq!(ed.buf().rope.to_string(), "helo\n");
+    }
+
+    #[test]
+    fn consecutive_line_zaps_undo_as_one_and_cutfromcursor_zaps_the_rest() {
+        let mut ed = test_editor("one\ntwo\nthree\n");
+        ed.execute(Action::Zap);
+        ed.execute(Action::Zap);
+        assert_eq!(ed.buf().rope.to_string(), "three\n");
+        ed.execute(Action::Undo);
+        assert_eq!(ed.buf().rope.to_string(), "one\ntwo\nthree\n");
+        // Something in between ends the run.
+        ed.execute(Action::Zap);
+        ed.execute(Action::Down);
+        ed.execute(Action::Zap);
+        ed.execute(Action::Undo);
+        assert_eq!(ed.buf().rope.to_string(), "two\nthree\n");
+
+        let mut ed = test_editor("hello world\nline two\n");
+        ed.options.cutfromcursor = true;
+        ed.buf_mut().cursor = Pos::new(0, 2);
+        ed.execute(Action::Zap);
+        assert_eq!(ed.buf().rope.to_string(), "he\nline two\n");
+        ed.execute(Action::Zap);
+        assert_eq!(ed.buf().rope.to_string(), "heline two\n");
     }
 
     #[test]

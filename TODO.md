@@ -12,6 +12,5 @@ here.
 
 ### Editing
 
-- [ ] `zap` (the setting: Backspace/Delete erase the marked region)
 - [ ] `colonparsing`
 - [ ] `rebinddelete`
