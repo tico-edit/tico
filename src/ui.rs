@@ -140,6 +140,7 @@ pub fn run(editor: &mut Editor) -> io::Result<()> {
             loop {
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        let key = rebind_delete(editor, key);
                         handle_key(editor, key);
                         dirty = true;
                     }
@@ -747,6 +748,23 @@ fn activate_shortcut_click(
     {
         handle_key(editor, kev);
     }
+}
+
+/// `set rebinddelete` (`-d`): swap the plain Backspace and Delete keys,
+/// for terminals whose Backspace sends what others send for Delete (nano
+/// does this in `parse_kbinput`, so it holds in every menu and prompt).
+/// Ctrl+H, and the modified forms of either key, are left alone, as is a
+/// keystroke being taken in verbatim, which nano reads raw.
+fn rebind_delete(editor: &Editor, key: KeyEvent) -> KeyEvent {
+    if !editor.options.rebinddelete || editor.verbatim.is_some() || !key.modifiers.is_empty() {
+        return key;
+    }
+    let code = match key.code {
+        KeyCode::Backspace => KeyCode::Delete,
+        KeyCode::Delete => KeyCode::Backspace,
+        _ => return key,
+    };
+    KeyEvent { code, ..key }
 }
 
 /// The crossterm `KeyEvent` that, fed through `handle_key`, has the same
@@ -8793,6 +8811,28 @@ mod tests {
             shortcut_bar_click_index(20, &entries, 0, 16),
             None,
             "beyond the last column"
+        );
+    }
+
+    #[test]
+    fn rebinddelete_swaps_the_plain_backspace_and_delete_keys() {
+        let mut ed = test_editor("abc\n");
+        ed.buf_mut().cursor = Pos::new(0, 1);
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        ed.options.rebinddelete = true;
+        let key = rebind_delete(&ed, plain(KeyCode::Backspace));
+        handle_key(&mut ed, key);
+        assert_eq!(ed.buf().rope.to_string(), "ac\n");
+        let key = rebind_delete(&ed, plain(KeyCode::Delete));
+        handle_key(&mut ed, key);
+        assert_eq!(ed.buf().rope.to_string(), "c\n");
+        // Modified forms stay as they are.
+        let alt = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(rebind_delete(&ed, alt), alt);
+        ed.options.rebinddelete = false;
+        assert_eq!(
+            rebind_delete(&ed, plain(KeyCode::Backspace)),
+            plain(KeyCode::Backspace)
         );
     }
 

@@ -8,8 +8,5 @@ Syntax highlighting is intentionally *not* nano-compatible; see
 `DIFFERENCES.md`. Nothing about nanorc `color`/`syntax` directives belongs
 here.
 
-## Options parsed but never consulted
-
-### Editing
-
-- [ ] `rebinddelete`
+Nothing is currently listed: every nano 8.7.1 option tico parses is
+also consulted.
