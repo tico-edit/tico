@@ -1026,6 +1026,7 @@ impl Editor {
                 run.tried.push(word);
                 run.col = i;
                 self.buf_mut().insert_str(&rest);
+                self.hard_wrap_if_overlong();
                 self.completion = Some(run);
                 return;
             }
@@ -1547,6 +1548,55 @@ impl Editor {
         } else {
             self.buf_mut().insert_char(c);
         }
+        self.hard_wrap_if_overlong();
+    }
+
+    /// `breaklonglines`: after typing or pasting onto the cursor's line,
+    /// hard-wrap it when it now runs past the fill column (nano's
+    /// `do_wrap`, run from `inject` and `paste_text`). The wrap joins the
+    /// undo step of the edit that caused it, as nano slips its
+    /// SPLIT_BEGIN under that edit's undo item: one undo takes back both.
+    fn hard_wrap_if_overlong(&mut self) {
+        if !self.options.breaklonglines {
+            return;
+        }
+        let quote_re = regex::Regex::new(&self.options.quotestr).ok();
+        let params = crate::hardwrap::WrapParams {
+            wrap_at: crate::justify::wrap_at(self.options.fill, self.screen_cols),
+            tabsize: self.options.tabsize as usize,
+            quote_re: quote_re.as_ref(),
+            autoindent: self.options.autoindent,
+            trimblanks: self.options.trimblanks,
+        };
+        let cursor = self.buf().cursor;
+        let line: Vec<char> = self.buf().line(cursor.line).chars().collect();
+        if !crate::hardwrap::needs_wrap(&line, &params) {
+            return;
+        }
+        // Restore the magic line first, so that it goes into the undo step
+        // of the typing that took it rather than being left for later.
+        self.ensure_magic_line();
+        let spillage_is_next = self.buf().spillage_line == Some(cursor.line + 1);
+        let lines = self.char_lines();
+        let Some(wrapped) =
+            crate::hardwrap::hard_wrap(&lines, cursor.line, cursor.col, spillage_is_next, &params)
+        else {
+            return;
+        };
+        let text: String = wrapped.lines[0]
+            .iter()
+            .chain(std::iter::once(&'\n'))
+            .chain(wrapped.lines[1].iter())
+            .collect();
+        let after = Pos::new(cursor.line + wrapped.cursor.0, wrapped.cursor.1);
+        self.buf_mut().replace_lines(
+            cursor.line,
+            cursor.line + wrapped.replaced - 1,
+            &text,
+            after,
+        );
+        self.buf_mut().merge_last_two_edits();
+        self.buf_mut().spillage_line = Some(cursor.line + 1);
     }
 
     /// Put what a verbatim keystroke produced into the text at the cursor
@@ -1559,6 +1609,7 @@ impl Editor {
         for c in text.chars() {
             self.buf_mut().insert_char(if c == '\n' { '\0' } else { c });
         }
+        self.hard_wrap_if_overlong();
         // Typing drops a Shift-selection, as any edit does (see
         // `ui::handle_editing_key`, which this keystroke bypasses).
         if self.buf().softmark {
@@ -1597,6 +1648,10 @@ impl Editor {
         self.cycling_aim = 0;
         self.completion = None;
         self.buf_mut().insert_str(&clean);
+        // nano's `paste_text`: wrap only a paste that stayed on one line.
+        if !clean.contains('\n') {
+            self.hard_wrap_if_overlong();
+        }
         if self.buf().softmark {
             self.buf_mut().mark = None;
             self.buf_mut().softmark = false;
@@ -2172,6 +2227,9 @@ impl Editor {
         }
         let text = self.cutbuffer.clone();
         self.buf_mut().insert_str(&text);
+        if !text.contains('\n') {
+            self.hard_wrap_if_overlong();
+        }
         self.set_status("Pasted");
     }
 
@@ -3944,6 +4002,42 @@ mod tests {
         let mut ed = Editor::new(Options::default(), KeyMap::new());
         ed.buffers[0] = Buffer::from_text(text, None);
         ed
+    }
+
+    #[test]
+    fn breaklonglines_wraps_while_typing_and_undoes_with_the_keystroke() {
+        let mut ed = test_editor("");
+        ed.options.breaklonglines = true;
+        ed.options.fill = 10;
+        for c in "one two three four five".chars() {
+            ed.insert_char(c);
+        }
+        assert_eq!(ed.buf().rope.to_string(), "one two \nthree four \nfive\n");
+        assert_eq!(ed.buf().cursor, Pos::new(2, 4));
+        // Typing at the start of the paragraph pushes words along onto
+        // the line the last wrap spilled into, rather than a new line.
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        for c in "aa ".chars() {
+            ed.insert_char(c);
+        }
+        assert_eq!(
+            ed.buf().rope.to_string(),
+            "one two \naa three \nfour five\n"
+        );
+        // The first "a" wrapped; it undoes together with its wrap.
+        for _ in 0..2 {
+            assert!(ed.buf_mut().undo());
+        }
+        assert_eq!(ed.buf().rope.to_string(), "one two \nathree \nfour five\n");
+        assert!(ed.buf_mut().undo());
+        assert_eq!(ed.buf().rope.to_string(), "one two \nthree four \nfive\n");
+        // Without the option, nothing wraps.
+        let mut ed = test_editor("");
+        ed.options.fill = 10;
+        for c in "one two three".chars() {
+            ed.insert_char(c);
+        }
+        assert_eq!(ed.buf().rope.to_string(), "one two three");
     }
 
     #[test]

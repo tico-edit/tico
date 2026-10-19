@@ -167,6 +167,7 @@ pub struct Cli {
     #[arg(
         short = 'b',
         long = "breaklonglines",
+        overrides_with = "nowrap",
         help = "Automatically hard-wrap overlong lines"
     )]
     pub breaklonglines: bool,
@@ -283,6 +284,7 @@ pub struct Cli {
     #[arg(
         short = 'w',
         long = "nowrap",
+        overrides_with = "breaklonglines",
         help = "Don't hard-wrap long lines [default]"
     )]
     pub nowrap: bool,
@@ -382,7 +384,6 @@ impl Cli {
         flag!(wordbounds);
         flag!(zap);
         flag!(atblanks);
-        flag!(breaklonglines);
         flag!(constantshow);
         flag!(rebinddelete);
         flag!(emptyline);
@@ -397,13 +398,26 @@ impl Cli {
         flag!(saveonexit);
         flag!(unix);
         flag!(view);
-        flag!(nowrap);
         flag!(nohelp);
         flag!(afterends);
         flag!(colonparsing);
         flag!(minibar);
         flag!(zero);
         flag!(modernbindings);
+
+        // nano's legacy `nowrap` is on by default; a nanorc that unsets
+        // it asks for `breaklonglines`. Then `-w`/`-b` on the command line
+        // have the last word, overriding the nanorc either way (when both
+        // are given, whichever comes last: they override each other).
+        if !options.nowrap {
+            options.breaklonglines = true;
+        }
+        if self.nowrap {
+            options.nowrap = true;
+            options.breaklonglines = false;
+        } else if self.breaklonglines {
+            options.breaklonglines = true;
+        }
 
         if self.stateflags {
             options.stateflags = true;
@@ -500,6 +514,27 @@ mod tests {
         };
         cli.apply(&mut options);
         options
+    }
+
+    #[test]
+    fn breaklonglines_follows_nowrap_in_the_nanorc_and_the_last_of_b_and_w() {
+        assert!(!apply(&[]).breaklonglines);
+        assert!(apply(&["-b"]).breaklonglines);
+        assert!(!apply(&["-b", "-w"]).breaklonglines);
+        assert!(apply(&["-w", "-b"]).breaklonglines);
+        let from_rc = |nowrap, args: &[&str]| {
+            let cli = Cli::try_parse_from(std::iter::once(&"tico").chain(args)).unwrap();
+            let mut options = crate::options::Options {
+                nowrap,
+                ..Default::default()
+            };
+            cli.apply(&mut options);
+            options.breaklonglines
+        };
+        // `unset nowrap` in a nanorc.
+        assert!(from_rc(false, &[]));
+        assert!(!from_rc(false, &["--nowrap"]));
+        assert!(!from_rc(true, &[]));
     }
 
     #[test]

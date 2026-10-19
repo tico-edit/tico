@@ -33,7 +33,7 @@ pub fn wrap_at(fill: i32, screen_cols: usize) -> usize {
 /// nano's `quote_length`: the length (in chars) of the leading substring
 /// of `line` matched by `quote_re`, when that match starts at position 0.
 /// `None` (an unparseable `quotestr`) means "no quoting recognized".
-fn quote_length(line: &[char], quote_re: Option<&Regex>) -> usize {
+pub(crate) fn quote_length(line: &[char], quote_re: Option<&Regex>) -> usize {
     let Some(re) = quote_re else {
         return 0;
     };
@@ -45,12 +45,12 @@ fn quote_length(line: &[char], quote_re: Option<&Regex>) -> usize {
 }
 
 /// nano's `indent_length`: the leading run of blanks.
-fn indent_length(line: &[char]) -> usize {
+pub(crate) fn indent_length(line: &[char]) -> usize {
     line.iter().take_while(|&&c| is_blank(c)).count()
 }
 
 /// nano's `inpar`: whether `line` has any text beyond its quote+indent.
-fn inpar(line: &[char], quote_re: Option<&Regex>) -> bool {
+pub(crate) fn inpar(line: &[char], quote_re: Option<&Regex>) -> bool {
     let q = quote_length(line, quote_re);
     let i = indent_length(&line[q..]);
     line.len() > q + i
@@ -59,7 +59,12 @@ fn inpar(line: &[char], quote_re: Option<&Regex>) -> bool {
 /// nano's `begpar`: whether `lines[idx]` begins a new paragraph.
 /// `bookstyle` is `set bookstyle` in effect -- nano honors it only while
 /// `autoindent` is off, which the caller folds in.
-fn begpar(lines: &[Vec<char>], idx: usize, quote_re: Option<&Regex>, bookstyle: bool) -> bool {
+pub(crate) fn begpar(
+    lines: &[Vec<char>],
+    idx: usize,
+    quote_re: Option<&Regex>,
+    bookstyle: bool,
+) -> bool {
     if idx == 0 {
         return true;
     }

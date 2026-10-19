@@ -12,9 +12,6 @@ here.
 
 ### Editing
 
-- [ ] `breaklonglines` — the `M-L` toggle flips the flag; typing never
-      hard-wraps
-- [ ] `nowrap` (nano's legacy alias for `unset breaklonglines`)
 - [ ] `zap` (the setting: Backspace/Delete erase the marked region)
 - [ ] `colonparsing`
 - [ ] `rebinddelete`
