@@ -364,11 +364,13 @@ pub struct Editor {
     /// reading either field directly.
     pub language_themes: std::collections::HashMap<String, crate::theme::Theme>,
     pub cutbuffer: String,
-    pub cut_was_consecutive: bool,
-    /// After a zap of a whole line (or the rest of one), the buffer and
-    /// undo-stack depth it left: a further line zap straight after it
-    /// joins the same undo step (nano's ZAP undo item plus
-    /// `keep_cutbuffer`). Cleared by any other action.
+    /// After a `^K` cut of a whole line (or the rest of one), the buffer
+    /// and undo-stack depth it left: a further line cut straight after it
+    /// adds to the cutbuffer and joins the same undo step (nano's
+    /// `keep_cutbuffer` plus its CUT undo item). Cleared by any other
+    /// action, and in effect by any edit in between.
+    pub cut_run: Option<(usize, usize)>,
+    /// The same as `cut_run`, for zaps (nano's ZAP undo item).
     pub zap_run: Option<(usize, usize)>,
     /// nano's `cycling_aim`: where the next `M-%` Cycle puts the cursor
     /// line -- 0 the center, 1 the top row, 2 the bottom row. Reset to 0
@@ -510,7 +512,7 @@ impl Editor {
             theme: crate::theme::Theme::builtin_default(),
             language_themes: std::collections::HashMap::new(),
             cutbuffer: String::new(),
-            cut_was_consecutive: false,
+            cut_run: None,
             zap_run: None,
             cycling_aim: 0,
             completion: None,
@@ -1225,7 +1227,7 @@ impl Editor {
         // Any action other than Cut clears nano's "consecutive cuts append
         // to the same cutbuffer" chain.
         if !matches!(action, Cut | CutRestOfFile) {
-            self.cut_was_consecutive = false;
+            self.cut_run = None;
         }
         if action != Zap {
             self.zap_run = None;
@@ -2177,30 +2179,25 @@ impl Editor {
         }
     }
 
+    /// nano's `cut_text` (`^K`): move the marked region, else the current
+    /// line, or with `cutfromcursor` the rest of it (or its line break, at
+    /// its end), into the cutbuffer. Line cuts in a row add to the
+    /// cutbuffer and undo as one; a region cut starts the cutbuffer over.
     fn do_cut(&mut self) {
-        if let Some((start, end)) = self.selection_range() {
-            let text = self.buf_mut().delete_range(start, end);
-            self.cutbuffer = text;
-            self.buf_mut().mark = None;
-        } else {
-            let line = self.buf().cursor.line;
-            let line_len = self.buf().line(line).chars().count();
-            let has_next = line + 1 < self.buf().line_count();
-            let end = if has_next {
-                Pos::new(line + 1, 0)
-            } else {
-                Pos::new(line, line_len)
-            };
-            let start = Pos::new(line, 0);
-            let text = self.buf_mut().delete_range(start, end);
-            if self.cut_was_consecutive {
-                self.cutbuffer.push_str(&text);
-            } else {
-                self.cutbuffer = text;
-            }
+        let marked = self.buf().mark.is_some();
+        if !self.is_cuttable(self.options.cutfromcursor && !marked) {
+            return;
         }
-        self.cut_was_consecutive = true;
-        self.set_status("Cut");
+        let continues_run = !marked && self.cut_run == self.run_mark();
+        let text = self.snip();
+        if continues_run {
+            self.buf_mut().merge_last_two_edits();
+            self.cutbuffer.push_str(&text);
+        } else {
+            self.cutbuffer = text;
+        }
+        self.cut_run = (!marked).then(|| self.run_mark()).flatten();
+        self.status = None;
     }
 
     /// `M-T` (and `^V` at the Execute prompt): nano's `cut_till_eof`. The
@@ -2222,7 +2219,7 @@ impl Editor {
         }
         let end = Pos::new(last_line, self.buf().line(last_line).chars().count());
         self.cutbuffer = self.buf_mut().delete_range(start, end);
-        self.cut_was_consecutive = false;
+        self.cut_run = None;
         self.status = None;
     }
 
@@ -2270,16 +2267,16 @@ impl Editor {
         !nothing
     }
 
-    /// nano's `zap_text` (`M-Del`, and Bsp/Del on a marked region under
-    /// `set zap`): cut without touching the cutbuffer -- the marked region,
-    /// else the current line, or with `cutfromcursor` the rest of it (or
-    /// its line break, at its end). A run of consecutive line zaps undoes
-    /// as one, like nano's.
-    fn do_zap(&mut self) {
-        let marked = self.buf().mark.is_some();
-        if !self.is_cuttable(self.options.cutfromcursor && !marked) {
-            return;
-        }
+    /// Where a run of consecutive line cuts or zaps has got to: the
+    /// current buffer and its undo-stack depth.
+    fn run_mark(&self) -> Option<(usize, usize)> {
+        Some((self.current, self.buf().undo_stack.len()))
+    }
+
+    /// nano's `do_snip` for a cut or zap: delete and return the marked
+    /// region, else the current line, or with `cutfromcursor` the rest of
+    /// it (or its line break, at its end). Drops the mark.
+    fn snip(&mut self) -> String {
         let (start, end) = if let Some(range) = self.selection_range() {
             range
         } else {
@@ -2300,14 +2297,27 @@ impl Editor {
                 (Pos::new(line, 0), Pos::new(line, line_len))
             }
         };
-        let continues_run = self.zap_run == Some((self.current, self.buf().undo_stack.len()));
-        self.buf_mut().delete_range(start, end);
+        let text = self.buf_mut().delete_range(start, end);
         self.buf_mut().mark = None;
         self.buf_mut().softmark = false;
+        text
+    }
+
+    /// nano's `zap_text` (`M-Del`, and Bsp/Del on a marked region under
+    /// `set zap`): what `^K` would cut, but without touching the
+    /// cutbuffer. A run of consecutive line zaps undoes as one, like
+    /// nano's.
+    fn do_zap(&mut self) {
+        let marked = self.buf().mark.is_some();
+        if !self.is_cuttable(self.options.cutfromcursor && !marked) {
+            return;
+        }
+        let continues_run = !marked && self.zap_run == self.run_mark();
+        self.snip();
         if continues_run {
             self.buf_mut().merge_last_two_edits();
         }
-        self.zap_run = (!marked).then(|| (self.current, self.buf().undo_stack.len()));
+        self.zap_run = (!marked).then(|| self.run_mark()).flatten();
         self.status = None;
     }
 
@@ -4126,6 +4136,32 @@ mod tests {
         ed.buf_mut().cursor = Pos::new(0, 3);
         ed.execute(Action::Backspace);
         assert_eq!(ed.buf().rope.to_string(), "helo\n");
+    }
+
+    #[test]
+    fn cut_honors_cutfromcursor_and_line_cuts_in_a_row_undo_as_one() {
+        let mut ed = test_editor("hello world\nline two\nthree\n");
+        ed.options.cutfromcursor = true;
+        ed.buf_mut().cursor = Pos::new(0, 2);
+        ed.execute(Action::Cut);
+        assert_eq!(ed.buf().rope.to_string(), "he\nline two\nthree\n");
+        ed.execute(Action::Cut);
+        assert_eq!(ed.buf().rope.to_string(), "heline two\nthree\n");
+        assert_eq!(ed.cutbuffer, "llo world\n");
+        assert_eq!(ed.status, None);
+        ed.execute(Action::Undo);
+        assert_eq!(ed.buf().rope.to_string(), "hello world\nline two\nthree\n");
+
+        // An edit in between starts the cutbuffer over.
+        let mut ed = test_editor("one\ntwo\nthree\n");
+        ed.execute(Action::Cut);
+        ed.insert_char('x');
+        ed.execute(Action::Cut);
+        assert_eq!(ed.cutbuffer, "xtwo\n");
+        // Nothing to cut at the end of the buffer.
+        ed.buf_mut().cursor = Pos::new(1, 0);
+        ed.execute(Action::Cut);
+        assert_eq!(ed.status.as_deref(), Some("Nothing was cut"));
     }
 
     #[test]
