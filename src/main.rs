@@ -92,7 +92,27 @@ fn main() -> anyhow::Result<()> {
     // to name, so it stands for itself.
     let startup_problem = loaded.startup_problem.or_else(|| warnings.first().cloned());
 
-    let file_args = cli::parse_file_args(&cli.files);
+    let mut file_args = cli::parse_file_args(&cli.files);
+    if options.colonparsing {
+        for fa in file_args
+            .iter_mut()
+            .filter(|fa| fa.line.is_none() && fa.column.is_none() && fa.path != "-")
+        {
+            let exists = |name: &str| std::fs::metadata(name).is_ok();
+            match cli::split_colon_position(&fa.path, exists) {
+                Ok(Some((path, line, column))) => {
+                    fa.path = path;
+                    fa.line = Some(line);
+                    fa.column = column;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    eprintln!("Invalid number");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     let mut editor = app::Editor::new(options, loaded.keymap);
     editor.theme = theme;
     editor.language_themes = language_themes;

@@ -8,13 +8,5 @@ Syntax highlighting is intentionally *not* nano-compatible; see
 `DIFFERENCES.md`. Nothing about nanorc `color`/`syntax` directives belongs
 here.
 
-## Options parsed but never consulted
-
-### Editing
-
-- [ ] `breaklonglines` — the `M-L` toggle flips the flag; typing never
-      hard-wraps
-- [ ] `nowrap` (nano's legacy alias for `unset breaklonglines`)
-- [ ] `zap` (the setting: Backspace/Delete erase the marked region)
-- [ ] `colonparsing`
-- [ ] `rebinddelete`
+Nothing is currently listed: every nano 8.7.1 option tico parses is
+also consulted.

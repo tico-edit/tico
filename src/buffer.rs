@@ -203,6 +203,12 @@ pub struct Buffer {
     /// sorted 0-based line indices. `shift_anchors` keeps them in step
     /// with every edit, undo and redo.
     pub anchors: Vec<usize>,
+    /// The line that the last automatic hard wrap (`breaklonglines`)
+    /// carried text over to (nano's `spillage_line`): when the line above
+    /// it overflows again, the excess is prepended to it rather than
+    /// getting a line of its own. Kept in step with edits like `anchors`;
+    /// forgotten once the line itself is joined to another or removed.
+    pub spillage_line: Option<usize>,
 }
 
 impl Buffer {
@@ -231,6 +237,7 @@ impl Buffer {
             highlight_cache: std::cell::RefCell::new(None),
             highlighting_size_warning_shown: false,
             anchors: Vec::new(),
+            spillage_line: None,
         }
     }
 
@@ -346,6 +353,14 @@ impl Buffer {
             result.push(first);
         }
         self.anchors = result;
+        // The spillage line is a line of its own: it survives an edit
+        // within it (or one that starts at it), but not one that merges
+        // it into the line above.
+        self.spillage_line = match self.spillage_line {
+            Some(line) if line <= first => Some(line),
+            Some(line) if line > last => Some(line + first + count - last - 1),
+            _ => None,
+        };
     }
 
     /// Replace `[start,end)` with `text`, recording an undo entry. Returns
@@ -508,6 +523,50 @@ impl Buffer {
         self.rope.slice(start_c..end_c).to_string()
     }
 
+    /// Fold the newest undo entry into the one before it, so a single
+    /// undo (or redo) takes back (or re-applies) both -- for an edit that
+    /// follows from another automatically, like a hard wrap from typing.
+    pub fn merge_last_two_edits(&mut self) {
+        if self.undo_stack.len() < 2 {
+            return;
+        }
+        let b = self.undo_stack.pop().unwrap();
+        let a = self.undo_stack.pop().unwrap();
+        let a_ins: Vec<char> = a.inserted.chars().collect();
+        let b_rem: Vec<char> = b.removed.chars().collect();
+        let (a0, b0) = (a.start_char, b.start_char);
+        let a_end = a0 + a_ins.len();
+        let b_end = b0 + b_rem.len();
+        // The span both touch, in the text as it was between the two.
+        let lo = a0.min(b0);
+        let hi = a_end.max(b_end);
+        let b_ins_len = b.inserted.chars().count();
+        let between: Vec<char> = (lo..hi)
+            .map(|pos| {
+                if (a0..a_end).contains(&pos) {
+                    a_ins[pos - a0]
+                } else if (b0..b_end).contains(&pos) {
+                    b_rem[pos - b0]
+                } else if pos < b0 {
+                    self.rope.char(pos)
+                } else {
+                    self.rope.char(pos - b_rem.len() + b_ins_len)
+                }
+            })
+            .collect();
+        let piece =
+            |from: usize, to: usize| -> String { between[from - lo..to - lo].iter().collect() };
+        let removed = piece(lo, a0) + &a.removed + &piece(a_end, hi);
+        let inserted = piece(lo, b0) + &b.inserted + &piece(b_end, hi);
+        self.undo_stack.push(Edit {
+            start_char: lo,
+            removed,
+            inserted,
+            cursor_before: a.cursor_before,
+            cursor_after: b.cursor_after,
+        });
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(edit) = self.undo_stack.pop() else {
             return false;
@@ -658,6 +717,31 @@ impl std::fmt::Display for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_edits_undo_and_redo_as_one_whatever_their_layout() {
+        // (first edit, second edit) as (start, end, text) on the buffer
+        // as each finds it: overlapping, disjoint either way round.
+        let cases = [
+            ((1, 1, "X"), (0, 3, "PQRS")),
+            ((1, 1, "X"), (4, 5, "")),
+            ((4, 4, "YZ"), (0, 1, "W")),
+            ((2, 3, ""), (2, 2, "\n")),
+        ];
+        for ((s1, e1, t1), (s2, e2, t2)) in cases {
+            let mut b = Buffer::from_text("abcdef", None);
+            b.replace_text(Pos::new(0, s1), Pos::new(0, e1), t1);
+            let mid = b.rope.to_string();
+            b.replace_text(Pos::new(0, s2), Pos::new(0, e2), t2);
+            let end = b.rope.to_string();
+            b.merge_last_two_edits();
+            assert_eq!(b.undo_stack.len(), 1, "{mid:?}");
+            assert!(b.undo());
+            assert_eq!(b.rope.to_string(), "abcdef", "{mid:?} -> {end:?}");
+            assert!(b.redo());
+            assert_eq!(b.rope.to_string(), end);
+        }
+    }
 
     #[test]
     fn a_jump_drops_the_remembered_column() {
